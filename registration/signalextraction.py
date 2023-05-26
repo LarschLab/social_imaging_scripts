@@ -1,6 +1,6 @@
 import numpy as np
 import sys
-sys.path.insert(1, 'C:/Users/kslangewal/PycharmProjects/suitecodesocialvis')
+sys.path.insert(1, 'C:/Users/jlarsch/Documents/social_imaging_scripts/analysis')
 from suite2p import classification
 from suite2p.run_s2p import default_ops, run_s2p
 import os
@@ -9,7 +9,7 @@ import skimage.io
 from skimage.filters import gaussian
 import shutil
 import glob, re
-import Utils
+import utils as Utils
 from scipy import interpolate
 
 
@@ -854,8 +854,8 @@ if __name__ == '__main__':
 #                                      user='martin'
 #                                      )
     extraction = ROITracesExtraction(path=r'J:/Johannes Kappel/Imaging data/Theia',
-                                     date='20230316',
-                                     nfish=3,
+                                     date='20230503',
+                                     nfish=4,
                                      ds_fac=5,
                                      diameter=7,
                                      recwise=False,

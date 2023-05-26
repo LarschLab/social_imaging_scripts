@@ -15,8 +15,8 @@ import shutil
 from scipy.signal import resample, convolve
 import matplotlib.pyplot as plt
 import sys
-sys.path.insert(1, 'C:/Users/jkappel/PycharmProjects/SocialVisionS2P')
-import Tuninganalysis
+sys.path.insert(1, 'C:/Users/jlarsch/Documents/social_imaging_scripts/analysis')
+import tuninganalysis as Tuninganalysis
 import pickle
 import re
 from sklearn.linear_model import LinearRegression
