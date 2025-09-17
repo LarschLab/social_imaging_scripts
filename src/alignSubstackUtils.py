@@ -10,10 +10,12 @@ _HAS_WIDGETS = True
 
 import skimage
 from skimage.feature import match_template
-from skimage.transform import rescale, resize
+from skimage.transform import rescale, resize, rotate
 from skimage.registration import phase_cross_correlation
 from skimage.util import img_as_float32
 from skimage.filters import gaussian
+
+from scipy.ndimage import uniform_filter1d
 
 
 import pandas as pd
@@ -467,4 +469,135 @@ def interactive_checker(fixed_stack, moving_stack, df_results):
         {"moving_index": slider}
     )
     display(widgets.HBox([slider]), out)
+
+# Build hyperstack (T, Z, Y, X) from functional plane stacks using registration results
+
+
+# ---------- helpers ----------
+
+def _load_timeseries_stack(path):
+    arr = tiff.imread(str(path))
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected (T,Y,X) or (Y,X); got shape {arr.shape} for {path}")
+    return arr.astype(np.float32, copy=False)
+
+def _temporal_filter_and_subsample(ts, movavg=10, limit=1000, step=10):
+    T = min(limit, ts.shape[0])
+    ts = ts[:T]
+    ts_f = uniform_filter1d(ts, size=movavg, axis=0, mode='reflect')  # centered MA
+    return ts_f[::step]  # (100, Y, X)
+
+def _process_plane_stack(path, scale_xy, rot_deg=140.0, bg_value=0.0):
+    """
+    Load -> limit to 1000 -> MA(10) -> every 10th (100 frames)
+    -> rotate 140° (no canvas growth) -> resize by scale_xy.
+    Returns float32 (100, Ys, Xs).
+    """
+    ts = _load_timeseries_stack(path)                     # (T,512,512)
+    ts = _temporal_filter_and_subsample(ts, 10, 1000, 10) # (100,512,512)
+
+    T_out, H, W = ts.shape
+    Ys = max(1, int(round(H * scale_xy)))
+    Xs = max(1, int(round(W * scale_xy)))
+    out = np.empty((T_out, Ys, Xs), dtype=np.float32)
+
+    for t in range(T_out):
+        fr = ts[t]
+        fr_r = rotate(fr, angle=rot_deg, resize=False, mode='constant', cval=bg_value,
+                      order=1, preserve_range=True)
+        out[t] = resize(fr_r, (Ys, Xs), anti_aliasing=True,
+                        preserve_range=True).astype(np.float32, copy=False)
+    return out
+
+def _safe_paste_max(dst2d, src2d, top, left):
+    """Paste src2d into dst2d at (top,left) with clipping; merge via np.maximum."""
+    H, W = dst2d.shape
+    h, w = src2d.shape
+    y1 = int(np.floor(top)); x1 = int(np.floor(left))
+    y2 = y1 + h;             x2 = x1 + w
+    dy1 = max(0, y1); dx1 = max(0, x1)
+    dy2 = min(H, y2); dx2 = min(W, x2)
+    if dy2 <= dy1 or dx2 <= dx1:
+        return
+    sy1 = dy1 - y1; sx1 = dx1 - x1
+    sy2 = sy1 + (dy2 - dy1); sx2 = sx1 + (dx2 - dx1)
+    dst2d[dy1:dy2, dx1:dx2] = np.maximum(dst2d[dy1:dy2, dx1:dx2],
+                                         src2d[sy1:sy2, sx2 - (dx2 - dx1) + sx1:sx2] if False else src2d[sy1:sy2, sx1:sx2])
+    # note: the odd slice in the 'if False' is a guard for accidental mistakes; current branch is correct.
+
+def _scale_to_uint8(arr, vmin, vmax):
+    eps = 1e-6
+    out = (arr - vmin) * (255.0 / max(vmax - vmin, eps))
+    return np.clip(out, 0, 255).astype(np.uint8, copy=False)
+
+# ---------- main (simple, in-memory) ----------
+
+def build_hyperstack_uint8_in_memory(
+    funcStacks,            # list of paths, one per moving plane (same order as df_results.moving_plane)
+    df_results,            # DataFrame: moving_plane, z_index, y_px, x_px, scale_moving_to_fixed
+    fixed_stack_shape,     # (Zf, Yf, Xf) e.g., (216, 512, 512)
+    use_percentiles=None,  # None -> global min/max; or (1,99) robust scaling
+    save_path=None         # optional TIFF path to save the TZYX hyperstack
+):
+    Zf, Yf, Xf = fixed_stack_shape
+    T_out = 100  # 1000 -> /10
+
+    # Map plane -> (z,y,x,scale)
+    meta = {}
+    for _, r in df_results.iterrows():
+        meta[int(r["moving_plane"])] = (
+            int(r["z_index"]),
+            float(r["y_px"]),
+            float(r["x_px"]),
+            float(r["scale_moving_to_fixed"])
+        )
+
+    # 1) Process all planes (rotation + scale) and keep in RAM (list)
+    processed = []  # list of dicts: {"idx": i, "z": z, "y": y, "x": x, "s": s, "data": (100,Ys,Xs)}
+    for i, p in enumerate(funcStacks):
+        if i not in meta:
+            print(f"[skip] plane {i}: no registration row")
+            continue
+        z, y, x, s = meta[i]
+        arr = _process_plane_stack(p, s, rot_deg=140.0)   # (100, Ys, Xs) float32
+        processed.append({"idx": i, "z": z, "y": y, "x": x, "s": s, "data": arr})
+        print(f"[proc] plane {i}: -> z={z}, pos=({y:.1f},{x:.1f}), scale={s:.3f}, shape={arr.shape}")
+
+    # 2) Global intensity scaling
+    if use_percentiles is None:
+        g_min = min(float(np.nanmin(p["data"])) for p in processed)
+        g_max = max(float(np.nanmax(p["data"])) for p in processed)
+    else:
+        p_lo, p_hi = use_percentiles
+        samples = []
+        for p in processed:
+            d = p["data"]
+            # take a few million random pixels total for robust percentiles
+            n_pick = min(2_000_000 // len(processed), d.size)
+            idx = np.random.default_rng(123).integers(0, d.size, n_pick)
+            samples.append(d.ravel()[idx])
+        samples = np.concatenate(samples) if samples else np.array([0.0], dtype=np.float32)
+        g_min = float(np.percentile(samples[samples>1.], p_lo))
+        g_max = float(np.percentile(samples[samples>1.], p_hi))
+    print(f"[scale] global intensity >1 -> {g_min:.6f} .. {g_max:.6f}")
+
+    # 3) Allocate the uint8 hyperstack in RAM
+    hyper = np.zeros((T_out, Zf, Yf, Xf), dtype=np.uint8)  # ~5.6 GB
+
+    # 4) Paste each plane frame-by-frame (np.maximum)
+    for P in processed:
+        z, y, x = P["z"], P["y"], P["x"]
+        dat = P["data"]  # (100, Ys, Xs) float32
+        for t in range(T_out):
+            frame8 = _scale_to_uint8(dat[t], g_min, g_max)
+            _safe_paste_max(hyper[t, z], frame8, top=y, left=x)
+        print(f"[merge] plane {P['idx']} pasted at z={z}")
+
+    if save_path:
+        tiff.imwrite(save_path, hyper, bigtiff=True, metadata={'axes': 'TZYX'})
+        print(f"[saved] {save_path}")
+
+    return hyper
 

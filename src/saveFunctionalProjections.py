@@ -32,9 +32,13 @@ def scale_to_uint8(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
     out = np.clip(out, 0.0, 1.0)
     return (out * 255.0 + 0.5).astype(np.uint8)
 
+def collect_tiff_files(folder: Path) -> list:
+    """Collect all .tif/.tiff files in the given folder."""
+    return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}])
+
 def save_max_avg_projections(start_folder: Path, angle_deg: float = 140.0):
-    # Collect all .tif/.tiff files
-    files = sorted([p for p in start_folder.iterdir() if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}])
+
+    files = collect_tiff_files(start_folder)
     print(f"Found {len(files)} TIFF stack(s).")
 
     # 1) For each file: read, compute max & avg projections (NO rotation yet)
