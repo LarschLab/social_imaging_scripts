@@ -36,7 +36,7 @@ def collect_tiff_files(folder: Path) -> list:
     """Collect all .tif/.tiff files in the given folder."""
     return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}])
 
-def save_max_avg_projections(start_folder: Path, angle_deg: float = 140.0):
+def save_max_avg_projections(start_folder: Path, angle_deg: float = 140.0, out_dir: Path = None, animal_name: str = None):
 
     files = collect_tiff_files(start_folder)
     print(f"Found {len(files)} TIFF stack(s).")
@@ -73,11 +73,17 @@ def save_max_avg_projections(start_folder: Path, angle_deg: float = 140.0):
     avg_u8_rot = rotate_pages_uint8(avg_u8, angle_deg)
 
     # 5) Save ImageJ-formatted multi-page TIFFs
-    out_dir = start_folder / "projections"
-    out_dir.mkdir(exist_ok=True)
+    if out_dir is None:
+        out_dir = start_folder / "projections"
+        out_dir.mkdir(exist_ok=True)
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    max_path = out_dir / "max_projections.tif"
-    avg_path = out_dir / "avg_projections.tif"
+    # Use animal name if given, otherwise default
+    prefix = f"{animal_name}_" if animal_name else ""
+
+    max_path = out_dir / f"{prefix}max_projections.tif"
+    avg_path = out_dir / f"{prefix}avg_projections.tif"
 
     # ImageJ expects axes "ZYX" for stacks
     tiff.imwrite(str(max_path), max_u8_rot, imagej=True, metadata={"axes": "ZYX"}, compression="deflate")

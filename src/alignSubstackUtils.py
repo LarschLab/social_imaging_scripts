@@ -25,6 +25,42 @@ import numpy as np
 import tifffile as tiff
 
 
+def _fits_strictly_inside(fixed_shape, templ_shape, y, x, margin=1):
+    """Return True if template at (y,x) fits strictly inside the fixed image with a pixel margin."""
+    H, W = int(fixed_shape[0]), int(fixed_shape[1])
+    th, tw = int(templ_shape[0]), int(templ_shape[1])
+    return (y >= margin) and (x >= margin) and (y + th <= H - margin) and (x + tw <= W - margin)
+
+def _clamp_inside(fixed_shape, templ_shape, y, x, margin=1):
+    """Clamp (y,x) so that the template fits strictly inside with the given margin."""
+    H, W = int(fixed_shape[0]), int(fixed_shape[1])
+    th, tw = int(templ_shape[0]), int(templ_shape[1])
+    y_min, y_max = margin, max(margin, H - margin - th)
+    x_min, x_max = margin, max(margin, W - margin - tw)
+    y_cl = float(np.clip(y, y_min, y_max))
+    x_cl = float(np.clip(x, x_min, x_max))
+    return y_cl, x_cl
+
+def _ncc_at(fixed_plane, templ, y, x):
+    """Compute NCC of templ placed at (y,x) using a safe crop (edge-padded if needed)."""
+    H, W = fixed_plane.shape
+    th, tw = templ.shape
+    y0, x0 = int(np.floor(y)), int(np.floor(x))
+    y1 = max(0, y0); x1 = max(0, x0)
+    y2 = min(H, y0 + th); x2 = min(W, x0 + tw)
+    if y2 <= y1 or x2 <= x1:
+        return -1.0
+    crop = fixed_plane[y1:y2, x1:x2]
+    # edge-pad to template size if partial overlap
+    pad_y = th - crop.shape[0]
+    pad_x = tw - crop.shape[1]
+    if pad_y > 0 or pad_x > 0:
+        crop = np.pad(crop, ((0, max(0, pad_y)), (0, max(0, pad_x))), mode="edge")
+    c = crop.astype(np.float32); t = templ.astype(np.float32)
+    num = np.sum((c - c.mean()) * (t - t.mean()))
+    den = np.sqrt(np.sum((c - c.mean())**2) * np.sum((t - t.mean())**2)) + 1e-9
+    return float(num / den)
+
 
 def normalize_image(im, eps=1e-6):
     """Z-score normalize 2D image; robust to outliers."""
@@ -82,47 +118,48 @@ def template_match_best_xy(fixed_plane, templ):
 def refine_subpixel_xy(fixed_plane, templ, yx_initial, pad=16):
     """
     Subpixel refine around initial (y, x) by cropping fixed region the same size as templ.
-    Uses phase correlation for subpixel shift between templ and the cropped region.
-    Returns refined (y, x) in fixed coords and an updated NCC score for the refined crop.
+    Returns refined (y, x) in fixed coords and an updated NCC score.
     """
     y0, x0 = yx_initial
     th, tw = templ.shape
-    # Crop region around initial match; clamp to image bounds
-    y1 = max(0, y0)
-    x1 = max(0, x0)
-    y2 = min(fixed_plane.shape[0], y0 + th)
-    x2 = min(fixed_plane.shape[1], x0 + tw)
+
+    # Anchor the crop on integer pixel coordinates (top-left). This is crucial.
+    y1 = max(0, int(np.floor(y0)))
+    x1 = max(0, int(np.floor(x0)))
+    y2 = min(fixed_plane.shape[0], y1 + th)
+    x2 = min(fixed_plane.shape[1], x1 + tw)
     crop = fixed_plane[y1:y2, x1:x2]
 
     # If crop smaller than template due to edges, pad the crop
     if crop.shape != templ.shape:
-        pad_y = max(0, templ.shape[0] - crop.shape[0])
-        pad_x = max(0, templ.shape[1] - crop.shape[1])
+        pad_y = max(0, th - crop.shape[0])
+        pad_x = max(0, tw - crop.shape[1])
         crop = np.pad(crop, ((0, pad_y), (0, pad_x)), mode='edge')
 
-    # Phase correlation expects same-size arrays
-    shift, error, phasediff = phase_cross_correlation(crop, templ, upsample_factor=10)
-    dy, dx = shift
-    # Convert to fixed coordinates
-    y_ref = y1 + dy
-    x_ref = x1 + dx
+    # phase_cross_correlation(reference=crop, moving=templ) -> shift to apply to MOVING
+    dy, dx = phase_cross_correlation(crop, templ, upsample_factor=10)[0]
 
-    # Recompute NCC score at refined location (rounded)
-    yr = int(round(y_ref))
-    xr = int(round(x_ref))
+    # Convert to fixed coordinates (top-left of template in fixed coords)
+    # KEY: subtract the shift returned by phase correlation
+    y_ref = float(y1) - float(dy)
+    x_ref = float(x1) - float(dx)
+
+    # Recompute NCC at refined (rounded) position for a stable score
+    yr = int(round(y_ref)); xr = int(round(x_ref))
     yr2 = min(fixed_plane.shape[0], yr + th)
     xr2 = min(fixed_plane.shape[1], xr + tw)
     crop2 = fixed_plane[yr:yr2, xr:xr2]
     if crop2.shape != templ.shape:
-        pad_y = max(0, templ.shape[0] - crop2.shape[0])
-        pad_x = max(0, templ.shape[1] - crop2.shape[1])
+        pad_y = max(0, th - crop2.shape[0])
+        pad_x = max(0, tw - crop2.shape[1])
         crop2 = np.pad(crop2, ((0, pad_y), (0, pad_x)), mode='edge')
 
-    # NCC score
-    num = np.sum((crop2 - crop2.mean()) * (templ - templ.mean()))
-    den = np.sqrt(np.sum((crop2 - crop2.mean())**2) * np.sum((templ - templ.mean())**2)) + 1e-9
+    c = crop2.astype(np.float32); t = templ.astype(np.float32)
+    num = np.sum((c - c.mean()) * (t - t.mean()))
+    den = np.sqrt(np.sum((c - c.mean())**2) * np.sum((t - t.mean())**2)) + 1e-9
     score = float(num / den)
-    return float(y_ref), float(x_ref), score
+
+    return y_ref, x_ref, score
 
 
 # ### Core registration (coarse-to-fine search over z and scale)
@@ -152,6 +189,33 @@ def match_in_window(fixed_plane, templ, yx_hint, win_radius):
     xx = int(ij[1]) + x1
     return yy, xx, peak
 
+def _assert_strictly_inside(fixed_plane_shape, templ_shape, y, x, margin=1, ctx=""):
+    """
+    Ensure the template placed at (y,x) fits strictly inside fixed_plane with a pixel margin on all sides.
+    fixed_plane_shape: (Y, X)
+    templ_shape: (th, tw)
+    y, x: floats in fixed coords (top-left of template)
+    margin: >=1 requires at least that many pixels to the border
+    Raises RuntimeError if the placement is invalid.
+    """
+    H, W = int(fixed_plane_shape[0]), int(fixed_plane_shape[1])
+    th, tw = int(templ_shape[0]), int(templ_shape[1])
+
+    if th <= 0 or tw <= 0:
+        raise RuntimeError(f"{ctx} invalid template size th={th}, tw={tw}")
+
+    # template must fit strictly inside with margin
+    if not (
+        (y >= margin) and
+        (x >= margin) and
+        (y + th <= H - margin) and
+        (x + tw <= W - margin)
+    ):
+        raise RuntimeError(
+            f"{ctx} registration out-of-bounds (or touching edge): "
+            f"y={y:.2f}, x={x:.2f}, th={th}, tw={tw}, fixed(H,W)=({H},{W}), margin={margin}"
+        )
+
 
 def register_moving_plane_to_fixed_stack(
     fixed_stack,
@@ -164,6 +228,7 @@ def register_moving_plane_to_fixed_stack(
     pyramid_min_size=160,
     gaussian_sigma=0.5,
     verbose=False,
+    do_subpixel=False,   # <<< NEW: default off (skip subpixel)
 ):
     """
     Find best (z, y, x, scale) in fixed_stack for a single moving_plane.
@@ -206,9 +271,20 @@ def register_moving_plane_to_fixed_stack(
             yzxp = template_match_best_xy(f0[z], templ)
             if yzxp is None:
                 continue
+
+            # Unpack the match result
             y, x, score = yzxp
-            if score > best["ncc"]:
-                best.update({"z_index": z, "y": float(y), "x": float(x), "scale": float(s), "ncc": float(score), "pyr_level": 0})
+
+            # Only accept in-bounds candidates
+            if score > best["ncc"] and _fits_strictly_inside(f0[z].shape, templ.shape, y, x, margin=1):
+                best.update({
+                    "z_index": z,
+                    "y": float(y),
+                    "x": float(x),
+                    "scale": float(s),
+                    "ncc": float(score),
+                    "pyr_level": 0
+                })
 
     if verbose:
         print(f"[Coarse] best @ level 0 -> z={best['z_index']}, yx=({best['y']:.1f},{best['x']:.1f}), s={best['scale']:.3f}, ncc={best['ncc']:.4f}")
@@ -251,36 +327,63 @@ def register_moving_plane_to_fixed_stack(
                 continue
 
             for z in z_candidates:
-                yzxp = template_match_best_xy(fL[z], templ)
+
                 yzxp = template_match_best_xy(fL[z], templ)
                 if yzxp is None:
                     continue
-                # global coarse guess at this level:
-                y_g, x_g, _ = yzxp
 
-                # seed from previous level (upscaled by pyramid_downscale)
+                # Global coarse candidate at this level
+                y_g, x_g, score_g = yzxp
+
+                # Seed from previous level (upscaled by pyramid_downscale)
                 seed_y = best["y"] * pyramid_downscale
                 seed_x = best["x"] * pyramid_downscale
 
-                # search in a local window around the seed; radius can shrink with levels
-                win_radius = max(6, int(32 / (pyramid_downscale ** (lvl-1))))  # e.g., 32 -> 21 -> 14 -> 9
+                # Local windowed candidate around the seed
+                #win_radius = max(6, int(32 / (pyramid_downscale ** (lvl - 1))))
+                win_radius = max(10, int(40 / (pyramid_downscale ** (lvl-1))))
                 y_w, x_w, score_w = match_in_window(fL[z], templ, (seed_y, seed_x), win_radius)
 
-                # take the better of global vs windowed
-                if score_w > _:
-                    y, x, score = y_w, x_w, score_w
-                else:
-                    y, x, score = y_g, x_g, _
-                if score > improved["ncc"]:
-                    improved.update({"z_index": z, "y": float(y), "x": float(x), "scale": float(s), "ncc": float(score), "pyr_level": lvl})
+                # Choose between global and windowed, but require strict in-bounds
+                cands = []
+                if _fits_strictly_inside(fL[z].shape, templ.shape, y_g, x_g, margin=1):
+                    cands.append((y_g, x_g, score_g))
+                if _fits_strictly_inside(fL[z].shape, templ.shape, y_w, x_w, margin=1):
+                    cands.append((y_w, x_w, score_w))
+
+                # If neither candidate is valid, try next z/scale without touching 'improved'
+                if not cands:
+                    continue
+
+                # Pick the best valid candidate
+                y_sel, x_sel, sc_sel = max(cands, key=lambda t: t[2])
+
+                # --- Improvement A: tolerant update ---
+                EPS_NCC = 0.02  # allow refinement even if NCC is slightly lower
+                if sc_sel > improved["ncc"] - EPS_NCC:
+                    improved.update({
+                        "z_index": z,
+                        "y": float(y_sel),
+                        "x": float(x_sel),
+                        "scale": float(s),
+                        "ncc": float(sc_sel),
+                        "pyr_level": lvl
+                    })
+
+        if improved["ncc"] == best["ncc"] and verbose:
+            print(f"[Refine L{lvl}] no in-bounds improvement; keeping previous best")
 
         best = improved
         if verbose:
             print(f"[Refine L{lvl}] z={best['z_index']}, yx=({best['y']:.1f},{best['x']:.1f}), s={best['scale']:.3f}, ncc={best['ncc']:.4f}")
 
-    # ---- Final subpixel XY refinement on full-res level
+    # ---- Final subpixel XY refinement on full-res level (robust, in-bounds) ----
+    # ---- Final placement & (optional) subpixel refinement ----
+    # ---- Final placement at full-res + optional subpixel ----
     z_fin = int(best["z_index"])
     s_fin = float(best["scale"])
+
+    # full-res template according to s_fin
     templ_full = mov_norm
     if not math.isclose(s_fin, 1.0, rel_tol=1e-6):
         new_y = max(8, int(round(mov_norm.shape[0] * s_fin)))
@@ -288,21 +391,81 @@ def register_moving_plane_to_fixed_stack(
         templ_full = resize(mov_norm, (new_y, new_x), anti_aliasing=True, preserve_range=True)
         templ_full = normalize_image(templ_full)
 
-    y0, x0 = int(round(best["y"])), int(round(best["x"]))
-    y_ref, x_ref, ncc_ref = refine_subpixel_xy(fixed_norm[z_fin], templ_full, (y0, x0))
+    fixed_slice = fixed_norm[z_fin]
+    th, tw = templ_full.shape
 
-    # Compose result
+    # 1) map coords from the level they were found at -> full-res
+    lvl_found = int(best.get("pyr_level", len(fixed_pyr)-1))      # 0 = coarsest
+    levels_total = len(fixed_pyr)
+    scale_to_full = (pyramid_downscale ** (levels_total - 1 - lvl_found))
+    y_ref = float(best["y"]) * scale_to_full
+    x_ref = float(best["x"]) * scale_to_full
+
+    qc_notes = []
+
+    # 2) ensure strictly inside at full-res
+    if not _fits_strictly_inside(fixed_slice.shape, (th, tw), y_ref, x_ref, margin=1):
+        y_ref, x_ref = _clamp_inside(fixed_slice.shape, (th, tw), y_ref, x_ref, margin=1)
+        qc_notes.append("clamped_final_int")
+
+    # helper: exact NCC (no padding) at integer-rounded coords
+    def _ncc_exact_full(fixed_plane, templ, y, x):
+        H, W = fixed_plane.shape
+        th, tw = templ.shape
+        yr = int(round(y)); xr = int(round(x))
+        if yr < 0 or xr < 0 or yr + th > H or xr + tw > W:
+            return None
+        c = fixed_plane[yr:yr+th, xr:xr+tw].astype(np.float32, copy=False)
+        t = templ.astype(np.float32, copy=False)
+        c0 = c - c.mean(); t0 = t - t.mean()
+        den = np.sqrt((c0**2).sum() * (t0**2).sum()) + 1e-9
+        return float((c0 * t0).sum() / den)
+
+    # 3) integer placement NCC
+    ncc_final = _ncc_exact_full(fixed_slice, templ_full, y_ref, x_ref)
+    if ncc_final is None:
+        ncc_final = _ncc_at(fixed_slice, templ_full, y_ref, x_ref)
+        qc_notes.append("ncc_padded_fallback")
+
+    # 4) OPTIONAL: subpixel starting from full-res (y_ref, x_ref)
+    if do_subpixel:
+        try:
+            y_sp, x_sp, ncc_sp = refine_subpixel_xy(fixed_slice, templ_full, (y_ref, x_ref))
+            # keep only if still strictly inside and improves exact NCC
+            if _fits_strictly_inside(fixed_slice.shape, (th, tw), y_sp, x_sp, margin=1):
+                ncc_exact_sp = _ncc_exact_full(fixed_slice, templ_full, y_sp, x_sp)
+                if ncc_exact_sp is not None and ncc_exact_sp > ncc_final:
+                    y_ref, x_ref = y_sp, x_sp
+                    ncc_final = ncc_exact_sp
+                else:
+                    qc_notes.append("subpixel_rejected_no_gain")
+            else:
+                qc_notes.append("subpixel_rejected_oob")
+        except Exception:
+            qc_notes.append("subpixel_failed")
+
+    if verbose:
+        print(f"[Final] z={z_fin}, yx=({y_ref:.2f},{x_ref:.2f}), s={s_fin:.3f}, ncc={ncc_final:.4f}"
+            + (" (int+subpixel)" if do_subpixel else " (int)"))
+
     result = {
         "z_index": int(z_fin),
         "y_px": float(y_ref),
         "x_px": float(x_ref),
         "scale_moving_to_fixed": s_fin,
-        "ncc_score": float(ncc_ref),
+        "ncc_score": float(ncc_final),
+        "qc_flag": "|".join(qc_notes) if qc_notes else "",
     }
     return result
 
 
+
+
+
+
 # ### Batch registration for the whole moving stack
+
+
 
 # %%
 def register_moving_stack(
@@ -317,6 +480,8 @@ def register_moving_stack(
     pyramid_min_size=160,
     gaussian_sigma=0.5,
     verbose=False,
+    animal_id=None,   # <-- NEW
+    do_subpixel=False,   # <<< NEW: default off (skip subpixel)
 ):
     """
     Registers each plane of moving_stack to fixed_stack.
@@ -342,21 +507,29 @@ def register_moving_stack(
             pyramid_min_size=pyramid_min_size,
             gaussian_sigma=gaussian_sigma,
             verbose=verbose,
+            do_subpixel=do_subpixel,  
         )
         res.update({
+            "animal": animal_id,
             "moving_plane": zi,
             "z_um": res["z_index"] * float(fixed_z_spacing_um),
         })
         results.append(res)
 
-    df = pd.DataFrame(results, columns=["moving_plane","z_index","z_um","y_px","x_px","scale_moving_to_fixed","ncc_score"])
+    #df = pd.DataFrame(results, columns=["moving_plane","z_index","z_um","y_px","x_px","scale_moving_to_fixed","ncc_score"])
+    df = pd.DataFrame(
+        results,
+        columns=["animal","moving_plane","z_index","z_um",
+                 "y_px","x_px","scale_moving_to_fixed","ncc_score","qc_flag"]
+    )
+    
     return df
 
 
-def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_overlay=0.35):
+def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_overlay=0.35, rot_deg=0.0):
     import numpy as np
     import matplotlib.pyplot as plt
-    from skimage.transform import resize
+    from skimage.transform import resize, rotate as sk_rotate
 
     assert 0 <= moving_index < moving_stack.shape[0], "moving_index out of range"
     row = df_results[df_results["moving_plane"] == moving_index]
@@ -364,27 +537,37 @@ def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_over
         raise ValueError("No results found for the given moving_index in df_results.")
     row = row.iloc[0]
 
-    z = int(row["z_index"])
-    y = float(row["y_px"])
-    x = float(row["x_px"])
-    s = float(row["scale_moving_to_fixed"])
+    # fields
+    z   = int(row["z_index"])
+    y   = float(row["y_px"])
+    x   = float(row["x_px"])
+    s   = float(row["scale_moving_to_fixed"])
+    animal = str(row["animal"]) if "animal" in row.index else "?"
 
-    fixed = fixed_stack[z].astype(np.float32)
+    fixed  = fixed_stack[z].astype(np.float32)
     moving = moving_stack[moving_index].astype(np.float32)
 
-    # --- helpers (same as before) ---
+    # helpers
     def _safe_crop(img, y, x, h, w):
-        y, x = int(np.floor(y)), int(np.floor(x))
-        y2, x2 = y + int(h), x + int(w)
-        y1c, x1c = max(0, y), max(0, x)
-        y2c, x2c = min(img.shape[0], y2), min(img.shape[1], x2)
-        crop = img[y1c:y2c, x1c:x2c]
-        pad_y_top = y1c - y
-        pad_x_left = x1c - x
-        pad_y_bot = (y + h) - y2c
-        pad_x_right = (x + w) - x2c
-        if any(v > 0 for v in (pad_y_top, pad_x_left, pad_y_bot, pad_x_right)):
-            crop = np.pad(crop, ((pad_y_top, pad_y_bot), (pad_x_left, pad_x_right)), mode="edge")
+        y0, x0 = int(np.floor(y)), int(np.floor(x))
+        y1, x1 = y0 + int(h), x0 + int(w)
+        H, W   = img.shape
+        # clamp paste area
+        ya, yb = max(0, y0), min(H, y1)
+        xa, xb = max(0, x0), min(W, x1)
+        if ya >= yb or xa >= xb:
+            return np.zeros((int(h), int(w)), dtype=img.dtype)
+        crop = img[ya:yb, xa:xb]
+        # pad to (h,w) if partially outside
+        pad_top  = ya - y0
+        pad_left = xa - x0
+        pad_bot  = (y0 + int(h)) - yb
+        pad_right= (x0 + int(w)) - xb
+        if any(v > 0 for v in (pad_top, pad_left, pad_bot, pad_right)):
+            crop = np.pad(crop,
+                          ((max(0,pad_top),  max(0,pad_bot)),
+                           (max(0,pad_left), max(0,pad_right))),
+                          mode="edge")
         return crop
 
     def _rescale(img, scale):
@@ -392,80 +575,127 @@ def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_over
         out_w = max(1, int(round(img.shape[1] * scale)))
         return resize(img, (out_h, out_w), anti_aliasing=True, preserve_range=True)
 
-    def norm(im):
+    def _norm(im):
         im = im.astype(np.float32)
         p1, p99 = np.percentile(im, (1, 99))
         if p99 <= p1:
             p1, p99 = im.min(), max(im.max(), im.min()+1e-3)
         return np.clip((im - p1) / (p99 - p1 + 1e-6), 0, 1)
 
-    # Scale moving to the estimated scale
+    # scale moving + prepare matched crop (UNROTATED data; rotation happens after compositing)
     moving_scaled = _rescale(moving, s)
-    h, w = moving_scaled.shape
+    h, w          = moving_scaled.shape
+    fixed_n       = _norm(fixed)
+    moving_n      = _norm(moving_scaled)
+    matched_crop  = _safe_crop(fixed, y, x, h, w)
+    matched_n     = _norm(matched_crop)
 
-    # Crop the matched region from the fixed slice (same size as moving_scaled)
-    matched_crop = _safe_crop(fixed, y, x, h, w)
-
-    # Normalize for display
-    fixed_n = norm(fixed)
-    moving_scaled_n = norm(moving_scaled)
-    matched_crop_n = norm(matched_crop)
-
-    # --- Plot
-    fig = plt.figure(figsize=(12, 5))
-
-    # Left: overlay in RGB (fixed stays the reference canvas)
-    ax1 = fig.add_subplot(1, 2, 1)
-
+    # ---- Build LEFT overlay as an RGB image in numpy ----
     H, W = fixed_n.shape
-    fixed_rgb = np.stack([fixed_n, fixed_n, fixed_n], axis=-1)
+    overlay = np.stack([fixed_n, fixed_n, fixed_n], axis=-1)  # RGB from fixed
 
-    # 1) Draw fixed with explicit extent
-    ax1.imshow(fixed_rgb, interpolation="nearest", extent=[0, W, H, 0])
+    # alpha-blend the (green) moving onto overlay at (y,x)
+    y0, x0 = int(np.floor(y)), int(np.floor(x))
+    ya, xa = max(0, y0), max(0, x0)
+    yb, xb = min(H, y0 + h), min(W, x0 + w)
+    # align source window inside moving_n
+    sy1 = ya - y0; sx1 = xa - x0
+    sy2 = sy1 + (yb - ya); sx2 = sx1 + (xb - xa)
+    if yb > ya and xb > xa:
+        # green channel blend
+        dstG = overlay[ya:yb, xa:xb, 1]
+        src  = moving_n[sy1:sy2, sx1:sx2]
+        overlay[ya:yb, xa:xb, 1] = (1 - alpha_overlay) * dstG + alpha_overlay * src
+        # rectangle (lime)
+        rr_thick = 2
+        # top/bottom
+        y_top = slice(max(0, y0), min(H, y0 + rr_thick))
+        y_bot = slice(max(0, y0 + h - rr_thick), min(H, y0 + h))
+        x_all = slice(max(0, x0), min(W, x0 + w))
+        overlay[y_top, x_all, :] = [0, 1, 0]
+        overlay[y_bot, x_all, :] = [0, 1, 0]
+        # left/right
+        x_left  = slice(max(0, x0), min(W, x0 + rr_thick))
+        x_right = slice(max(0, x0 + w - rr_thick), min(W, x0 + w))
+        y_all   = slice(max(0, y0), min(H, y0 + h))
+        overlay[y_all, x_left,  :] = [0, 1, 0]
+        overlay[y_all, x_right, :] = [0, 1, 0]
 
-    # 2) Freeze axes to fixed bounds so the center never moves
-    ax1.set_xlim(0, W)
-    ax1.set_ylim(H, 0)
-    ax1.set_aspect('equal', adjustable='box')
-    ax1.set_autoscale_on(False)  # <- prevents any artist (overlay/rect) from changing limits
+    # rotate BOTH panels for visualization
+    # rotate overlay (whole left panel)
+    if abs(float(rot_deg)) > 1e-6:
+        overlay_disp = sk_rotate(overlay, angle=rot_deg, resize=False,
+                                preserve_range=True, mode="constant", cval=0.0, order=1)
+    else:
+        overlay_disp = overlay
 
-    # Overlay the scaled moving plane in green at (x,y) without shifting the axes
-    extent = [x, x + w, y + h, y]  # left, right, bottom, top in FIXED coords
-    ax1.imshow(moving_scaled_n, cmap="Greens", alpha=alpha_overlay,
-            extent=extent, interpolation="nearest", clip_on=True, zorder=2)
+    # rotate the right panel images individually, then concatenate
+    if abs(float(rot_deg)) > 1e-6:
+        moving_disp  = sk_rotate(moving_n, angle=rot_deg, resize=False,
+                                preserve_range=True, mode="constant", cval=0.0, order=1)
+        matched_disp = sk_rotate(matched_n, angle=rot_deg, resize=False,
+                                preserve_range=True, mode="constant", cval=0.0, order=1)
+    else:
+        moving_disp, matched_disp = moving_n, matched_n
 
-    # Rectangle (purely visual; also won't change limits)
-    rect = plt.Rectangle((x, y), w, h, fill=False, linewidth=2, color="lime", zorder=3)
-    ax1.add_patch(rect)
+    if matched_disp.shape != moving_disp.shape:
+        from skimage.transform import resize
+        matched_disp = resize(matched_disp, moving_disp.shape,
+                            preserve_range=True, anti_aliasing=True)
 
-    ax1.set_title(f"Fixed z={z} with green overlay\n(y={y:.1f}, x={x:.1f}, scale={s:.3f})")
+    right_disp = np.concatenate([moving_disp, matched_disp], axis=1)
+    
+
+    # ---- Plot
+    fig = plt.figure(figsize=(14, 6))
+
+    # left
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.imshow(np.clip(overlay_disp, 0, 1), interpolation="nearest")
+    ax1.set_title("Fixed with moving overlay (rotated display)")
     ax1.set_axis_off()
 
-    # Right: moving (scaled) vs matched crop (for inspection only)
+    # right
     ax2 = fig.add_subplot(1, 2, 2)
-    if matched_crop_n.shape != moving_scaled_n.shape:
-        from skimage.transform import resize
-        matched_crop_n = resize(matched_crop_n, moving_scaled_n.shape, preserve_range=True, anti_aliasing=True)
-    ax2.imshow(np.concatenate([moving_scaled_n, matched_crop_n], axis=1),
-            cmap="gray", interpolation="nearest")
-    ax2.set_title("Left: moving (scaled) | Right: matched crop (fixed)")
+    ax2.imshow(right_disp, cmap="gray", interpolation="nearest")
+    ax2.set_title("Left: moving (scaled) | Right: matched crop  (rotated display)")
     ax2.set_axis_off()
+
+    # info box (2 columns, 3-dec floats)
+    info_items = []
+    for col in df_results.columns:
+        val = row[col]
+        if isinstance(val, (float, np.floating)):
+            info_items.append(f"{col}={val:.3f}")
+        else:
+            info_items.append(f"{col}={val}")
+    mid = (len(info_items) + 1) // 2
+    left_items, right_items = info_items[:mid], info_items[mid:]
+    if len(right_items) < len(left_items):
+        right_items += [""] * (len(left_items) - len(right_items))
+    text_lines = [f"{a:<28} {b}" for a, b in zip(left_items, right_items)]
+    text_str = f"{animal}, plane {moving_index}\n\n" + "\n".join(text_lines)
+
+    ax1.text(0.02, 0.98, text_str,
+             transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color="yellow", family="monospace",
+             bbox=dict(facecolor="black", alpha=0.5, pad=4, edgecolor="none"))
 
     plt.tight_layout()
     plt.show()
 
-def interactive_checker(fixed_stack, moving_stack, df_results):
+
+
+
+
+def interactive_checker(fixed_stack, moving_stack, df_results, rot_deg=140):
     """Slider UI to browse matches per moving plane."""
-    if not _HAS_WIDGETS:
-        print("ipywidgets not available; showing the first plane statically. Install ipywidgets for a slider UI.")
-        show_match(fixed_stack, moving_stack, df_results, moving_index=0)
-        return
 
     slider = widgets.IntSlider(
         value=0, min=0, max=moving_stack.shape[0]-1, step=1, description="moving plane"
     )
     out = widgets.interactive_output(
-        lambda moving_index: show_match(fixed_stack, moving_stack, df_results, moving_index=moving_index),
+        lambda moving_index: show_match(fixed_stack, moving_stack, df_results, moving_index=moving_index, rot_deg=rot_deg),
         {"moving_index": slider}
     )
     display(widgets.HBox([slider]), out)
@@ -600,4 +830,43 @@ def build_hyperstack_uint8_in_memory(
         print(f"[saved] {save_path}")
 
     return hyper
+
+
+def write_combined_log(base_folder, out_csv=None, out_full_csv=None):
+    """Aggregate all per-animal CSVs into one summary log + full log."""
+    base = Path(base_folder)
+    per_animal_csvs = sorted(base.glob("*/02_reg/07_2pf-a/*_registration_results.csv"))
+
+    if not per_animal_csvs:
+        print("[WARN] no per-animal results found.")
+        return None, None
+
+    dfs = [pd.read_csv(csv_path) for csv_path in per_animal_csvs]
+    big = pd.concat(dfs, ignore_index=True)
+
+    agg = (big.groupby("animal")["ncc_score"]
+             .agg(n_planes="count",
+                  ncc_mean="mean",
+                  ncc_median="median",
+                  ncc_min="min",
+                  ncc_max="max")
+             .reset_index())
+
+    def _qual(median_ncc):
+        if median_ncc >= 0.85: return "excellent"
+        if median_ncc >= 0.65: return "good"
+        if median_ncc >= 0.40: return "ok"
+        return "poor"
+
+    agg["quality"] = agg["ncc_median"].apply(_qual)
+
+    out_csv = out_csv or (base / "combined_registration_log.csv")
+    agg.to_csv(out_csv, index=False)
+    print(f"[SAVED] Combined summary: {out_csv}")
+
+    out_full_csv = out_full_csv or (base / "combined_registration_full.csv")
+    big.to_csv(out_full_csv, index=False)
+    print(f"[SAVED] Combined full log: {out_full_csv}")
+
+    return agg, big
 
