@@ -1,7 +1,7 @@
 # utilities
 
 # Setup & imports
-import sys, math, warnings, json
+import sys, math, warnings, json, re
 import numpy as np
 import matplotlib.pyplot as plt
 import ipywidgets as widgets
@@ -14,7 +14,7 @@ from skimage.transform import rescale, resize, rotate
 from skimage.registration import phase_cross_correlation
 from skimage.util import img_as_float32
 from skimage.filters import gaussian
-
+import nrrd
 from scipy.ndimage import uniform_filter1d
 
 
@@ -870,3 +870,158 @@ def write_combined_log(base_folder, out_csv=None, out_full_csv=None):
 
     return agg, big
 
+
+def read_good_nrrd_uint8(path: Path, flip_horizontal: bool = False) -> np.ndarray:
+    """
+    Read 3D stack as uint8 with your axis handling. Tries NRRD first, then
+    falls back to TIFF if the file is mis-labeled. Returns array shaped (Z, Y, X).
+    """
+    path = Path(path)
+    try:
+        data, _ = nrrd.read(str(path))
+    except (nrrd.NRRDError, UnicodeDecodeError) as err:
+        try:
+            im = tiff.imread(str(path))
+        except Exception as tif_err:
+            raise RuntimeError(f"Failed to read anatomy stack {path}: {tif_err}") from tif_err
+        im = np.asarray(im, dtype=np.uint8, order="C")
+        if im.ndim == 2:
+            im = im[np.newaxis, :, :]
+        elif im.ndim != 3:
+            raise ValueError(f"Unexpected TIFF shape {im.shape} for {path}")
+    else:
+        im = np.asarray(data, dtype=np.uint8, order="C")
+        if im.ndim != 3:
+            raise ValueError(f"Expected 3D NRRD; got shape {im.shape} for {path}")
+        im = np.moveaxis(im, 2, 0)
+        im = np.moveaxis(im, 1, 2)
+    if flip_horizontal:
+        im = im[:, :, ::-1]  # flip X
+    return im
+
+
+def get_spacing_origin_ZYX(nrrd_path: Path):
+    """
+    Return (spacing_zyx, origin_zyx) aligned to the array produced by
+    read_good_nrrd_uint8. Handles true NRRDs as well as TIFF files that were
+    mislabeled with a .nrrd suffix (ImageJ export with embedded NRRD metadata).
+    """
+    path = Path(nrrd_path)
+
+    def _spacing_origin_from_head(head):
+        spacing = origin = None
+        if head is None:
+            return spacing, origin
+        if 'spacing' in head and head['spacing'] is not None:
+            sp = np.array(head['spacing'], dtype=float)
+            if np.ndim(sp) == 0:
+                spacing = np.array([sp, sp, sp], dtype=float)
+            else:
+                spacing = np.array(sp, dtype=float)
+        elif 'spacings' in head and head['spacings'] is not None:
+            spacing = np.array(head['spacings'], dtype=float)
+        elif 'space directions' in head and head['space directions'] is not None:
+            sd = np.array(head['space directions'], dtype=float)
+            spacing = np.linalg.norm(sd, axis=1)
+        if 'space origin' in head and head['space origin'] is not None:
+            origin = np.array(head['space origin'], dtype=float)
+        return spacing, origin
+
+    def _spacing_origin_from_tiff(path: Path):
+        spacing = origin = None
+        try:
+            with tiff.TiffFile(str(path)) as tf:
+                page0 = tf.pages[0]
+                ij_tag = page0.tags.get('IJMetadata')
+                info_str = None
+                if ij_tag is not None:
+                    ij_val = ij_tag.value
+                    if isinstance(ij_val, dict):
+                        info_str = ij_val.get('Info') or ij_val.get('info')
+                    elif isinstance(ij_val, (bytes, str)):
+                        info_str = ij_val
+                if isinstance(info_str, bytes):
+                    info_str = info_str.decode('utf-8', 'ignore')
+                if isinstance(info_str, str):
+                    for line in info_str.splitlines():
+                        line = line.strip()
+                        if not line or ':' not in line:
+                            continue
+                        key, val = line.split(':', 1)
+                        key = key.strip().lower()
+                        val = val.strip()
+                        if key == 'space directions':
+                            vecs = []
+                            for part in re.findall(r'\(([^)]*)\)', val):
+                                vec = np.fromstring(part, sep=',')
+                                if vec.size:
+                                    vecs.append(vec)
+                            if len(vecs) == 3:
+                                spacing = np.linalg.norm(np.vstack(vecs), axis=1)
+                        elif key == 'spacings':
+                            arr = np.fromstring(val.replace(',', ' '), sep=' ')
+                            if arr.size == 3:
+                                spacing = arr
+                        elif key == 'space origin':
+                            arr = np.fromstring(val.strip('()'), sep=',')
+                            if arr.size == 3:
+                                origin = arr
+                desc_tag = page0.tags.get('ImageDescription')
+                desc = desc_tag.value if desc_tag is not None else None
+                if isinstance(desc, bytes):
+                    desc = desc.decode('utf-8', 'ignore')
+                if isinstance(desc, str):
+                    for line in desc.splitlines():
+                        line = line.strip()
+                        if line.lower().startswith('spacing='):
+                            try:
+                                z_spacing = float(line.split('=', 1)[1])
+                            except ValueError:
+                                z_spacing = None
+                            if z_spacing is not None:
+                                if spacing is None:
+                                    spacing = np.array([1.0, 1.0, z_spacing], dtype=float)
+                                else:
+                                    spacing = np.array(spacing, dtype=float)
+                                    if spacing.size >= 3:
+                                        spacing[2] = z_spacing
+                                    else:
+                                        spacing = np.array([spacing[0], spacing[1], z_spacing], dtype=float)
+                            break
+        except Exception:
+            pass
+        return spacing, origin
+
+    spacing_raw = origin_raw = None
+    try:
+        _, head = nrrd.read(str(path))
+    except (nrrd.NRRDError, UnicodeDecodeError):
+        head = None
+    else:
+        spacing_raw, origin_raw = _spacing_origin_from_head(head)
+
+    if spacing_raw is None or origin_raw is None:
+        spacing_alt, origin_alt = _spacing_origin_from_tiff(path)
+        if spacing_raw is None and spacing_alt is not None:
+            spacing_raw = spacing_alt
+        if origin_raw is None and origin_alt is not None:
+            origin_raw = origin_alt
+
+    if spacing_raw is None:
+        spacing_raw = np.array([1.0, 1.0, 1.0], dtype=float)
+    if origin_raw is None or origin_raw.size != 3:
+        origin_raw = np.array([0.0, 0.0, 0.0], dtype=float)
+
+    spacing_zyx = np.array([spacing_raw[2], spacing_raw[0], spacing_raw[1]], dtype=float)
+    origin_zyx  = np.array([origin_raw[2], origin_raw[1], origin_raw[0]], dtype=float)
+
+    return spacing_zyx, origin_zyx
+
+
+def indexZYX_to_physZYX(idx_zyx: np.ndarray, spacing_zyx, origin_zyx):
+    """idx_zyx: (N,3) in (z,y,x) -> physical (z,y,x)."""
+    return origin_zyx + idx_zyx * spacing_zyx
+
+def physZYX_to_indexZYX(phys_zyx: np.ndarray, spacing_zyx, origin_zyx):
+    """phys_zyx: (N,3) in (z,y,x) -> index (z,y,x)."""
+    return (phys_zyx - origin_zyx) / spacing_zyx
