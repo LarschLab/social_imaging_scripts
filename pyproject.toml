@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "social-imaging-scripts"
+version = "0.1.0"
+description = "Pipeline for cross-animal 2p/confocal registration and ROI processing"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Social Imaging Team", email = "lab@example.com" }
+]
+
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=1.5",
+  "pydantic>=2.6",
+  "ruamel.yaml>=0.18",
+  "scipy>=1.10",
+  "scikit-image>=0.22",
+  "matplotlib>=3.7",
+  "tifffile>=2023.7.10",
+  "pynrrd>=0.4.2",
+  "antspyx>=0.4.2",
+  "SimpleITK>=2.3",
+  "suite2p>=0.13.0",
+  "cellpose>=3.0.0",
+  "typer[all]>=0.9",
+  "structlog>=24.1",
+  "rich>=13.7",
+  "jinja2>=3.1"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "ruff>=0.4"
+]
+
+[project.scripts]
+social-img-pipeline = "social_imaging_scripts.pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

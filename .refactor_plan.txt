@@ -1,0 +1,5 @@
+1. Audit existing scripts and notebooks to identify all imports referencing old locations and gather functionality that needs modularization.
+2. Design package submodules (metadata, preprocessing, registration, transforms, qc, pipeline) and stub necessary __init__ and module files.
+3. Incrementally move code from legacy directories (registration/, analysis/, etc.) into the new package, updating imports and adding compatibility shims if needed.
+4. Update notebooks and scripts to consume the new package structure, removing shims once verified.
+5. Run sanity checks (import tests, basic execution path) to confirm refactor didn’t break existing workflows.
