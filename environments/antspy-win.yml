@@ -1,0 +1,16 @@
+name: antspy-win
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - itk
+  - nibabel
+  - numpy=1.26
+  - scikit-image
+  - simpleitk
+  - jupyter
+  - pynrrd
+  - seaborn
+  - tifffile
+  - charset-normalizer
+prefix: C:\Users\jlarsch\AppData\Local\miniconda3\envs\antspy-win
