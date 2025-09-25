@@ -1,0 +1,107 @@
+animal_id: L395_f11
+genotype: HuC-H2B-GCaMP6s
+owner: Matilde
+tank: L395
+date_of_birth: '2025-06-16'
+meta_sources:
+  - type: lab_record
+    path: 07 Data/Matilde/allfish_allexperiments_2p.xlsx
+root_dir: D:\pipelineTest\L395_f11
+available_modalities:
+  functional_2p: true
+  anatomy_2p: true
+  confocal_rounds: 2
+  behavior: false
+sessions:
+  - session_id: L395_f11_functional_2025-07-04
+    date: '2025-07-04'
+    condition: live
+    experimenter: Matilde
+    include_in_analysis: true
+    image_quality: amazing
+    notes: Good fish, predominance of left neurons (131 vs 47).
+    session_type: functional_stack
+    session_data:
+      raw_path: D:\pipelineTest\L395_f11\01_raw\2p\functional
+      stimulus_name: LR_bout_continous
+      stimulus_metadata_path: D:\pipelineTest\L395_f11\01_raw\2p\metadata
+      microscope_settings_path: 
+        D:\pipelineTest\L395_f11\01_raw\2p\metadata\L395_f11_2025-07-04-1509_L395_metadata.csv
+      num_planes: 5
+      zoom_factor:
+      channels: []
+  - session_id: L395_f11_anatomy_2025-07-04
+    date: '2025-07-04'
+    condition: live
+    experimenter: Matilde
+    include_in_analysis: true
+    image_quality:
+    notes:
+    session_type: anatomy_stack
+    session_data:
+      raw_path: 
+        D:\pipelineTest\L395_f11\01_raw\2p\anatomy\L395_f11_anatomy_00001.tif
+      round_id: 1
+      plane_spacing:
+      microscope_settings_path:
+      channels: []
+  - session_id: L395_f11_confocal_round1_2025-07-04
+    date: '2025-07-04'
+    condition: fixed
+    experimenter: Matilde
+    include_in_analysis: true
+    image_quality:
+    notes: 'Round 1 markers: sst1_2, tac3b'
+    session_type: anatomy_stack
+    session_data:
+      raw_path: 
+        D:\pipelineTest\L395_f11\01_raw\confocal\round1\L395_f11_r1_HuC-H2B-GC6s_sst12_546_pth2_647_Stitch.lsm
+      round_id: 1
+      plane_spacing:
+      microscope_settings_path:
+      channels:
+        - channel_id: 1
+          name: gcamp
+          marker: HuC-H2B-GCaMP6s
+          wavelength_nm: 488.0
+          round_id: 1
+        - channel_id: 2
+          name: sst1_2
+          marker: sst1_2
+          wavelength_nm: 546.0
+          round_id: 1
+        - channel_id: 3
+          name: tac3b
+          marker: tac3b
+          wavelength_nm: 647.0
+          round_id: 1
+  - session_id: L395_f11_confocal_round2_2025-07-04
+    date: '2025-07-04'
+    condition: fixed
+    experimenter: Matilde
+    include_in_analysis: true
+    image_quality:
+    notes: 'Round 2 markers: sst1_1, pth2'
+    session_type: anatomy_stack
+    session_data:
+      raw_path: 
+        D:\pipelineTest\L395_f11\01_raw\confocal\roundn\L395_f11_r2_HuC-H2B-GC6s_sst11_546_tac3b_647_Stitch.lsm
+      round_id: 2
+      plane_spacing:
+      microscope_settings_path:
+      channels:
+        - channel_id: 1
+          name: gcamp
+          marker: HuC-H2B-GCaMP6s
+          wavelength_nm: 488.0
+          round_id: 2
+        - channel_id: 2
+          name: sst1_1
+          marker: sst1_1
+          wavelength_nm: 546.0
+          round_id: 2
+        - channel_id: 3
+          name: pth2
+          marker: pth2
+          wavelength_nm: 647.0
+          round_id: 2
