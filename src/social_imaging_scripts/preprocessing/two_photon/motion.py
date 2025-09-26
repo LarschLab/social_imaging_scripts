@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import re
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -64,7 +65,7 @@ def run_suite2p_one_plane(
     if batch_size is None:
         batch_size = min(400, n_frames)
     else:
-        batch_size = min(int(batch_size), 400, n_frames)
+        batch_size = max(1, min(int(batch_size), 400, n_frames))
     ops["batch_size"] = batch_size
 
     suite2p_tmp = save_path / 'suite2p'
@@ -80,37 +81,53 @@ def move_suite2p_outputs(
     motion_output: Path,
     segmentation_output: Path,
 ) -> Dict[str, Path]:
-    """Move Suite2p outputs to project-specific folders.
-
-    - Registered TIFFs (in suite2p/plane0/reg_tif) → motion_output
-    - Plane npy outputs (suite2p/plane0/*.npy) → segmentation_output/plane{idx}
-    """
+    """Collate Suite2p outputs and clean project layout."""
 
     reg_folder = suite2p_folder / "suite2p" / "plane0" / "reg_tif"
     if not reg_folder.exists():
         raise FileNotFoundError(f"Suite2p reg_tif folder missing: {reg_folder}")
 
+    def _chunk_index(path: Path) -> int:
+        match = re.search(r"file(\d+)", path.name)
+        if not match:
+            raise ValueError(f"Unexpected Suite2p chunk name: {path.name}")
+        return int(match.group(1))
+
+    tiff_files = sorted(reg_folder.glob("*.tif"), key=_chunk_index)
+    if not tiff_files:
+        raise FileNotFoundError(f"No registered TIFF chunks found in {reg_folder}")
+
     motion_output.mkdir(parents=True, exist_ok=True)
-    segmentation_output.mkdir(parents=True, exist_ok=True)
+    dest_motion = motion_output / f"{animal_id}_plane{plane_idx}_mcorrected.tif"
+    if dest_motion.exists():
+        dest_motion.unlink()
 
-    outputs: Dict[str, Path] = {}
+    with tifffile.TiffWriter(dest_motion, bigtiff=True) as writer:
+        for chunk_path in tiff_files:
+            with tifffile.TiffFile(chunk_path) as tif:
+                for page in tif.pages:
+                    writer.write(page.asarray(), contiguous=True)
 
-    for tiff_file in sorted(reg_folder.glob("*.tif")):
-        dest_file = motion_output / f"{animal_id}_plane{plane_idx}_mcorrected.tif"
-        if dest_file.exists():
-            dest_file.unlink()
-        shutil.move(str(tiff_file), str(dest_file))
-        outputs.setdefault("motion_tiff", dest_file)
+    for chunk_path in tiff_files:
+        chunk_path.unlink()
 
     plane_folder = suite2p_folder / "suite2p" / "plane0"
-    dest_plane_folder = segmentation_output / f"plane{plane_idx}"
-    dest_plane_folder.mkdir(exist_ok=True)
+    if not plane_folder.exists():
+        raise FileNotFoundError(f"Suite2p plane folder missing: {plane_folder}")
+
+    if segmentation_output.exists():
+        shutil.rmtree(segmentation_output)
+    segmentation_output.mkdir(parents=True, exist_ok=True)
+
     for seg_file in plane_folder.glob("*.npy"):
-        dest_file = dest_plane_folder / seg_file.name
-        if dest_file.exists():
-            dest_file.unlink()
+        new_name = f"{animal_id}_plane{plane_idx}_{seg_file.name}"
+        dest_file = segmentation_output / new_name
         shutil.move(str(seg_file), str(dest_file))
-    outputs["segmentation_folder"] = dest_plane_folder
+
+    outputs: Dict[str, Path] = {
+        "motion_tiff": dest_motion,
+        "segmentation_folder": segmentation_output,
+    }
 
     shutil.rmtree(suite2p_folder / "suite2p", ignore_errors=True)
 
