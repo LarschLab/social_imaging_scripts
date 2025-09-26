@@ -1,4 +1,4 @@
-"""Metadata domain models for social imaging pipelines.
+﻿"""Metadata domain models for social imaging pipelines.
 
 The models describe the declarative metadata we expect to collect before
 running the processing pipeline. The schema stays concise so users can edit it
@@ -32,16 +32,26 @@ class ChannelInfo(BaseModel):
     round_id: Optional[int] = None
 
 
+class TwoPhotonPreprocessing(BaseModel):
+    """Acquisition parameters required to preprocess two-photon stacks."""
+
+    mode: Literal["resonant", "linear"]
+    n_planes: Optional[int] = None
+    frames_per_plane: int
+    flyback_frames: int = 0
+    remove_first_frame: bool = False
+    blocks: Optional[list[int]] = None
+
+
 class FunctionalSessionData(BaseModel):
     """Functional two-photon acquisition exported by Suite2p preprocessing."""
 
     raw_path: Path
     stimulus_name: Optional[str] = None
     stimulus_metadata_path: Optional[Path] = None
-    microscope_settings_path: Optional[Path] = None
-    num_planes: Optional[int] = None
     zoom_factor: Optional[float] = None
     channels: list[ChannelInfo] = Field(default_factory=list)
+    preprocessing_two_photon: Optional[TwoPhotonPreprocessing] = None
 
 
 class AnatomySessionData(BaseModel):
@@ -50,8 +60,9 @@ class AnatomySessionData(BaseModel):
     raw_path: Path
     round_id: Optional[int] = None
     plane_spacing: Optional[float] = None
-    microscope_settings_path: Optional[Path] = None
+    stack_type: Literal["two_photon", "confocal"] = "confocal"
     channels: list[ChannelInfo] = Field(default_factory=list)
+    preprocessing_two_photon: Optional[TwoPhotonPreprocessing] = None
 
 
 class SessionCommon(BaseModel):

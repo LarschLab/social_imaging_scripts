@@ -1,4 +1,4 @@
-"""Build per-animal YAML metadata files from the spreadsheet entry form."""
+﻿"""Build per-animal YAML metadata files from the spreadsheet entry form."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from social_imaging_scripts.metadata.models import (
     FunctionalSessionData,
     MetaSource,
     OtherSession,
+    TwoPhotonPreprocessing,
 )
 
 yaml = YAML()
@@ -79,6 +80,24 @@ def _bool_from_cell(value) -> bool:
     return text not in {"", "0", "false", "no"}
 
 
+def _parse_blocks(value) -> Optional[list[int]]:
+    """Parse block identifiers from a delimited cell."""
+
+    text = _clean_str(value)
+    if not text:
+        return None
+    blocks = []
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            blocks.append(int(part))
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Invalid block identifier '{part}'") from exc
+    return blocks or None
+
+
 def build_metadata_from_excel(excel_path: Path, output_dir: Path) -> None:
     """Convert the multi-sheet workbook into validated per-animal YAML files."""
 
@@ -88,61 +107,109 @@ def build_metadata_from_excel(excel_path: Path, output_dir: Path) -> None:
 
     xls = pd.ExcelFile(excel_path)
     animals_df = xls.parse("animals").fillna("")
-    sessions_df = xls.parse("sessions").fillna("")
-    functional_df = xls.parse("functional_stack").fillna("")
-    anatomy_df = xls.parse("anatomy_stack").fillna("")
-    channels_df = xls.parse("channels").fillna("")
+    stacks_df = xls.parse("stacks").fillna("")
+    stacks_df = stacks_df.copy()
+    stacks_df["session_type"] = stacks_df.get("stack_type")
+    try:
+        tp_df = xls.parse("two_photon_settings").fillna("")
+    except ValueError:
+        tp_df = pd.DataFrame(columns=[
+            "session_id",
+            "mode",
+            "n_planes",
+            "frames_per_plane",
+            "flyback_frames",
+            "remove_first_frame",
+            "blocks",
+        ])
 
-    functional_map: dict[str, FunctionalSessionData] = {}
-    for _, row in functional_df.iterrows():
+    sessions_df = stacks_df[[
+        "animal_id",
+        "stack_id",
+        "stack_type",
+        "date",
+        "condition",
+        "experimenter",
+        "include_in_analysis",
+        "image_quality",
+        "notes",
+    ]].rename(columns={
+        "stack_id": "session_id",
+        "stack_type": "session_type",
+    })
+
+    functional_df = stacks_df[stacks_df["session_type"] == "functional_stack"][[
+        "stack_id",
+        "raw_path",
+        "stimulus_name",
+        "stimulus_metadata_path",
+        "zoom_factor",
+    ]].rename(columns={"stack_id": "session_id"})
+
+    anatomy_df = stacks_df[stacks_df["session_type"] == "anatomy_stack"][[
+        "stack_id",
+        "round_id",
+        "raw_path",
+        "plane_spacing",
+    ]].rename(columns={"stack_id": "session_id"})
+
+    anatomy_df["stack_type"] = anatomy_df["raw_path"].astype(str).apply(
+        lambda p: "two_photon" if "\\2p\\" in p or "/2p/" in p else "confocal"
+    )
+
+    channel_records = []
+    channel_cols = [
+        (1, "channel1_name", "channel1_wavelength_nm"),
+        (2, "channel2_name", "channel2_wavelength_nm"),
+        (3, "channel3_name", "channel3_wavelength_nm"),
+    ]
+    for _, row in stacks_df.iterrows():
+        session_id = row.get("session_id", row.get("stack_id"))
+        round_id = row.get("round_id")
+        for channel_id, name_col, wavelength_col in channel_cols:
+            name = row.get(name_col)
+            if not isinstance(name, str) or not name.strip():
+                continue
+            marker = str(name).strip()
+            wavelength = row.get(wavelength_col)
+            channel_records.append(
+                {
+                    "session_id": session_id,
+                    "round_id": round_id,
+                    "channel_id": channel_id,
+                    "name": marker,
+                    "marker": marker,
+                    "wavelength_nm": wavelength if pd.notna(wavelength) else None,
+                }
+            )
+    channels_df = pd.DataFrame(channel_records, columns=[
+        "session_id",
+        "round_id",
+        "channel_id",
+        "name",
+        "marker",
+        "wavelength_nm",
+    ])
+
+    tp_settings_map: dict[str, TwoPhotonPreprocessing] = {}
+    for _, row in tp_df.iterrows():
         session_id = str(row.get("session_id", "")).strip()
         if not session_id:
             continue
-        raw_path = _maybe_path(row.get("raw_path"))
-        if raw_path is None:
-            raise ValueError(f"functional_stack entry for {session_id} is missing raw_path")
-        functional_map[session_id] = FunctionalSessionData(
-            raw_path=raw_path,
-            stimulus_name=_clean_str(row.get("stimulus_name")),
-            stimulus_metadata_path=_maybe_path(row.get("stimulus_metadata_path")),
-            microscope_settings_path=_maybe_path(row.get("microscope_settings_path")),
-            num_planes=_maybe_int(row.get("num_planes")),
-            zoom_factor=_maybe_float(row.get("zoom_factor")),
-        )
-
-    anatomy_map: dict[str, AnatomySessionData] = {}
-    for _, row in anatomy_df.iterrows():
-        session_id = str(row.get("session_id", "")).strip()
-        if not session_id:
+        mode = _clean_str(row.get("mode"))
+        if not mode:
             continue
-        raw_path = _maybe_path(row.get("raw_path"))
-        if raw_path is None:
-            raise ValueError(f"anatomy_stack entry for {session_id} is missing raw_path")
-        if session_id in anatomy_map:
-            raise ValueError(f"Duplicate anatomy_stack entry for session {session_id}")
-        anatomy_map[session_id] = AnatomySessionData(
-            raw_path=raw_path,
-            round_id=_maybe_int(row.get("round_id")),
-            plane_spacing=_maybe_float(row.get("plane_spacing")),
-            microscope_settings_path=_maybe_path(row.get("microscope_settings_path")),
+        frames_per_plane = _maybe_int(row.get("frames_per_plane"))
+        if frames_per_plane is None:
+            raise ValueError(f"Two-photon session {session_id} missing frames_per_plane")
+        tp_settings_map[session_id] = TwoPhotonPreprocessing(
+            mode=mode.lower(),
+            n_planes=_maybe_int(row.get("n_planes")),
+            frames_per_plane=frames_per_plane,
+            flyback_frames=_maybe_int(row.get("flyback_frames")) or 0,
+            remove_first_frame=_bool_from_cell(row.get("remove_first_frame")),
+            blocks=_parse_blocks(row.get("blocks")),
         )
-
-    channels_map: dict[str, list[ChannelInfo]] = {}
-    for _, row in channels_df.iterrows():
-        session_id = str(row.get("session_id", "")).strip()
-        if not session_id:
-            continue
-        channel_id = _maybe_int(row.get("channel_id"))
-        if channel_id is None:
-            raise ValueError(f"Channel entry for session {session_id} is missing channel_id")
-        info = ChannelInfo(
-            channel_id=channel_id,
-            name=_clean_str(row.get("name")) or f"channel_{channel_id}",
-            marker=_clean_str(row.get("marker")),
-            wavelength_nm=_maybe_float(row.get("wavelength_nm")),
-            round_id=_maybe_int(row.get("round_id")),
-        )
-        channels_map.setdefault(session_id, []).append(info)
 
     for _, row in animals_df.iterrows():
         animal_id = str(row.get("animal_id", "")).strip()
@@ -192,23 +259,63 @@ def build_metadata_from_excel(excel_path: Path, output_dir: Path) -> None:
             )
 
             if session_type == "functional_stack":
-                data = functional_map.get(session_id)
-                if data is None:
+                data_row = functional_df[functional_df["session_id"] == session_id]
+                if data_row.empty:
                     raise ValueError(
                         f"Session {session_id} marked functional_stack but missing functional_stack entry"
                     )
-                if session_id in channels_map:
-                    data.channels = channels_map[session_id]
-                session = FunctionalSession(session_type="functional_stack", session_data=data, **base_kwargs)
+                record = data_row.iloc[0]
+                session_data = FunctionalSessionData(
+                    raw_path=_maybe_path(record.get("raw_path")),
+                    stimulus_name=_clean_str(record.get("stimulus_name")),
+                    stimulus_metadata_path=_maybe_path(record.get("stimulus_metadata_path")),
+                    zoom_factor=_maybe_float(record.get("zoom_factor")),
+                )
+                if session_data.raw_path is None:
+                    raise ValueError(f"Functional session {session_id} missing raw_path")
+                if session_id in tp_settings_map:
+                    session_data.preprocessing_two_photon = tp_settings_map[session_id]
+                if session_id in channels_df["session_id"].values:
+                    session_data.channels = [
+                        ChannelInfo(
+                            channel_id=int(row_c["channel_id"]),
+                            name=row_c["name"],
+                            marker=row_c["marker"],
+                            wavelength_nm=_maybe_float(row_c.get("wavelength_nm")),
+                            round_id=_maybe_int(row_c.get("round_id")),
+                        )
+                        for _, row_c in channels_df[channels_df["session_id"] == session_id].iterrows()
+                    ]
+                session = FunctionalSession(session_type="functional_stack", session_data=session_data, **base_kwargs)
             elif session_type == "anatomy_stack":
-                data = anatomy_map.get(session_id)
-                if data is None:
+                data_row = anatomy_df[anatomy_df["session_id"] == session_id]
+                if data_row.empty:
                     raise ValueError(
                         f"Session {session_id} marked anatomy_stack but missing anatomy_stack entry"
                     )
-                if session_id in channels_map:
-                    data.channels = channels_map[session_id]
-                session = AnatomySession(session_type="anatomy_stack", session_data=data, **base_kwargs)
+                record = data_row.iloc[0]
+                session_data = AnatomySessionData(
+                    raw_path=_maybe_path(record.get("raw_path")),
+                    round_id=_maybe_int(record.get("round_id")),
+                    plane_spacing=_maybe_float(record.get("plane_spacing")),
+                    stack_type=record.get("stack_type", "confocal"),
+                )
+                if session_data.raw_path is None:
+                    raise ValueError(f"Anatomy session {session_id} missing raw_path")
+                if session_id in tp_settings_map:
+                    session_data.preprocessing_two_photon = tp_settings_map[session_id]
+                if session_id in channels_df["session_id"].values:
+                    session_data.channels = [
+                        ChannelInfo(
+                            channel_id=int(row_c["channel_id"]),
+                            name=row_c["name"],
+                            marker=row_c["marker"],
+                            wavelength_nm=_maybe_float(row_c.get("wavelength_nm")),
+                            round_id=_maybe_int(row_c.get("round_id")),
+                        )
+                        for _, row_c in channels_df[channels_df["session_id"] == session_id].iterrows()
+                    ]
+                session = AnatomySession(session_type="anatomy_stack", session_data=session_data, **base_kwargs)
             elif session_type == "behavior":
                 session = BehaviorSession(session_type="behavior", session_data={}, **base_kwargs)
             else:
@@ -232,7 +339,7 @@ def build_metadata_from_excel(excel_path: Path, output_dir: Path) -> None:
 
         out_path = output_dir / f"{animal_id}.yaml"
         with out_path.open("w", encoding="utf-8") as fh:
-            yaml.dump(animal_meta.model_dump(mode="json"), fh)
+            yaml.dump(animal_meta.model_dump(mode="json", exclude_none=True), fh)
 
 
 def main():
