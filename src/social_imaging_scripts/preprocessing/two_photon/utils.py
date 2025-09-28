@@ -50,10 +50,16 @@ def load_tiff_stack(path: Path) -> np.ndarray:
     """Load a multi-page TIFF as ``(frames, height, width)`` array."""
 
     with tifffile.TiffFile(path) as tif:
-        frames = tif.asarray()
-    if frames.ndim == 2:
-        frames = frames[np.newaxis, ...]
-    return np.asarray(frames)
+        # Some microscope exports contain inconsistent metadata about the
+        # intended stack shape (e.g., ImageJ tags claiming fewer slices).
+        # Reading page-by-page avoids reshape warnings while yielding the
+        # actual acquired frames.
+        frames = [page.asarray() for page in tif.pages]
+
+    stack = np.stack(frames, axis=0)
+    if stack.ndim == 2:
+        stack = stack[np.newaxis, ...]
+    return np.asarray(stack)
 
 
 def correct_negative_values(stack: np.ndarray, *, chunk_size: int = 256) -> np.ndarray:
