@@ -4,7 +4,7 @@ owner: Matilde
 tank: L395
 date_of_birth: '2025-06-16'
 meta_sources: []
-root_dir: D:\pipelineTest\L395_f11
+root_dir: 07_data/matilde/L395_f11
 available_modalities:
   functional_2p: false
   anatomy_2p: false
@@ -20,9 +20,9 @@ sessions:
     notes: Good fish, predominance of left neurons (131 vs 47).
     session_type: functional_stack
     session_data:
-      raw_path: D:\pipelineTest\L395_f11\01_raw\2p\functional
+      raw_path: 01_raw/2p/functional
       stimulus_name: LR_bout_continous
-      stimulus_metadata_path: D:\pipelineTest\L395_f11\01_raw\2p\metadata
+      stimulus_metadata_path: 01_raw/2p/metadata
       channels:
         - channel_id: 1
           name: gcamp
@@ -45,8 +45,7 @@ sessions:
     include_in_analysis: true
     session_type: anatomy_stack
     session_data:
-      raw_path: 
-        D:\pipelineTest\L395_f11\01_raw\2p\anatomy\L395_f11_anatomy_00001.tif
+      raw_path: 01_raw/2p/anatomy/L395_f11_anatomy_00001.tif
       round_id: 1
       stack_type: two_photon
       channels:
@@ -64,7 +63,7 @@ sessions:
     session_type: anatomy_stack
     session_data:
       raw_path: 
-        D:\pipelineTest\L395_f11\01_raw\confocal\round1\L395_f11_r1_HuC-H2B-GC6s_sst12_546_pth2_647_Stitch.lsm
+        01_raw/confocal/round1/L395_f11_r1_HuC-H2B-GC6s_sst12_546_pth2_647_Stitch.lsm
       round_id: 1
       stack_type: confocal
       channels:
@@ -92,7 +91,7 @@ sessions:
     session_type: anatomy_stack
     session_data:
       raw_path: 
-        D:\pipelineTest\L395_f11\01_raw\confocal\roundn\L395_f11_r2_HuC-H2B-GC6s_sst11_546_tac3b_647_Stitch.lsm
+        01_raw/confocal/roundn/L395_f11_r2_HuC-H2B-GC6s_sst11_546_tac3b_647_Stitch.lsm
       round_id: 2
       stack_type: confocal
       channels:
