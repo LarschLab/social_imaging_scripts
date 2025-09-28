@@ -1,0 +1,43 @@
+Metadata-Version: 2.4
+Name: social-imaging-scripts
+Version: 0.1.0
+Summary: Pipeline for cross-animal 2p/confocal registration and ROI processing
+Author-email: Social Imaging Team <lab@example.com>
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy<2.0,>=1.24
+Requires-Dist: pandas>=1.5
+Requires-Dist: pydantic>=2.6
+Requires-Dist: ruamel.yaml>=0.18
+Requires-Dist: scipy>=1.10
+Requires-Dist: scikit-image>=0.22
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: tifffile>=2023.7.10
+Requires-Dist: pynrrd>=0.4.2
+Requires-Dist: antspyx>=0.4.2
+Requires-Dist: SimpleITK==2.2.1
+Requires-Dist: suite2p>=0.13.0
+Requires-Dist: cellpose>=3.0.0
+Requires-Dist: typer[all]>=0.9
+Requires-Dist: structlog>=24.1
+Requires-Dist: rich>=13.7
+Requires-Dist: jinja2>=3.1
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
+
+# social_imaging_scripts
+
+Utilities and notebooks for the social imaging pipeline. The repository is in
+the middle of a refactor to standardise preprocessing, registration, and ROI
+handling across animals.
+
+## Documentation quick links
+
+- [Metadata Entry Workflow](wiki/metadata_entry_workflow.md) – how to record new
+  animals and sessions in the Excel workbook before running the pipeline.
+
+Additional wiki pages can live under the `wiki/` folder; add links here as they
+appear so newcomers can discover them from the repository front page.

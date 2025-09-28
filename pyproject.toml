@@ -14,7 +14,7 @@ authors = [
 ]
 
 dependencies = [
-  "numpy>=1.24",
+  "numpy>=1.24,<2.0",
   "pandas>=1.5",
   "pydantic>=2.6",
   "ruamel.yaml>=0.18",
@@ -24,7 +24,7 @@ dependencies = [
   "tifffile>=2023.7.10",
   "pynrrd>=0.4.2",
   "antspyx>=0.4.2",
-  "SimpleITK>=2.3",
+  "SimpleITK==2.2.1",
   "suite2p>=0.13.0",
   "cellpose>=3.0.0",
   "typer[all]>=0.9",

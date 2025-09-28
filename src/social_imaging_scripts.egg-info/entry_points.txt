@@ -1,0 +1,2 @@
+[console_scripts]
+social-img-pipeline = social_imaging_scripts.pipeline.cli:main

@@ -12,7 +12,9 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .config import normalise_pathlike
 
 
 class MetaSource(BaseModel):
@@ -53,6 +55,16 @@ class FunctionalSessionData(BaseModel):
     channels: list[ChannelInfo] = Field(default_factory=list)
     preprocessing_two_photon: Optional[TwoPhotonPreprocessing] = None
 
+    @field_validator("raw_path", mode="before")
+    @classmethod
+    def _normalise_raw_path(cls, value):
+        return normalise_pathlike(value)
+
+    @field_validator("stimulus_metadata_path", mode="before")
+    @classmethod
+    def _normalise_stimulus_metadata(cls, value):
+        return normalise_pathlike(value)
+
 
 class AnatomySessionData(BaseModel):
     """Any anatomy stack (two-photon or confocal) captured for a session."""
@@ -63,6 +75,11 @@ class AnatomySessionData(BaseModel):
     stack_type: Literal["two_photon", "confocal"] = "confocal"
     channels: list[ChannelInfo] = Field(default_factory=list)
     preprocessing_two_photon: Optional[TwoPhotonPreprocessing] = None
+
+    @field_validator("raw_path", mode="before")
+    @classmethod
+    def _normalise_raw_path(cls, value):
+        return normalise_pathlike(value)
 
 
 class SessionCommon(BaseModel):
@@ -132,6 +149,11 @@ class AnimalMetadata(BaseModel):
     root_dir: Optional[Path] = None
     available_modalities: AvailableModalities = Field(default_factory=AvailableModalities)
     sessions: list[Session] = Field(default_factory=list)
+
+    @field_validator("root_dir", mode="before")
+    @classmethod
+    def _normalise_root_dir(cls, value):
+        return normalise_pathlike(value)
 
 
 class MetadataCollection(BaseModel):
