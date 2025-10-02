@@ -27,5 +27,6 @@ src/social_imaging_scripts/preprocessing/two_photon/utils.py
 src/social_imaging_scripts/qc/__init__.py
 src/social_imaging_scripts/registration/__init__.py
 src/social_imaging_scripts/registration/align_substack.py
+src/social_imaging_scripts/registration/fireants_pipeline.py
 src/social_imaging_scripts/registration/roi_registration.py
 src/social_imaging_scripts/transforms/__init__.py

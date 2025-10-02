@@ -1,0 +1,24 @@
+here is some context on the project we are working on:
+
+Project Overview
+
+Building a full social_imaging_scripts pipeline to align multi-modal zebrafish imaging data (2p functional + anatomy + confocal (HCR)) into a common reference space.
+Current focus is on two-photon preprocessing: plane splitting, negative-pixel correction, Suite2p motion correction, and ROI extraction ready for downstream registration/analysis.
+Key Decisions
+
+Adopted pyproject.toml package layout; notebooks/scripts import modules via social_imaging_scripts.
+Metadata lives as per-animal YAML generated from a single Excel “stacks” tab; animals now just contain an animal_id plus stack entries, with optional two-photon preprocessing settings supplied via discriminated union.
+Added project-level config for raw-data root vs processed-output root, enabling relocation between network storage and local scratch.
+Preprocessing outputs follow the lab’s legacy structure: motion-corrected TIFFs named {animal}_plane{idx}_mcorrected.tif; Suite2p artefacts renamed with the same prefix.
+Suite2p integration reuses the lab’s shared ops template (suite2p_ops_may2025.npy), caps batch size at 400 frames, and merges registered chunks numerically to preserve frame order.
+
+Current Status & Next Steps
+
+Functional stack preprocessing and motion correction verified on L395_f10; merged TIFFs now match legacy results chunk-wise.
+Metadata, preprocessing notebooks, and wiki guide are documented; 
+For WSL deployment, update the project config/metadata to reflect POSIX paths; core code uses pathlib and will work once roots are adjusted.
+
+important agent restrictions:
+treat all existing data on the network drive a off-limits for change. Never delete anything there. Read only.
+
+we are on a wsl machine and using the environment fireantsGH. always use that for testing.

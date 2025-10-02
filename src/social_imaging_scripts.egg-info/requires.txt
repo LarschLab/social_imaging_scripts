@@ -8,6 +8,7 @@ matplotlib>=3.7
 tifffile>=2023.7.10
 pynrrd>=0.4.2
 antspyx>=0.4.2
+fireants>=0.4.0
 SimpleITK==2.2.1
 suite2p>=0.13.0
 cellpose>=3.0.0

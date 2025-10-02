@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Pipeline for cross-animal 2p/confocal registration and ROI processing"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors = [
   { name = "Social Imaging Team", email = "lab@example.com" }
 ]

@@ -1,0 +1,331 @@
+"""FireANTs-based registration pipeline utilities."""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, dataclass, field, is_dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import SimpleITK as sitk
+import tifffile
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WinsorizeSettings:
+    """Intensity clipping prior to registration."""
+
+    enabled: bool = True
+    lower_percentile: float = 0.5
+    upper_percentile: float = 99.5
+
+
+@dataclass
+class AffineSettings:
+    """Configuration for the FireANTs affine registration stage."""
+
+    scales: tuple[int, ...] = (4, 2, 1)
+    iterations: tuple[int, ...] = (1000, 500, 250)
+    optimizer: str = "Adam"
+    optimizer_lr: float = 0.05
+    cc_kernel_size: int = 5
+    tolerance: float = 1e-6
+    max_tolerance_iters: int = 10
+    loss_type: str = "cc"
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GreedySettings:
+    """Configuration for the FireANTs greedy (non-linear) registration stage."""
+
+    enabled: bool = True
+    scales: tuple[int, ...] = (4, 2, 1)
+    iterations: tuple[int, ...] = (250, 200, 100)
+    optimizer: str = "Adam"
+    optimizer_lr: float = 0.05
+    cc_kernel_size: int = 5
+    smooth_grad_sigma: float = 1.0
+    smooth_warp_sigma: float = 0.5
+    deformation_type: str = "compositive"
+    optimizer_params: Dict[str, Any] = field(default_factory=dict)
+    loss_params: Dict[str, Any] = field(default_factory=dict)
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FireANTsRegistrationConfig:
+    """Top-level registration configuration with embedded defaults."""
+
+    device: str = "cuda"
+    winsorize: WinsorizeSettings = field(default_factory=WinsorizeSettings)
+    affine: AffineSettings = field(default_factory=AffineSettings)
+    greedy: GreedySettings = field(default_factory=GreedySettings)
+    qc_middle_plane: Optional[int] = None
+    qc_figsize: tuple[int, int] = (10, 6)
+
+    @classmethod
+    def with_overrides(
+        cls, overrides: Optional[Dict[str, Any]] = None
+    ) -> "FireANTsRegistrationConfig":
+        cfg = cls()
+        if overrides:
+            _apply_overrides(cfg, overrides)
+        return cfg
+
+
+def _apply_overrides(target: Any, overrides: Dict[str, Any]) -> None:
+    """Recursively apply dictionary overrides to (nested) dataclasses."""
+
+    for key, value in overrides.items():
+        if not hasattr(target, key):
+            raise AttributeError(f"Unknown configuration field '{key}'")
+        current = getattr(target, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            _apply_overrides(current, value)
+        else:
+            setattr(target, key, value)
+
+
+def _import_fireants():
+    fireants_version = "unknown"
+    try:
+        from importlib import metadata as _md
+
+        fireants_version = _md.version("fireants")
+    except Exception:  # pragma: no cover - best-effort
+        pass
+
+    try:
+        from fireants.io.image import Image as FAImage  # type: ignore
+        from fireants.io.image import BatchedImages  # type: ignore
+        from fireants.registration.affine import AffineRegistration  # type: ignore
+        from fireants.registration.greedy import GreedyRegistration  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "fireants (with GPU extensions) is required for registration"
+        ) from exc
+    return fireants_version, FAImage, BatchedImages, AffineRegistration, GreedyRegistration
+
+
+def _winsorize_image(
+    image: sitk.Image, settings: WinsorizeSettings
+) -> tuple[sitk.Image, Dict[str, float]]:
+    if not settings.enabled:
+        return image, {}
+    array = sitk.GetArrayFromImage(image).astype(np.float32)
+    lower, upper = np.percentile(
+        array, [settings.lower_percentile, settings.upper_percentile]
+    )
+    if upper <= lower:
+        upper = lower + 1.0
+    np.clip(array, lower, upper, out=array)
+    winsorized = sitk.GetImageFromArray(array)
+    winsorized.CopyInformation(image)
+    return winsorized, {"lower": float(lower), "upper": float(upper)}
+
+
+def register_two_photon_anatomy(
+    *,
+    animal_id: str,
+    session_id: str,
+    stack_path: Path,
+    reference_path: Path,
+    output_root: Path,
+    config: Optional[FireANTsRegistrationConfig] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Path]:
+    """Run FireANTs affine + greedy registration and persist outputs."""
+
+    cfg = config or FireANTsRegistrationConfig()
+    if overrides:
+        _apply_overrides(cfg, overrides)
+
+    if cfg.device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available, falling back to CPU")
+        cfg.device = "cpu"
+
+    fireants_version, FAImage, BatchedImages, AffineRegistration, GreedyRegistration = (
+        _import_fireants()
+    )
+
+    stack_path = Path(stack_path)
+    reference_path = Path(reference_path)
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    if not stack_path.exists():
+        raise FileNotFoundError(stack_path)
+    if not reference_path.exists():
+        raise FileNotFoundError(reference_path)
+
+    logger.info(
+        "fireants_registration_start",
+        extra={
+            "animal_id": animal_id,
+            "session_id": session_id,
+            "stack_path": str(stack_path),
+            "reference_path": str(reference_path),
+            "config": asdict(cfg),
+        },
+    )
+
+    moving_image = sitk.ReadImage(str(stack_path))
+    moving_image, winsorize_stats = _winsorize_image(moving_image, cfg.winsorize)
+    winsorized = cfg.winsorize.enabled and bool(winsorize_stats)
+
+    fixed_image = sitk.ReadImage(str(reference_path))
+
+    moving_fa = FAImage(moving_image, device=cfg.device, dtype=torch.float32)
+    fixed_fa = FAImage(fixed_image, device=cfg.device, dtype=torch.float32)
+    fixed_batch = BatchedImages(fixed_fa)
+    moving_batch = BatchedImages(moving_fa)
+
+    affine = AffineRegistration(
+        list(cfg.affine.scales),
+        list(cfg.affine.iterations),
+        fixed_batch,
+        moving_batch,
+        optimizer=cfg.affine.optimizer,
+        optimizer_lr=cfg.affine.optimizer_lr,
+        cc_kernel_size=cfg.affine.cc_kernel_size,
+        tolerance=cfg.affine.tolerance,
+        max_tolerance_iters=cfg.affine.max_tolerance_iters,
+        loss_type=cfg.affine.loss_type,
+        **cfg.affine.extra_args,
+    )
+    affine.optimize()
+    affine_warp = affine.evaluate(fixed_batch, moving_batch)
+
+    transforms_dir = output_root / "transforms"
+    transforms_dir.mkdir(exist_ok=True)
+    affine_transform_path = transforms_dir / f"{animal_id}_fireants_affine.mat"
+    affine.save_as_ants_transforms(str(affine_transform_path))
+
+    final_tensor = affine_warp
+    greedy_transform_path: Optional[Path] = None
+    greedy_inverse_path: Optional[Path] = None
+
+    if cfg.greedy.enabled:
+        greedy = GreedyRegistration(
+            list(cfg.greedy.scales),
+            list(cfg.greedy.iterations),
+            fixed_batch,
+            moving_batch,
+            optimizer=cfg.greedy.optimizer,
+            optimizer_lr=cfg.greedy.optimizer_lr,
+            cc_kernel_size=cfg.greedy.cc_kernel_size,
+            smooth_grad_sigma=cfg.greedy.smooth_grad_sigma,
+            smooth_warp_sigma=cfg.greedy.smooth_warp_sigma,
+            deformation_type=cfg.greedy.deformation_type,
+            optimizer_params=cfg.greedy.optimizer_params,
+            loss_params=cfg.greedy.loss_params,
+            **cfg.greedy.extra_args,
+        )
+        greedy.optimize()
+        final_tensor = greedy.evaluate(fixed_batch, moving_batch)
+        greedy_transform_path = transforms_dir / f"{animal_id}_fireants_greedy_warp.nii.gz"
+        greedy_inverse_path = transforms_dir / f"{animal_id}_fireants_greedy_inverse_warp.nii.gz"
+        greedy.save_as_ants_transforms(str(greedy_transform_path))
+        greedy.save_as_ants_transforms(str(greedy_inverse_path), save_inverse=True)
+
+    warped_volume = final_tensor.squeeze().detach().cpu().numpy().astype(np.float32)
+    warped_stack_path = output_root / f"{animal_id}_anatomy_warped_fireants.tif"
+    tifffile.imwrite(warped_stack_path, warped_volume)
+
+    qc_dir = output_root / "qc"
+    qc_dir.mkdir(exist_ok=True)
+    qc_path = qc_dir / f"{animal_id}_fireants_qc.png"
+    _write_qc_figure(
+        reference=fixed_fa.array.squeeze().detach().cpu().numpy(),
+        moving=moving_fa.array.squeeze().detach().cpu().numpy(),
+        warped=warped_volume,
+        output_path=qc_path,
+        percentiles=(cfg.winsorize.lower_percentile, cfg.winsorize.upper_percentile),
+        middle_plane=cfg.qc_middle_plane,
+        figsize=cfg.qc_figsize,
+    )
+
+    metadata = {
+        "animal_id": animal_id,
+        "session_id": session_id,
+        "stack_path": str(stack_path),
+        "reference_path": str(reference_path),
+        "fireants_version": fireants_version,
+        "config": asdict(cfg),
+        "winsorize": {
+            "applied": winsorized,
+            "stats": winsorize_stats,
+        },
+        "outputs": {
+            "warped_stack": str(warped_stack_path),
+            "affine_transform": str(affine_transform_path),
+            "greedy_transform": str(greedy_transform_path) if greedy_transform_path else None,
+            "greedy_inverse_transform": str(greedy_inverse_path) if greedy_inverse_path else None,
+            "qc": str(qc_path),
+        },
+    }
+    metadata_path = output_root / "fireants_registration_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+
+    logger.info(
+        "fireants_registration_complete",
+        extra={
+            "animal_id": animal_id,
+            "session_id": session_id,
+            "outputs": metadata["outputs"],
+        },
+    )
+
+    results: Dict[str, Path] = {
+        "warped_stack": warped_stack_path,
+        "affine_transform": affine_transform_path,
+        "metadata": metadata_path,
+        "qc": qc_path,
+    }
+    if greedy_transform_path:
+        results["greedy_transform"] = greedy_transform_path
+    if greedy_inverse_path:
+        results["greedy_inverse_transform"] = greedy_inverse_path
+    return results
+
+
+def _write_qc_figure(
+    *,
+    reference: np.ndarray,
+    moving: np.ndarray,
+    warped: np.ndarray,
+    output_path: Path,
+    percentiles: tuple[float, float],
+    middle_plane: Optional[int],
+    figsize: tuple[int, int],
+) -> None:
+    z_max = reference.shape[0]
+    index = middle_plane if middle_plane is not None else z_max // 2
+    index = int(np.clip(index, 0, z_max - 1))
+
+    def _norm(slice_2d: np.ndarray) -> np.ndarray:
+        lo, hi = np.percentile(slice_2d, percentiles)
+        if hi <= lo:
+            hi = lo + 1.0
+        out = np.clip((slice_2d - lo) / (hi - lo), 0.0, 1.0)
+        return out
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    axes[0].imshow(_norm(reference[index]), cmap="gray")
+    axes[0].set_title("Reference")
+    axes[1].imshow(_norm(moving[index]), cmap="gray")
+    axes[1].set_title("Moving (pre)")
+    axes[2].imshow(_norm(warped[index]), cmap="gray")
+    axes[2].set_title("Warpped (post)")
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
