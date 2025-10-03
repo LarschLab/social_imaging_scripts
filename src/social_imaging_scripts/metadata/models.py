@@ -75,6 +75,8 @@ class AnatomySessionData(BaseModel):
     stack_type: Literal["two_photon", "confocal"] = "confocal"
     channels: list[ChannelInfo] = Field(default_factory=list)
     preprocessing_two_photon: Optional[TwoPhotonPreprocessing] = None
+    pixel_size_xy_um: Optional[tuple[float, float]] = None
+    z_step_um: Optional[float] = None
 
     @field_validator("raw_path", mode="before")
     @classmethod

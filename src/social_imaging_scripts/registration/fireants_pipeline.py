@@ -16,13 +16,17 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import SimpleITK as sitk
 import tifffile
 import torch
+import pandas as pd
+
+from social_imaging_scripts.metadata.config import resolve_raw_path
+from social_imaging_scripts.metadata.models import AnimalMetadata, AnatomySession
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +202,96 @@ def _winsorize_image(
     return winsorized, {"lower": float(lower), "upper": float(upper)}
 
 
+def _compute_pixel_size_from_tiff(path: Path) -> Optional[Tuple[float, float]]:
+    """Return lateral pixel size in micrometres using TIFF resolution tags."""
+
+    with tifffile.TiffFile(path) as tif:
+        tags = tif.pages[0].tags
+        xres = tags.get("XResolution")
+        yres = tags.get("YResolution")
+        unit = tags.get("ResolutionUnit")
+
+    if not xres or not yres or not unit:
+        return None
+
+    def _single(res_value) -> Optional[float]:
+        if isinstance(res_value, tuple) and len(res_value) == 2:
+            num, den = res_value
+        else:
+            return None
+        if den == 0:
+            return None
+        return num / den
+
+    px_per_unit_x = _single(xres.value)
+    px_per_unit_y = _single(yres.value)
+    if not px_per_unit_x or not px_per_unit_y:
+        return None
+
+    unit_val = unit.value if hasattr(unit, "value") else unit
+    if unit_val == 2:  # inch
+        factor = 25400.0  # microns per inch
+    elif unit_val == 3:  # centimeter
+        factor = 10000.0  # microns per cm
+    else:
+        return None
+
+    size_x = factor / px_per_unit_x
+    size_y = factor / px_per_unit_y
+    return float(size_x), float(size_y)
+
+
+def _lookup_z_step_um(animal: AnimalMetadata, session: AnatomySession) -> Optional[float]:
+    """Read step_size_um_anatomy from the microscope metadata CSV if present."""
+
+    try:
+        metadata_dir = resolve_raw_path(Path(animal.root_dir) / "01_raw/2p/metadata")
+    except FileNotFoundError:
+        return None
+
+    for csv_path in sorted(Path(metadata_dir).glob("*_metadata.csv")):
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        if "parameter" not in df.columns or "value" not in df.columns:
+            continue
+        mask = df["parameter"].str.fullmatch("step_size_um_anatomy", case=False, na=False)
+        if mask.any():
+            raw_value = df.loc[mask, "value"].dropna().iloc[0]
+            try:
+                return float(raw_value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _prepare_voxel_spacing(
+    animal: Optional[AnimalMetadata], session: Optional[AnatomySession]
+) -> Tuple[Optional[Tuple[float, float]], Optional[float]]:
+    """Ensure session carries voxel spacing metadata; return (xy, z) in microns."""
+
+    if animal is None or session is None:
+        return None, None
+
+    pixel_size = session.session_data.pixel_size_xy_um
+    z_step = session.session_data.z_step_um
+
+    raw_stack_path = resolve_raw_path(Path(animal.root_dir) / session.session_data.raw_path)
+
+    if pixel_size is None:
+        pixel_size = _compute_pixel_size_from_tiff(raw_stack_path)
+        if pixel_size:
+            session.session_data.pixel_size_xy_um = pixel_size
+
+    if z_step is None:
+        z_step = _lookup_z_step_um(animal, session)
+        if z_step is not None:
+            session.session_data.z_step_um = z_step
+
+    return pixel_size, z_step
+
+
 def register_two_photon_anatomy(
     *,
     animal_id: str,
@@ -207,7 +301,7 @@ def register_two_photon_anatomy(
     output_root: Path,
     config: Optional[FireANTsRegistrationConfig] = None,
     overrides: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Path]:
+) -> Dict[str, Any]:
     """Run FireANTs affine + greedy registration and persist outputs."""
 
     cfg = config or FireANTsRegistrationConfig()
@@ -237,6 +331,13 @@ def register_two_photon_anatomy(
     if not reference_path.exists():
         raise FileNotFoundError(reference_path)
 
+    pixel_size_um, z_step_um = _prepare_voxel_spacing(animal_metadata, session_metadata)
+
+    spacing_info = {
+        "pixel_size_xy_um": list(pixel_size_um) if pixel_size_um else None,
+        "z_step_um": z_step_um,
+    }
+
     logger.info(
         "fireants_registration_start",
         extra={
@@ -245,11 +346,20 @@ def register_two_photon_anatomy(
             "stack_path": str(stack_path),
             "reference_path": str(reference_path),
             "config": asdict(cfg),
+            "voxel_spacing_um": spacing_info,
         },
     )
 
     moving_image = sitk.ReadImage(str(stack_path))
     fixed_image = sitk.ReadImage(str(reference_path))
+
+    spacing = list(moving_image.GetSpacing())
+    if pixel_size_um:
+        spacing[0] = pixel_size_um[0] / 1000.0
+        spacing[1] = pixel_size_um[1] / 1000.0
+    if z_step_um is not None and len(spacing) >= 3:
+        spacing[2] = z_step_um / 1000.0
+    moving_image.SetSpacing(tuple(spacing))
 
     moving_image, winsorize_stats_moving = _winsorize_image(moving_image, cfg.winsorize)
     fixed_image, winsorize_stats_fixed = _winsorize_image(fixed_image, cfg.winsorize)
@@ -379,6 +489,7 @@ def register_two_photon_anatomy(
         "reference_path": str(reference_path),
         "fireants_version": fireants_version,
         "config": asdict(cfg),
+        "voxel_spacing_um": spacing_info,
         "winsorize": {
             "applied": winsorized,
             "moving": winsorize_stats_moving,
@@ -403,10 +514,11 @@ def register_two_photon_anatomy(
             "animal_id": animal_id,
             "session_id": session_id,
             "outputs": metadata["outputs"],
+            "voxel_spacing_um": spacing_info,
         },
     )
 
-    results: Dict[str, Path] = {
+    results: Dict[str, Any] = {
         "warped_stack": warped_stack_path,
         "affine_transform": affine_transform_path,
         "metadata": metadata_path,
@@ -416,6 +528,7 @@ def register_two_photon_anatomy(
         results["greedy_transform"] = greedy_transform_path
     if greedy_inverse_path:
         results["greedy_inverse_transform"] = greedy_inverse_path
+    results["voxel_spacing_um"] = spacing_info
     return results
 
 
