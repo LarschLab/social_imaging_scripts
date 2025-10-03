@@ -19,25 +19,25 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WinsorizeSettings:
-    """Intensity clipping prior to registration."""
+    """Intensity clipping + normalization prior to registration."""
 
     enabled: bool = True
-    lower_percentile: float = 0.5
-    upper_percentile: float = 99.5
+    lower_percentile: float = 1.0
+    upper_percentile: float = 99.0
 
 
 @dataclass
 class AffineSettings:
     """Configuration for the FireANTs affine registration stage."""
 
-    scales: tuple[int, ...] = (4, 2, 1)
-    iterations: tuple[int, ...] = (1000, 500, 250)
+    scales: tuple[int, ...] = (12, 8, 4, 2, 1)
+    iterations: tuple[int, ...] = (200, 200, 200, 100, 50)
     optimizer: str = "Adam"
-    optimizer_lr: float = 0.05
-    cc_kernel_size: int = 5
+    optimizer_lr: float = 3e-3
+    cc_kernel_size: int = 31
     tolerance: float = 1e-6
     max_tolerance_iters: int = 10
-    loss_type: str = "cc"
+    loss_type: str = "fusedcc"
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -46,13 +46,14 @@ class GreedySettings:
     """Configuration for the FireANTs greedy (non-linear) registration stage."""
 
     enabled: bool = True
-    scales: tuple[int, ...] = (4, 2, 1)
-    iterations: tuple[int, ...] = (250, 200, 100)
+    scales: tuple[int, ...] = (12, 8, 4, 2, 1)
+    iterations: tuple[int, ...] = (200, 200, 200, 100, 25)
     optimizer: str = "Adam"
-    optimizer_lr: float = 0.05
-    cc_kernel_size: int = 5
-    smooth_grad_sigma: float = 1.0
-    smooth_warp_sigma: float = 0.5
+    optimizer_lr: float = 0.5
+    cc_kernel_size: int = 31
+    loss_type: str = "fusedcc"
+    smooth_grad_sigma: float = 5.0
+    smooth_warp_sigma: float = 3.0
     deformation_type: str = "compositive"
     optimizer_params: Dict[str, Any] = field(default_factory=dict)
     loss_params: Dict[str, Any] = field(default_factory=dict)
@@ -65,6 +66,7 @@ class FireANTsRegistrationConfig:
 
     device: str = "cuda"
     winsorize: WinsorizeSettings = field(default_factory=WinsorizeSettings)
+    moments_scale: int = 4
     affine: AffineSettings = field(default_factory=AffineSettings)
     greedy: GreedySettings = field(default_factory=GreedySettings)
     qc_middle_plane: Optional[int] = None
@@ -111,7 +113,20 @@ def _import_fireants():
         raise ImportError(
             "fireants (with GPU extensions) is required for registration"
         ) from exc
-    return fireants_version, FAImage, BatchedImages, AffineRegistration, GreedyRegistration
+    try:
+        from fireants.registration.moments import MomentsRegistration  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "fireants moments registration not available"  # pragma: no cover
+        ) from exc
+    return (
+        fireants_version,
+        FAImage,
+        BatchedImages,
+        MomentsRegistration,
+        AffineRegistration,
+        GreedyRegistration,
+    )
 
 
 def _winsorize_image(
@@ -126,8 +141,18 @@ def _winsorize_image(
     if upper <= lower:
         upper = lower + 1.0
     np.clip(array, lower, upper, out=array)
-    winsorized = sitk.GetImageFromArray(array)
+    array = (array - lower) / (upper - lower + 1e-8)
+    winsorized = sitk.GetImageFromArray(array.astype(np.float32))
     winsorized.CopyInformation(image)
+    print(
+        "Winsorize stats:",
+        {
+            "lower_percentile": settings.lower_percentile,
+            "upper_percentile": settings.upper_percentile,
+            "lower_value": float(lower),
+            "upper_value": float(upper),
+        },
+    )
     return winsorized, {"lower": float(lower), "upper": float(upper)}
 
 
@@ -151,9 +176,14 @@ def register_two_photon_anatomy(
         logger.warning("CUDA requested but not available, falling back to CPU")
         cfg.device = "cpu"
 
-    fireants_version, FAImage, BatchedImages, AffineRegistration, GreedyRegistration = (
-        _import_fireants()
-    )
+    (
+        fireants_version,
+        FAImage,
+        BatchedImages,
+        MomentsRegistration,
+        AffineRegistration,
+        GreedyRegistration,
+    ) = _import_fireants()
 
     stack_path = Path(stack_path)
     reference_path = Path(reference_path)
@@ -177,15 +207,23 @@ def register_two_photon_anatomy(
     )
 
     moving_image = sitk.ReadImage(str(stack_path))
-    moving_image, winsorize_stats = _winsorize_image(moving_image, cfg.winsorize)
-    winsorized = cfg.winsorize.enabled and bool(winsorize_stats)
-
     fixed_image = sitk.ReadImage(str(reference_path))
+
+    moving_image, winsorize_stats_moving = _winsorize_image(moving_image, cfg.winsorize)
+    fixed_image, winsorize_stats_fixed = _winsorize_image(fixed_image, cfg.winsorize)
+    winsorized = cfg.winsorize.enabled and (winsorize_stats_moving or winsorize_stats_fixed)
 
     moving_fa = FAImage(moving_image, device=cfg.device, dtype=torch.float32)
     fixed_fa = FAImage(fixed_image, device=cfg.device, dtype=torch.float32)
     fixed_batch = BatchedImages(fixed_fa)
     moving_batch = BatchedImages(moving_fa)
+
+    moments = MomentsRegistration(
+        scale=cfg.moments_scale, fixed_images=fixed_batch, moving_images=moving_batch
+    )
+    moments.optimize()
+    init_affine = moments.get_affine_init().detach()
+    print("Moments init affine:\n", init_affine.cpu().numpy())
 
     affine = AffineRegistration(
         list(cfg.affine.scales),
@@ -198,6 +236,7 @@ def register_two_photon_anatomy(
         tolerance=cfg.affine.tolerance,
         max_tolerance_iters=cfg.affine.max_tolerance_iters,
         loss_type=cfg.affine.loss_type,
+        init_rigid=init_affine,
         **cfg.affine.extra_args,
     )
     affine.optimize()
@@ -221,11 +260,13 @@ def register_two_photon_anatomy(
             optimizer=cfg.greedy.optimizer,
             optimizer_lr=cfg.greedy.optimizer_lr,
             cc_kernel_size=cfg.greedy.cc_kernel_size,
+            loss_type=cfg.greedy.loss_type,
             smooth_grad_sigma=cfg.greedy.smooth_grad_sigma,
             smooth_warp_sigma=cfg.greedy.smooth_warp_sigma,
             deformation_type=cfg.greedy.deformation_type,
             optimizer_params=cfg.greedy.optimizer_params,
             loss_params=cfg.greedy.loss_params,
+            init_affine=affine.get_affine_matrix().detach(),
             **cfg.greedy.extra_args,
         )
         greedy.optimize()
@@ -261,7 +302,8 @@ def register_two_photon_anatomy(
         "config": asdict(cfg),
         "winsorize": {
             "applied": winsorized,
-            "stats": winsorize_stats,
+            "moving": winsorize_stats_moving,
+            "fixed": winsorize_stats_fixed,
         },
         "outputs": {
             "warped_stack": str(warped_stack_path),
