@@ -1,4 +1,14 @@
-"""FireANTs-based registration pipeline utilities."""
+"""FireANTs-based registration pipeline utilities.
+
+This module encapsulates the exact FireANTs workflow we validated in
+``exampleNotebooks/RohitSettings.ipynb`` (Rohit Jena, 2025). The notebook
+established a three-stage recipe—moment alignment, affine refinement, and
+greedy diffeomorphic warping—along with specific hyper-parameters that provide
+robust alignment for zebrafish two-photon anatomy stacks. The defaults below
+mirror those values so that the automated pipeline reproduces the same
+behaviour and runtime characteristics you would observe when running the
+notebook manually.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +29,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WinsorizeSettings:
-    """Intensity clipping + normalization prior to registration."""
+    """Intensity clipping + normalization prior to registration.
+
+    Rohit's workflow clips both moving and reference stacks to the 1st/99th
+    percentile before rescaling into ``[0, 1]``. This stabilises the
+    cross-correlation loss (especially `fusedcc`) and keeps the optimiser from
+    chasing extremely bright nuclei. The ``enabled`` switch allows providers to
+    skip the step when pre-normalised volumes are supplied.
+    """
 
     enabled: bool = True
     lower_percentile: float = 1.0
@@ -28,7 +45,15 @@ class WinsorizeSettings:
 
 @dataclass
 class AffineSettings:
-    """Configuration for the FireANTs affine registration stage."""
+    """Configuration for the FireANTs affine registration stage.
+
+    Defaults reproduce the multi-resolution schedule from Rohit's notebook:
+    coarse-to-fine scales ``[12, 8, 4, 2, 1]`` with per-level iteration counts
+    ``[200, 200, 200, 100, 50]``. The `fusedcc` loss and kernel size ``31`` are
+    essential for contrast-invariant matching across anatomy stacks, while the
+    relatively small Adam learning rate ``3e-3`` prevents overshooting once the
+    rigid moment initialisation is applied.
+    """
 
     scales: tuple[int, ...] = (12, 8, 4, 2, 1)
     iterations: tuple[int, ...] = (200, 200, 200, 100, 50)
@@ -43,7 +68,16 @@ class AffineSettings:
 
 @dataclass
 class GreedySettings:
-    """Configuration for the FireANTs greedy (non-linear) registration stage."""
+    """Configuration for the FireANTs greedy (non-linear) registration stage.
+
+    Again, these numbers originate from the RohitSettings notebook: the greedy
+    solver runs through the same multiscale pyramid (``[12, 8, 4, 2, 1]``) but
+    stops at 25 iterations on the finest level to limit runtime. The fused
+    cross-correlation loss with kernel ``31`` proved more stable than MI for
+    this dataset; the relatively aggressive Adam learning rate ``0.5`` is
+    compensated by the heavy Gaussian smoothing (``smooth_grad_sigma=5``,
+    ``smooth_warp_sigma=3``) which regularises each incremental warp update.
+    """
 
     enabled: bool = True
     scales: tuple[int, ...] = (12, 8, 4, 2, 1)
@@ -62,7 +96,13 @@ class GreedySettings:
 
 @dataclass
 class FireANTsRegistrationConfig:
-    """Top-level registration configuration with embedded defaults."""
+    """Top-level registration configuration with embedded defaults.
+
+    ``moments_scale`` controls the isotropic down-sampling applied inside
+    ``MomentsRegistration``. Setting this to ``4`` matches Rohit's notebook and
+    gives a quick-yet-robust rigid initialisation before the affine stage takes
+    over.
+    """
 
     device: str = "cuda"
     winsorize: WinsorizeSettings = field(default_factory=WinsorizeSettings)
@@ -144,6 +184,8 @@ def _winsorize_image(
     array = (array - lower) / (upper - lower + 1e-8)
     winsorized = sitk.GetImageFromArray(array.astype(np.float32))
     winsorized.CopyInformation(image)
+    # Mirror Rohit's notebook by printing the clipping bounds – handy when
+    # troubleshooting intensity scaling without diving into the metadata file.
     print(
         "Winsorize stats:",
         {
@@ -218,13 +260,21 @@ def register_two_photon_anatomy(
     fixed_batch = BatchedImages(fixed_fa)
     moving_batch = BatchedImages(moving_fa)
 
+    # Stage 1: rigid moment alignment (Rohit's notebook used scale=4). This
+    # provides a fast coarse initialisation that greatly accelerates the affine
+    # optimiser.
     moments = MomentsRegistration(
         scale=cfg.moments_scale, fixed_images=fixed_batch, moving_images=moving_batch
     )
     moments.optimize()
     init_affine = moments.get_affine_init().detach()
+    # Emit the 3×4 affine (again matching the notebook output) so operators can
+    # quickly verify the rigid offset.
     print("Moments init affine:\n", init_affine.cpu().numpy())
 
+    # Stage 2: affine refinement with fused cross-correlation as configured
+    # above. We feed in the rigid result via ``init_rigid`` to replicate the
+    # interactive workflow exactly.
     affine = AffineRegistration(
         list(cfg.affine.scales),
         list(cfg.affine.iterations),
@@ -250,6 +300,7 @@ def register_two_photon_anatomy(
     final_tensor = affine_warp
     greedy_transform_path: Optional[Path] = None
     greedy_inverse_path: Optional[Path] = None
+    inverse_summary: Optional[Dict[str, float]] = None
 
     if cfg.greedy.enabled:
         greedy = GreedyRegistration(
@@ -276,6 +327,22 @@ def register_two_photon_anatomy(
         greedy.save_as_ants_transforms(str(greedy_transform_path))
         greedy.save_as_ants_transforms(str(greedy_inverse_path), save_inverse=True)
 
+        # After saving the forward warp we ask FireANTs for an inverse solution.
+        # There is no public parameter to shorten the inverse solve, so we keep
+        # the default behaviour but record simple residual metrics for QC.
+        try:
+            inverse_tensor = greedy.evaluate_inverse(fixed_batch, moving_batch)
+            moving_tensor = moving_batch()
+            diff = inverse_tensor - moving_tensor
+            inverse_mse = float(torch.mean(diff**2).item())
+            inverse_max = float(torch.max(torch.abs(diff)).item())
+            inverse_summary = {
+                "mse": inverse_mse,
+                "max_abs": inverse_max,
+            }
+        except Exception:  # pragma: no cover - diagnostic only
+            inverse_summary = None
+
     warped_volume = final_tensor.squeeze().detach().cpu().numpy().astype(np.float32)
     warped_stack_path = output_root / f"{animal_id}_anatomy_warped_fireants.tif"
     tifffile.imwrite(warped_stack_path, warped_volume)
@@ -292,6 +359,18 @@ def register_two_photon_anatomy(
         middle_plane=cfg.qc_middle_plane,
         figsize=cfg.qc_figsize,
     )
+
+    if cfg.greedy.enabled:
+        if inverse_summary is not None:
+            print("Inverse QC:", inverse_summary)
+            logger.info(
+                "fireants_inverse_qc",
+                extra={
+                    "animal_id": animal_id,
+                    "session_id": session_id,
+                    "metrics": inverse_summary,
+                },
+            )
 
     metadata = {
         "animal_id": animal_id,
@@ -313,6 +392,8 @@ def register_two_photon_anatomy(
             "qc": str(qc_path),
         },
     }
+    if cfg.greedy.enabled:
+        metadata["inverse_qc"] = inverse_summary
     metadata_path = output_root / "fireants_registration_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
