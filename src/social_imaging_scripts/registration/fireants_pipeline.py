@@ -299,6 +299,8 @@ def register_two_photon_anatomy(
     stack_path: Path,
     reference_path: Path,
     output_root: Path,
+    animal_metadata: Optional[AnimalMetadata] = None,
+    session_metadata: Optional[AnatomySession] = None,
     config: Optional[FireANTsRegistrationConfig] = None,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -355,10 +357,10 @@ def register_two_photon_anatomy(
 
     spacing = list(moving_image.GetSpacing())
     if pixel_size_um:
-        spacing[0] = pixel_size_um[0] / 1000.0
-        spacing[1] = pixel_size_um[1] / 1000.0
+        spacing[0] = pixel_size_um[0]
+        spacing[1] = pixel_size_um[1]
     if z_step_um is not None and len(spacing) >= 3:
-        spacing[2] = z_step_um / 1000.0
+        spacing[2] = z_step_um
     moving_image.SetSpacing(tuple(spacing))
 
     moving_image, winsorize_stats_moving = _winsorize_image(moving_image, cfg.winsorize)
