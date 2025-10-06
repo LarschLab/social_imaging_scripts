@@ -1,3 +1,2 @@
-raw_base_dir: \\SERVER\PATH\TO\RAW\DATA   # e.g., a network share
-output_base_dir: D:\pipelineTestOutput  # local fast disk for outputs
-
+raw_base_dir: /mnt/f/johannes/pipelineIn
+output_base_dir: /mnt/f/johannes/pipelineOut
