@@ -106,12 +106,20 @@ def build_metadata_from_excel(excel_path: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     xls = pd.ExcelFile(excel_path)
-    animals_df = xls.parse("animals").fillna("")
-    stacks_df = xls.parse("stacks").fillna("")
+
+    def _sheet_name(name: str) -> str:
+        lname = name.lower()
+        for sheet in xls.sheet_names:
+            if sheet.lower() == lname:
+                return sheet
+        raise ValueError(f"Worksheet named '{name}' not found")
+
+    animals_df = xls.parse(_sheet_name("animals")).fillna("")
+    stacks_df = xls.parse(_sheet_name("sessions")).fillna("")
     stacks_df = stacks_df.copy()
     stacks_df["session_type"] = stacks_df.get("stack_type")
     try:
-        tp_df = xls.parse("two_photon_settings").fillna("")
+        tp_df = xls.parse(_sheet_name("two_photon_settings")).fillna("")
     except ValueError:
         tp_df = pd.DataFrame(columns=[
             "session_id",

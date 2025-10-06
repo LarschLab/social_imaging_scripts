@@ -12,7 +12,7 @@ available_modalities:
   behavior: false
 sessions:
   - session_id: L395_f11_functional_2025-07-04
-    date: '2025-07-04'
+    date: '2025-04-07'
     condition: live
     experimenter: Matilde
     include_in_analysis: true
@@ -39,7 +39,7 @@ sessions:
           - 2
           - 3
   - session_id: L395_f11_anatomy_2025-07-04
-    date: '2025-07-04'
+    date: '2025-04-07'
     condition: live
     experimenter: Matilde
     include_in_analysis: true
@@ -47,6 +47,7 @@ sessions:
     session_data:
       raw_path: 01_raw/2p/anatomy/L395_f11_anatomy_00001.tif
       round_id: 1
+      plane_spacing: 2.0
       stack_type: two_photon
       channels:
         - channel_id: 1
@@ -54,8 +55,8 @@ sessions:
           marker: gcamp
           wavelength_nm: 850.0
           round_id: 1
-  - session_id: L395_f11_confocal_round1_2025-07-04
-    date: '2025-07-04'
+  - session_id: L395_f11_confocal_round1_zoom
+    date: '2025-04-07'
     condition: fixed
     experimenter: Matilde
     include_in_analysis: true
@@ -63,8 +64,9 @@ sessions:
     session_type: anatomy_stack
     session_data:
       raw_path: 
-        01_raw/confocal/round1/L395_f11_r1_HuC-H2B-GC6s_sst12_546_pth2_647_Stitch.lsm
+        01_raw/confocal/round1/zoomThalamus_L395_f11_HuC-H2B-GC6s_sst11_546_pth2_647_Stitch.lsm
       round_id: 1
+      plane_spacing: 3.0
       stack_type: confocal
       channels:
         - channel_id: 1
@@ -73,26 +75,87 @@ sessions:
           wavelength_nm: 488.0
           round_id: 1
         - channel_id: 2
-          name: sst1_2
-          marker: sst1_2
+          name: sst11
+          marker: sst11
           wavelength_nm: 546.0
           round_id: 1
+        - channel_id: 3
+          name: pth2
+          marker: pth2
+          wavelength_nm: 647.0
+          round_id: 1
+  - session_id: L395_f11_confocal_round1_2025-07-04
+    date: '2025-04-07'
+    condition: fixed
+    experimenter: Matilde
+    include_in_analysis: true
+    notes: 'Round 1 markers: sst1_2, tac3b'
+    session_type: anatomy_stack
+    session_data:
+      raw_path: 
+        01_raw/confocal/round1/L395_f11_HuC-H2B-GC6s_sst11_546_pth2_647_Stitch.lsm
+      round_id: 1
+      plane_spacing: 3.0
+      stack_type: confocal
+      channels:
+        - channel_id: 1
+          name: gcamp
+          marker: gcamp
+          wavelength_nm: 488.0
+          round_id: 1
+        - channel_id: 2
+          name: sst11
+          marker: sst11
+          wavelength_nm: 546.0
+          round_id: 1
+        - channel_id: 3
+          name: pth2
+          marker: pth2
+          wavelength_nm: 647.0
+          round_id: 1
+  - session_id: L395_f11_confocal_roundn_zoom
+    date: '2025-04-07'
+    condition: fixed
+    experimenter: Matilde
+    include_in_analysis: true
+    image_quality: unknown
+    notes: 'Markers: sst12, tac3b'
+    session_type: anatomy_stack
+    session_data:
+      raw_path: 
+        01_raw/confocal/roundn/zoomThalamus_av8x_L395_f11_HuC-H2B-GC6s_sst12_546_tac3b_647_Stitch.lsm
+      round_id: 2
+      plane_spacing: 3.0
+      stack_type: confocal
+      channels:
+        - channel_id: 1
+          name: gcamp
+          marker: gcamp
+          wavelength_nm: 488.0
+          round_id: 2
+        - channel_id: 2
+          name: sst12
+          marker: sst12
+          wavelength_nm: 546.0
+          round_id: 2
         - channel_id: 3
           name: tac3b
           marker: tac3b
           wavelength_nm: 647.0
-          round_id: 1
-  - session_id: L395_f11_confocal_round2_2025-07-04
-    date: '2025-07-04'
+          round_id: 2
+  - session_id: L395_f11_confocal_roundn_2025-07-04
+    date: '2025-04-07'
     condition: fixed
     experimenter: Matilde
     include_in_analysis: true
-    notes: 'Round 2 markers: sst1_1, pth2'
+    image_quality: unknown
+    notes: 'Markers: sst12, tac3b'
     session_type: anatomy_stack
     session_data:
       raw_path: 
-        01_raw/confocal/roundn/L395_f11_r2_HuC-H2B-GC6s_sst11_546_tac3b_647_Stitch.lsm
+        01_raw/confocal/roundn/L395_f11_HuC-H2B-GC6s_sst12_546_tac3b_647_Stitch.lsm
       round_id: 2
+      plane_spacing: 3.0
       stack_type: confocal
       channels:
         - channel_id: 1
@@ -101,12 +164,12 @@ sessions:
           wavelength_nm: 488.0
           round_id: 2
         - channel_id: 2
-          name: sst1_1
-          marker: sst1_1
+          name: sst12
+          marker: sst12
           wavelength_nm: 546.0
           round_id: 2
         - channel_id: 3
-          name: pth2
-          marker: pth2
+          name: tac3b
+          marker: tac3b
           wavelength_nm: 647.0
           round_id: 2

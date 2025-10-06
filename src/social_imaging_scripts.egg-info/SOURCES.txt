@@ -12,6 +12,7 @@ src/social_imaging_scripts/analysis/bp_analysis.py
 src/social_imaging_scripts/analysis/tuning_analysis.py
 src/social_imaging_scripts/analysis/utils.py
 src/social_imaging_scripts/metadata/__init__.py
+src/social_imaging_scripts/metadata/build_from_excel.py
 src/social_imaging_scripts/metadata/config.py
 src/social_imaging_scripts/metadata/loader.py
 src/social_imaging_scripts/metadata/models.py
