@@ -37,6 +37,8 @@ from .processing_log import (
 
 logger = logging.getLogger(__name__)
 
+_LOGGING_CONFIGURED = False
+
 SessionStatus = Literal["success", "skipped", "failed"]
 AnimalStatus = Literal["success", "partial", "skipped", "failed"]
 
@@ -733,6 +735,24 @@ def run_pipeline(
     """Execute the batch pipeline, defaulting to parameters supplied by the project config."""
 
     cfg = cfg or load_project_config()
+
+    global _LOGGING_CONFIGURED
+    if getattr(cfg, 'apply_log_settings', False) and not _LOGGING_CONFIGURED:
+        level_name = str(getattr(cfg, 'log_level', 'INFO')).upper()
+        level = getattr(logging, level_name, None)
+        if not isinstance(level, int):
+            try:
+                level = int(level_name)
+            except ValueError:
+                level = logging.INFO
+        logging.basicConfig(
+            level=level,
+            format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+            force=True,
+        )
+        logging.getLogger().setLevel(level)
+        _LOGGING_CONFIGURED = True
+        logger.setLevel(level)
 
     logger.info("========== Starting social imaging pipeline ==========")
 

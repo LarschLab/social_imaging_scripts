@@ -388,6 +388,14 @@ class ProcessingLogConfig(BaseModel):
 class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    apply_log_settings: bool = Field(
+        default=False,
+        description="Configure logging automatically when running the pipeline.",
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="Logging level to apply when configuring logging.",
+    )
     raw_base_dir: Optional[Path] = Field(
         default=None, description="Base path for raw inputs (e.g., network share)."
     )

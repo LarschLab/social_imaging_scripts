@@ -1,3 +1,5 @@
+apply_log_settings: true
+log_level: INFO
 # Base directories for resolving raw inputs, processed outputs, and optional fast-disk scratch space.
 raw_base_dir: /mnt/f/johannes/pipelineIn          # Base path for raw animal data.
 ref_base_dir: /mnt/nas_jlarsch/03_Common_Use/reference brains/ref_05_LB_Perrino_2p/          # Base path containing reference volumes.
