@@ -1,0 +1,75 @@
+# Base directories for resolving raw inputs, processed outputs, and optional fast-disk scratch space.
+raw_base_dir: null            # Absolute or relative path to raw data root (set to null to require per-session roots).
+output_base_dir: outputs      # Base directory where processed artefacts are written.
+fast_disk_base_dir: null      # Optional high-speed scratch location for Suite2p (null disables dedicated fast disk).
+
+# Functional preprocessing: plane splitting and metadata export.
+functional_preprocessing:
+  enabled: true                # Run functional plane splitting stage.
+  reprocess: false             # Re-run even if metadata already exists.
+  root_subdir: 02_reg/00_preprocessing/2p_functional           # Relative output folder for functional preprocessing.
+  planes_subdir: 01_individualPlanes                          # Subdirectory containing per-plane TIFF stacks.
+  plane_filename_template: "{animal_id}_plane{plane_index}.tif"    # Naming pattern for individual plane TIFFs.
+  metadata_filename_template: "{animal_id}_preprocessing_metadata.json"  # Metadata filename for plane splitting.
+
+# Motion correction (Suite2p) configuration.
+motion_correction:
+  enabled: true                # Run Suite2p motion correction.
+  reprocess: false             # Re-run Suite2p even if metadata exists.
+  planes_subdir: 01_individualPlanes                          # Location of plane TIFFs relative to functional root.
+  motion_output_subdir: 02_motionCorrected                    # Destination for registered TIFFs.
+  plane_folder_template: "plane{plane_index}"                 # Subdirectory naming for each plane.
+  projections_subdir: projections                             # Folder for max/avg projection stacks.
+  suite2p_output_subdir: 03_suite2p                           # Destination for Suite2p segmentation outputs.
+  segmentation_folder_template: "plane{plane_index}"          # Naming for Suite2p segmentation folders.
+  motion_filename_template: "{animal_id}_plane{plane_index}_mcorrected.tif"  # Registered TIFF filename.
+  metadata_filename: "motion_metadata.json"                   # Suite2p metadata filename per plane.
+  default_fps: 2.0                # Default frame rate (Hz) if no overrides are provided.
+  per_animal_fps: {}              # Optional per-animal FPS overrides (e.g., {L331_f01: 1.8}).
+  per_session_fps: {}             # Optional per-session FPS overrides (e.g., {L331_f01_functional_2025-05-20: 1.6}).
+
+# Anatomy preprocessing.
+anatomy_preprocessing:
+  enabled: true                # Run anatomy stack preprocessing.
+  reprocess: false             # Re-run even if outputs already exist.
+  root_subdir: 02_reg/00_preprocessing/2p_anatomy              # Relative output folder for anatomy preprocessing.
+  metadata_filename_template: "{animal_id}_anatomy_metadata.json"  # Anatomy metadata filename.
+  stack_filename_template: "{animal_id}_anatomy_stack.tif"     # Preprocessed anatomy stack filename.
+
+# FireANTs registration (anatomy → reference brain).
+fireants_registration:
+  enabled: true                # Run FireANTs registration.
+  reprocess: false             # Re-run FireANTs even if warped stack exists.
+  output_subdir: 02_reg/02_fireants                           # Relative output folder for FireANTs artefacts.
+  config_path: null            # Optional external FireANTs config file path.
+  overrides: {}                # Inline overrides for FireANTs config fields.
+  warped_stack_template: "{animal_id}_anatomy_warped_fireants.tif"  # Warped anatomy stack filename.
+
+# Functional → anatomy registration.
+functional_to_anatomy_registration:
+  enabled: true                # Enable functional-to-anatomy registration step.
+  reprocess: false             # Re-run registration even if CSV exists.
+  registration_output_subdir: 02_reg/07_2pf-a                 # Output folder for registration CSVs.
+  projections_subdir: projections                             # Folder (under motion outputs) containing projection stacks.
+  summary_csv: 02_reg/07_2pf-a/combined_registration_log.csv  # Aggregate registration summary CSV.
+  summary_full_csv: 02_reg/07_2pf-a/combined_registration_full.csv  # Detailed per-plane registration CSV.
+  registration_csv_template: "{animal_id}_registration_results.csv"  # Per-animal registration CSV filename.
+  max_projection_filename_template: "{animal_id}_max_projections.tif"  # Max projection filename.
+  avg_projection_filename_template: "{animal_id}_avg_projections.tif"  # Average projection filename.
+  rotation_angle_deg: 0.0      # Rotation applied to functional projections before registration.
+  fixed_z_spacing_um: 1.0      # Axial spacing (µm) of anatomy stack slices.
+  scale_range: [0.65, 1.05]    # Scale search range for template matching.
+  n_scales: 12                 # Number of scales sampled within the range.
+  z_stride_coarse: 5           # Coarse z stride for initial search.
+  z_refine_radius: 4           # Radius (planes) used for z refinement.
+  pyramid_downscale: 2         # Downscale factor between pyramid levels.
+  pyramid_min_size: 160        # Minimum image dimension at the coarsest pyramid level.
+  gaussian_sigma: 0.5          # Gaussian smoothing sigma applied during preprocessing.
+  do_subpixel: false           # Enable subpixel refinement.
+  flip_fixed_horizontal: false # Flip anatomy stack left-right before registration.
+
+# Processing log output (optional).
+processing_log:
+  enabled: true                # Write per-animal processing logs.
+  directory: metadata/processed  # Directory for generated processing log YAMLs.
+  filename_template: "{animal_id}.yaml"  # Filename pattern for processing logs.

@@ -80,6 +80,7 @@ def move_suite2p_outputs(
     suite2p_folder: Path,
     motion_output: Path,
     segmentation_output: Path,
+    dest_motion: Path,
 ) -> Dict[str, Path]:
     """Collate Suite2p outputs and clean project layout."""
 
@@ -98,7 +99,6 @@ def move_suite2p_outputs(
         raise FileNotFoundError(f"No registered TIFF chunks found in {reg_folder}")
 
     motion_output.mkdir(parents=True, exist_ok=True)
-    dest_motion = motion_output / f"{animal_id}_plane{plane_idx}_mcorrected.tif"
     if dest_motion.exists():
         dest_motion.unlink()
 
@@ -144,6 +144,13 @@ def run_motion_correction(
     output_root: Path,
     fast_disk: Optional[Path] = None,
     reprocess: bool = False,
+    session_id: Optional[str] = None,
+    motion_output_subdir: str | Path = Path("02_motionCorrected"),
+    suite2p_output_subdir: str | Path = Path("03_suite2p"),
+    plane_folder_template: str = "plane{plane_index}",
+    segmentation_folder_template: str = "plane{plane_index}",
+    motion_filename_template: str = "{animal_id}_plane{plane_index}_mcorrected.tif",
+    metadata_filename: str = "motion_metadata.json",
 ) -> Dict[str, Path]:
     """Run Suite2p on one plane and organize outputs under output_root.
 
@@ -152,9 +159,23 @@ def run_motion_correction(
     """
 
     output_root = Path(output_root)
-    motion_output = output_root / "02_motionCorrected" / f"plane{plane_idx}"
-    segmentation_output = output_root / "03_suite2p" / f"plane{plane_idx}"
-    metadata_path = motion_output / "motion_metadata.json"
+    motion_output_subdir = Path(motion_output_subdir)
+    suite2p_output_subdir = Path(suite2p_output_subdir)
+
+    context = {
+        "animal_id": animal.animal_id,
+        "plane_index": plane_idx,
+    }
+    if session_id is not None:
+        context["session_id"] = session_id
+
+    plane_folder = plane_folder_template.format(**context)
+    segmentation_folder = segmentation_folder_template.format(**context)
+
+    motion_output = output_root / motion_output_subdir / plane_folder
+    segmentation_output = output_root / suite2p_output_subdir / segmentation_folder
+    metadata_name = metadata_filename.format(**context)
+    metadata_path = motion_output / metadata_name
 
     if metadata_path.exists() and not reprocess:
         logger.info("Skipping plane %d (metadata exists at %s)", plane_idx, metadata_path)
@@ -168,12 +189,14 @@ def run_motion_correction(
         fast_disk=fast_disk,
     )
 
+    dest_motion = motion_output / motion_filename_template.format(**context)
     outputs = move_suite2p_outputs(
         animal_id=animal.animal_id,
         plane_idx=plane_idx,
         suite2p_folder=output_root,
         motion_output=motion_output,
         segmentation_output=segmentation_output,
+        dest_motion=dest_motion,
     )
 
     metadata = {

@@ -67,12 +67,16 @@ def run(
     raw_dir: Path,
     output_root: Path,
     settings: TwoPhotonPreprocessing,
+    planes_subdir: str | Path = Path("01_individualPlanes"),
+    plane_filename_template: str = "{animal_id}_plane{plane_index}.tif",
+    metadata_filename: str = "{animal_id}_preprocessing_metadata.json",
 ) -> Dict[str, Path]:
     """Preprocess a functional stack described by *settings*."""
 
     raw_dir = Path(raw_dir)
     output_root = Path(output_root)
-    output_planes = output_root / "01_individualPlanes"
+    planes_subdir = Path(planes_subdir)
+    output_planes = output_root / planes_subdir
     output_planes.mkdir(parents=True, exist_ok=True)
 
     block_paths = list(_select_blocks(raw_dir, settings))
@@ -97,7 +101,9 @@ def run(
             "blocks": settings.blocks,
             "output_stack": str(stack_path),
         }
-        metadata_path = output_root / f"{animal_id}_functional_metadata.json"
+        metadata_path = output_root / metadata_filename.format(
+            animal_id=animal_id, session_id=session_id
+        )
         metadata_path.write_text(json.dumps(metadata, indent=2))
         return {"stack": stack_path, "metadata": metadata_path}
 
@@ -127,7 +133,12 @@ def run(
     plane_paths: Dict[str, Path] = {}
     for plane_idx in range(planes):
         plane_stack = averaged[:, plane_idx, :, :]
-        plane_path = output_planes / f"{animal_id}_plane{plane_idx}.tif"
+        plane_filename = plane_filename_template.format(
+            animal_id=animal_id,
+            session_id=session_id,
+            plane_index=plane_idx,
+        )
+        plane_path = output_planes / plane_filename
         utils.save_tiff_stack(plane_path, plane_stack)
         plane_paths[f"plane_{plane_idx}"] = plane_path
 
@@ -143,7 +154,9 @@ def run(
         "output_dir": str(output_planes),
         "volumes": volumes,
     }
-    metadata_path = output_planes / f"{animal_id}_preprocessing_metadata.json"
+    metadata_path = output_planes / metadata_filename.format(
+        animal_id=animal_id, session_id=session_id
+    )
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
     result = {"metadata": metadata_path}

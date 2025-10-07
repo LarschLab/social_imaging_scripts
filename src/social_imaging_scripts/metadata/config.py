@@ -3,14 +3,40 @@ from __future__ import annotations
 import os
 import platform
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Mapping, Optional
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 REFERENCE_BRAIN_RELATIVE = Path(
     "03_Common_Use/reference brains/ref_05_LB_Perrino_2p/average_2p_noRot_orig.nrrd"
 )
+
+_DEFAULT_CONFIG_FILENAMES = (
+    "metadata/pipeline_defaults.yaml",
+    "metadata/pipeline_defaults.yml",
+)
+_PROJECT_OVERRIDE_FILENAMES = (
+    "metadata/project.yaml",
+    "metadata/project.yml",
+    "project.yaml",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _running_in_wsl() -> bool:
+    if os.name == "nt":
+        return False
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8")
+    except OSError:
+        release = platform.uname().release
+    return "microsoft" in release.lower()
 
 
 def normalise_pathlike(value: str | Path | None) -> Optional[Path]:
@@ -70,83 +96,383 @@ def normalise_pathlike(value: str | Path | None) -> Optional[Path]:
     return Path(text)
 
 
+def _resolve_candidate_path(name: str | Path) -> Optional[Path]:
+    candidate = Path(name)
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    repo_candidate = _repo_root() / candidate
+    if repo_candidate.exists():
+        return repo_candidate
+    cwd_candidate = Path.cwd() / candidate
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return None
+
+
+def load_yaml_mapping(path: Path) -> Dict[str, Any]:
+    """Load a YAML mapping document."""
+
+    from ruamel.yaml import YAML
+
+    yaml = YAML(typ="safe")
+    data = yaml.load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(data, Mapping):
+        raise TypeError(f"Expected mapping at {path}, found {type(data).__name__}")
+    return dict(data)
+
+
+def _deep_update(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
+    for key, value in updates.items():
+        if (
+            key in base
+            and isinstance(base[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            base[key] = _deep_update(dict(base[key]), value)
+        else:
+            base[key] = value
+    return base
+
+
+class FunctionalPreprocessingConfig(BaseModel):
+    """Configuration for functional plane splitting and basic preprocessing."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Run functional plane splitting stage.")
+    reprocess: bool = Field(..., description="Re-run even if metadata already exists.")
+    root_subdir: Path = Field(
+        ...,
+        description="Relative output path for functional preprocessing artefacts.",
+    )
+    planes_subdir: Path = Field(
+        ...,
+        description="Subdirectory containing per-plane TIFF outputs.",
+    )
+    plane_filename_template: str = Field(
+        ...,
+        description="Template for preprocessed plane TIFF filenames.",
+    )
+    metadata_filename_template: str = Field(
+        ...,
+        description="Template for preprocessing metadata filenames.",
+    )
+
+    @field_validator("root_subdir", "planes_subdir", mode="before")
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
+class MotionCorrectionConfig(BaseModel):
+    """Configuration for Suite2p motion correction and projections."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Run Suite2p motion correction.")
+    reprocess: bool = Field(..., description="Re-run Suite2p even if metadata exists.")
+    planes_subdir: Path = Field(
+        ...,
+        description="Location of per-plane TIFFs relative to the functional root.",
+    )
+    motion_output_subdir: Path = Field(
+        ...,
+        description="Subdirectory for Suite2p motion-corrected outputs.",
+    )
+    plane_folder_template: str = Field(
+        ...,
+        description="Template for per-plane folder names under motion outputs.",
+    )
+    projections_subdir: Path = Field(
+        ...,
+        description="Subdirectory used to store max/avg projection stacks.",
+    )
+    suite2p_output_subdir: Path = Field(
+        ...,
+        description="Subdirectory containing Suite2p segmentation artefacts.",
+    )
+    segmentation_folder_template: str = Field(
+        ...,
+        description="Template for per-plane Suite2p segmentation folders.",
+    )
+    motion_filename_template: str = Field(
+        ...,
+        description="Filename template for motion-corrected TIFF outputs.",
+    )
+    metadata_filename: str = Field(
+        ...,
+        description="Filename for per-plane motion metadata.",
+    )
+    default_fps: float = Field(
+        ...,
+        description="Default frame rate (Hz) used for Suite2p runs.",
+    )
+    per_animal_fps: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional FPS overrides keyed by animal_id.",
+    )
+    per_session_fps: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional FPS overrides keyed by session_id.",
+    )
+
+    @field_validator(
+        "planes_subdir",
+        "motion_output_subdir",
+        "projections_subdir",
+        "suite2p_output_subdir",
+        mode="before",
+    )
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
+class AnatomyPreprocessingConfig(BaseModel):
+    """Configuration for two-photon anatomy preprocessing."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Run anatomy stack preprocessing.")
+    reprocess: bool = Field(..., description="Re-run even if outputs already exist.")
+    root_subdir: Path = Field(
+        ...,
+        description="Relative output path for anatomy preprocessing artefacts.",
+    )
+    metadata_filename_template: str = Field(
+        ...,
+        description="Template for anatomy preprocessing metadata filenames.",
+    )
+    stack_filename_template: str = Field(
+        ...,
+        description="Template for the generated anatomy stack filename.",
+    )
+
+    @field_validator("root_subdir", mode="before")
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
+class FireantsRegistrationStageConfig(BaseModel):
+    """Configuration for FireANTs anatomy registration stage."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Run FireANTs registration.")
+    reprocess: bool = Field(..., description="Re-run FireANTs even if warped stack exists.")
+    output_subdir: Path = Field(
+        ...,
+        description="Relative output path for FireANTs outputs.",
+    )
+    config_path: Optional[Path] = Field(
+        default=None,
+        description="Optional path to a FireANTs configuration YAML/JSON file.",
+    )
+    overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Dictionary of overrides applied to the FireANTs config model.",
+    )
+    warped_stack_template: str = Field(
+        ...,
+        description="Filename template for the warped anatomy stack.",
+    )
+
+    @field_validator("output_subdir", "config_path", mode="before")
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
+class FunctionalToAnatomyRegistrationConfig(BaseModel):
+    """Configuration for registering functional projections to anatomy stacks."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Enable functional-to-anatomy registration.")
+    reprocess: bool = Field(..., description="Re-run registration even if CSV exists.")
+    registration_output_subdir: Path = Field(
+        ...,
+        description="Relative output path for functional-to-anatomy registration artefacts.",
+    )
+    projections_subdir: Path = Field(
+        ...,
+        description="Subdirectory under the motion outputs for projection stacks.",
+    )
+    summary_csv: Path = Field(
+        ...,
+        description="Relative path for the aggregated registration summary CSV.",
+    )
+    summary_full_csv: Path = Field(
+        ...,
+        description="Relative path for the detailed registration log CSV.",
+    )
+    registration_csv_template: str = Field(
+        ...,
+        description="Filename template for per-animal registration CSV outputs.",
+    )
+    max_projection_filename_template: str = Field(
+        ...,
+        description="Filename template for saved maximum projection stacks.",
+    )
+    avg_projection_filename_template: str = Field(
+        ...,
+        description="Filename template for saved average projection stacks.",
+    )
+    rotation_angle_deg: float = Field(
+        ...,
+        description="Rotation applied to functional projections prior to registration.",
+    )
+    fixed_z_spacing_um: float = Field(
+        ...,
+        description="Axial spacing (um) for the fixed anatomy stack.",
+    )
+    scale_range: tuple[float, float] = Field(
+        ...,
+        description="Inclusive scale search range for template matching.",
+    )
+    n_scales: int = Field(
+        ...,
+        description="Number of discrete scales evaluated during search.",
+    )
+    z_stride_coarse: int = Field(
+        ...,
+        description="Coarse stride (planes) for initial z search.",
+    )
+    z_refine_radius: int = Field(
+        ...,
+        description="Number of planes on each side sampled during z refinement.",
+    )
+    pyramid_downscale: int = Field(
+        ...,
+        description="Downscale factor between pyramid levels.",
+    )
+    pyramid_min_size: int = Field(
+        ...,
+        description="Smallest dimension allowed in the search pyramid.",
+    )
+    gaussian_sigma: float = Field(
+        ...,
+        description="Gaussian sigma used during preprocessing.",
+    )
+    do_subpixel: bool = Field(
+        ...,
+        description="Enable subpixel refinement during registration.",
+    )
+    flip_fixed_horizontal: bool = Field(
+        ...,
+        description="Flip anatomy stacks horizontally before registration.",
+    )
+
+    @field_validator(
+        "registration_output_subdir",
+        "projections_subdir",
+        "summary_csv",
+        "summary_full_csv",
+        mode="before",
+    )
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
+class ProcessingLogConfig(BaseModel):
+    """Configuration for generated per-animal processing artefact logs."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Write per-animal processing logs.")
+    directory: Path = Field(
+        ...,
+        description="Directory where per-animal processing logs are written.",
+    )
+    filename_template: str = Field(
+        ...,
+        description="Filename template for per-animal processing logs.",
+    )
+
+    @field_validator("directory", mode="before")
+    @classmethod
+    def _normalise_path(cls, value):
+        return normalise_pathlike(value)
+
+
 class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # Base directories
-    raw_base_dir: Optional[Path] = Field(default=None, description="Base path for raw inputs (e.g., network share)")
-    output_base_dir: Optional[Path] = Field(default=None, description="Base path for large outputs (local fast disk)")
+    raw_base_dir: Optional[Path] = Field(
+        default=None, description="Base path for raw inputs (e.g., network share)."
+    )
+    output_base_dir: Optional[Path] = Field(
+        default=None, description="Base path for processed outputs."
+    )
+    fast_disk_base_dir: Optional[Path] = Field(
+        default=None,
+        description="Optional fast disk scratch path for Suite2p outputs.",
+    )
+
+    functional_preprocessing: FunctionalPreprocessingConfig = Field(...)
+    motion_correction: MotionCorrectionConfig = Field(...)
+    anatomy_preprocessing: AnatomyPreprocessingConfig = Field(...)
+    fireants_registration: FireantsRegistrationStageConfig = Field(...)
+    functional_to_anatomy_registration: FunctionalToAnatomyRegistrationConfig = Field(
+        ...
+    )
+    processing_log: ProcessingLogConfig = Field(...)
 
     @field_validator("raw_base_dir", "output_base_dir", mode="before")
     @classmethod
     def _normalise_base(cls, value):
         return normalise_pathlike(value)
 
+    @field_validator("fast_disk_base_dir", mode="before")
+    @classmethod
+    def _normalise_fast_disk(cls, value):
+        return normalise_pathlike(value)
+
     @staticmethod
     def default_locations() -> list[Path]:
-        return [
-            Path("metadata/project.yaml"),
-            Path("metadata/project.yml"),
-            Path("project.yaml"),
-        ]
-
-
-def _running_in_wsl() -> bool:
-    if os.name == "nt":
-        return False
-    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
-        return True
-    try:
-        release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8")
-    except OSError:
-        release = platform.uname().release
-    return "microsoft" in release.lower()
-
-
-def _default_base_dirs() -> tuple[Optional[Path], Optional[Path]]:
-    if os.name == "nt":
-        return Path("Y:/"), Path(r"D:\\social_imaging_outputs")
-    if _running_in_wsl():
-        return Path("/mnt/nas_jlarsch"), Path("/mnt/f/johannes/testoutput")
-    return None, None
+        return [Path(name) for name in _PROJECT_OVERRIDE_FILENAMES]
 
 
 def load_project_config(path: Optional[Path] = None) -> ProjectConfig:
-    """Load project config from YAML if present, overridden by env vars.
+    """Load project configuration from defaults, overrides, and environment."""
 
-    Env overrides:
-      - SOCIAL_IMG_RAW_BASE
-      - SOCIAL_IMG_OUT_BASE
-    """
-    raw = os.getenv("SOCIAL_IMG_RAW_BASE")
-    out = os.getenv("SOCIAL_IMG_OUT_BASE")
+    data: Dict[str, Any] = {}
 
-    data = {}
-    if path is None:
-        for cand in ProjectConfig.default_locations():
-            if cand.exists():
-                path = cand
+    default_loaded = False
+    for filename in _DEFAULT_CONFIG_FILENAMES:
+        candidate = _resolve_candidate_path(filename)
+        if candidate:
+            data = _deep_update(data, load_yaml_mapping(candidate))
+            default_loaded = True
+            break
+    if not default_loaded:
+        raise FileNotFoundError(
+            "Unable to locate pipeline defaults YAML. Expected one of: "
+            + ", ".join(str(_repo_root() / name) for name in _DEFAULT_CONFIG_FILENAMES)
+        )
+
+    override_path: Optional[Path] = None
+    if path is not None:
+        override_path = Path(path)
+    else:
+        for candidate in ProjectConfig.default_locations():
+            resolved = _resolve_candidate_path(candidate)
+            if resolved:
+                override_path = resolved
                 break
 
-    if path is not None and Path(path).exists():
-        try:
-            from ruamel.yaml import YAML
+    if override_path is not None and override_path.exists():
+        data = _deep_update(data, load_yaml_mapping(override_path))
 
-            y = YAML(typ="safe")
-            data = y.load(Path(path).read_text(encoding="utf-8")) or {}
-        except Exception:
-            data = {}
+    raw_env = os.getenv("SOCIAL_IMG_RAW_BASE")
+    out_env = os.getenv("SOCIAL_IMG_OUT_BASE")
 
-    if raw:
-        data["raw_base_dir"] = raw
-    if out:
-        data["output_base_dir"] = out
-
-    defaults = _default_base_dirs()
-    if defaults[0] is not None and not data.get("raw_base_dir"):
-        data["raw_base_dir"] = defaults[0]
-    if defaults[1] is not None and not data.get("output_base_dir"):
-        data["output_base_dir"] = defaults[1]
+    if raw_env:
+        data["raw_base_dir"] = raw_env
+    if out_env:
+        data["output_base_dir"] = out_env
 
     return ProjectConfig.model_validate(data)
 

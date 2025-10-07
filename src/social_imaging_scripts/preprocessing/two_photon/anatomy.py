@@ -22,6 +22,8 @@ def run(
     raw_dir: Path,
     output_root: Path,
     settings: TwoPhotonPreprocessing | None = None,
+    stack_filename: str = "{animal_id}_anatomy_stack.tif",
+    metadata_filename: str = "{animal_id}_anatomy_metadata.json",
 ) -> Dict[str, Path]:
     """Preprocess an anatomy stack.
 
@@ -44,7 +46,9 @@ def run(
     concatenated = np.concatenate(stacks, axis=0)
     corrected = utils.correct_negative_values(concatenated)
 
-    stack_path = output_root / f"{animal_id}_anatomy_stack.tif"
+    stack_path = output_root / stack_filename.format(
+        animal_id=animal_id, session_id=session_id
+    )
     utils.save_tiff_stack(stack_path, corrected)
 
     metadata = {
@@ -58,7 +62,9 @@ def run(
         "blocks": settings.blocks if settings else None,
         "output_stack": str(stack_path),
     }
-    metadata_path = output_root / f"{animal_id}_anatomy_metadata.json"
+    metadata_path = output_root / metadata_filename.format(
+        animal_id=animal_id, session_id=session_id
+    )
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
     return {"stack": stack_path, "metadata": metadata_path}
