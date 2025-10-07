@@ -36,7 +36,8 @@ sessions:
         flyback_frames: 0
         remove_first_frame: false
         blocks:
-          - 23
+          - 2
+          - 3
   - session_id: L395_f06_anatomy_2025-07-03
     date: '2025-03-07'
     condition: live

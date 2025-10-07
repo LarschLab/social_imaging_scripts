@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 REFERENCE_BRAIN_RELATIVE = Path(
-    "03_Common_Use/reference brains/ref_05_LB_Perrino_2p/average_2p_noRot_8bit_flipX_reverse.nrrd"
+    "03_Common_Use/reference brains/ref_05_LB_Perrino_2p/average_2p_noRot_orig.nrrd"
 )
 
 

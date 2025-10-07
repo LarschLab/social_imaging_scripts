@@ -91,10 +91,25 @@ class PipelineResult:
         return pd.DataFrame(self.iter_session_records())
 
 
+def _default_metadata_dir() -> Path:
+    """Return repository-level ``metadata/animals`` regardless of cwd."""
+
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / "metadata" / "animals"
+
+
+def _default_ops_template_path() -> Path:
+    """Return the shared Suite2p ops template shipped with the repository."""
+
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / "suite2p_ops_may2025.npy"
+
+
 def iter_animals_with_yaml(yaml_dir: Optional[Path] = None) -> Iterator[AnimalMetadata]:
     """Yield :class:`AnimalMetadata` for each YAML file in *yaml_dir*."""
 
-    collection = load_animals(base_dir=yaml_dir)
+    directory = yaml_dir or _default_metadata_dir()
+    collection = load_animals(base_dir=directory)
     for animal in collection.animals:
         yield animal
 
@@ -184,8 +199,9 @@ def process_functional_session(
     fast_disk: Optional[Path] = None,
     reprocess: bool = False,
     reprocess_motion: bool = False,
+    enable_preprocessing: bool = True,
+    enable_motion: bool = True,
 ) -> SessionResult:
-    settings = session.session_data.preprocessing_two_photon
     result = SessionResult(
         animal_id=animal.animal_id,
         session_id=session.session_id,
@@ -193,16 +209,14 @@ def process_functional_session(
         status="failed",
     )
 
-    if settings is None:
-        result.message = "missing two-photon preprocessing settings"
+    if not enable_preprocessing and not enable_motion:
+        result.status = "skipped"
+        result.message = "functional pipeline disabled"
         return result
 
-    try:
-        raw_dir = _resolve_session_raw_path(
-            animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
-        )
-    except Exception as exc:
-        result.message = f"failed to resolve raw path: {exc}"
+    settings = session.session_data.preprocessing_two_photon
+    if enable_preprocessing and settings is None:
+        result.message = "missing two-photon preprocessing settings"
         return result
 
     output_root = resolve_output_path(
@@ -216,66 +230,103 @@ def process_functional_session(
     output_root.mkdir(parents=True, exist_ok=True)
 
     metadata_path = output_root / "01_individualPlanes" / f"{animal.animal_id}_preprocessing_metadata.json"
-    preprocessing_needed = reprocess or not metadata_path.exists()
+    preproc_generated = False
+    notes: list[str] = []
 
-    try:
-        if preprocessing_needed:
-            # Plane splitting mirrors the single-animal notebook but now feeds the batch driver.
-            preproc_outputs = functional_preproc.run(
-                animal_id=animal.animal_id,
-                session_id=session.session_id,
-                raw_dir=raw_dir,
-                output_root=output_root,
-                settings=settings,
+    if enable_preprocessing:
+        try:
+            raw_dir = _resolve_session_raw_path(
+                animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
             )
-            result.outputs.update(
-                {f"preprocess_{key}": Path(value) for key, value in preproc_outputs.items()}
-            )
-        else:
-            result.status = "skipped"
+        except Exception as exc:
+            result.message = f"failed to resolve raw path: {exc}"
+            return result
+
+        preprocessing_needed = reprocess or not metadata_path.exists()
+        try:
+            if preprocessing_needed:
+                # Plane splitting mirrors the single-animal notebook but now feeds the batch driver.
+                preproc_outputs = functional_preproc.run(
+                    animal_id=animal.animal_id,
+                    session_id=session.session_id,
+                    raw_dir=raw_dir,
+                    output_root=output_root,
+                    settings=settings,
+                )
+                result.outputs.update(
+                    {f"preprocess_{key}": Path(value) for key, value in preproc_outputs.items()}
+                )
+                preproc_generated = True
+            else:
+                result.outputs["preprocess_metadata"] = metadata_path
+        except Exception as exc:  # pragma: no cover - pipeline side effects
+            logger.exception("Functional preprocessing failed", exc_info=exc)
+            result.message = f"functional preprocessing failed: {exc}"
+            return result
+    else:
+        if metadata_path.exists():
             result.outputs["preprocess_metadata"] = metadata_path
-    except Exception as exc:  # pragma: no cover - pipeline side effects
-        logger.exception("Functional preprocessing failed", exc_info=exc)
-        result.message = f"functional preprocessing failed: {exc}"
-        return result
 
     plane_dir = output_root / "01_individualPlanes"
-    plane_paths = sorted(plane_dir.glob(f"{animal.animal_id}_plane*.tif"))
-    if not plane_paths:
-        result.message = f"no plane TIFFs found in {plane_dir}"
-        return result
+    plane_paths = (
+        sorted(plane_dir.glob(f"{animal.animal_id}_plane*.tif"))
+        if enable_motion or preproc_generated
+        else []
+    )
 
-    fps = _resolve_fps(fps_config, animal, session)
-    motion_outputs_collected = True
+    motion_generated = False
+    if enable_motion:
+        if not plane_paths:
+            result.message = f"no plane TIFFs found in {plane_dir}"
+            return result
 
-    for plane_path in plane_paths:
-        plane_idx = _extract_plane_index(plane_path)
-        try:
-            # Run Suite2p plane-by-plane so outputs match the legacy project layout.
-            motion_outputs = motion_correction.run_motion_correction(
-                animal=animal,
-                plane_idx=plane_idx,
-                plane_tiff=plane_path,
-                ops_template=ops_template,
-                fps=fps,
-                output_root=output_root,
-                fast_disk=fast_disk,
-                reprocess=reprocess_motion,
-            )
-            for key, value in motion_outputs.items():
-                result.outputs[f"plane{plane_idx}_{key}"] = Path(value)
-        except Exception as exc:  # pragma: no cover - external tool failure
-            logger.exception("Motion correction failed", exc_info=exc)
-            result.message = f"motion correction failed for plane {plane_idx}: {exc}"
-            motion_outputs_collected = False
-            break
+        fps = _resolve_fps(fps_config, animal, session)
+        motion_outputs_collected = True
 
-    if not motion_outputs_collected:
-        return result
+        for plane_path in plane_paths:
+            plane_idx = _extract_plane_index(plane_path)
+            try:
+                # Run Suite2p plane-by-plane so outputs match the legacy project layout.
+                motion_outputs = motion_correction.run_motion_correction(
+                    animal=animal,
+                    plane_idx=plane_idx,
+                    plane_tiff=plane_path,
+                    ops_template=ops_template,
+                    fps=fps,
+                    output_root=output_root,
+                    fast_disk=fast_disk,
+                    reprocess=reprocess_motion,
+                )
+                for key, value in motion_outputs.items():
+                    result.outputs[f"plane{plane_idx}_{key}"] = Path(value)
+                if {"motion_tiff", "segmentation_folder"}.intersection(motion_outputs.keys()):
+                    motion_generated = True
+            except Exception as exc:  # pragma: no cover - external tool failure
+                logger.exception("Motion correction failed", exc_info=exc)
+                result.message = f"motion correction failed for plane {plane_idx}: {exc}"
+                motion_outputs_collected = False
+                break
 
-    result.status = "success" if result.status != "skipped" else "skipped"
-    if result.status == "skipped":
-        result.message = "functional preprocessing already present"
+        if not motion_outputs_collected:
+            return result
+    else:
+        notes.append("motion correction disabled")
+
+    if enable_preprocessing:
+        notes.append(
+            "plane splitting ran" if preproc_generated else "plane splitting reused existing outputs"
+        )
+    else:
+        notes.append("plane splitting disabled")
+
+    if enable_motion:
+        notes.append(
+            "motion correction ran" if motion_generated else "motion correction reused existing outputs"
+        )
+
+    result.status = "success" if preproc_generated or motion_generated else "skipped"
+    if notes:
+        result.message = "; ".join(notes)
     return result
 
 
@@ -288,6 +339,8 @@ def process_anatomy_session(
     fireants_overrides: Optional[dict] = None,
     reprocess_preprocessing: bool = False,
     reprocess_registration: bool = False,
+    enable_preprocessing: bool = True,
+    enable_registration: bool = True,
 ) -> SessionResult:
     result = SessionResult(
         animal_id=animal.animal_id,
@@ -296,12 +349,9 @@ def process_anatomy_session(
         status="failed",
     )
 
-    try:
-        raw_path = _resolve_session_raw_path(
-            animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
-        )
-    except Exception as exc:
-        result.message = f"failed to resolve raw anatomy path: {exc}"
+    if not enable_preprocessing and not enable_registration:
+        result.status = "skipped"
+        result.message = "anatomy pipeline disabled"
         return result
 
     preprocess_root = resolve_output_path(
@@ -315,35 +365,54 @@ def process_anatomy_session(
     preprocess_root.mkdir(parents=True, exist_ok=True)
 
     preprocess_metadata = preprocess_root / f"{animal.animal_id}_anatomy_metadata.json"
-    preprocessing_needed = reprocess_preprocessing or not preprocess_metadata.exists()
-
+    preproc_generated = False
     stack_path: Optional[Path] = None
-    if preprocessing_needed:
+
+    if enable_preprocessing:
         try:
-            preproc_outputs = anatomy_preproc.run(
-                animal_id=animal.animal_id,
-                session_id=session.session_id,
-                raw_dir=
-                (
-                    raw_path.parent
-                    if raw_path.is_file()
-                    or raw_path.suffix.lower() in {".tif", ".tiff"}
-                    else raw_path
-                ),
-                output_root=preprocess_root,
-                settings=session.session_data.preprocessing_two_photon,
+            raw_path = _resolve_session_raw_path(
+                animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
             )
-            stack_path = Path(preproc_outputs.get("stack", preprocess_root / f"{animal.animal_id}_anatomy_stack.tif"))
-            result.outputs.update(
-                {f"anatomy_preprocess_{key}": Path(value) for key, value in preproc_outputs.items()}
-            )
+        except Exception as exc:
+            result.message = f"failed to resolve raw anatomy path: {exc}"
+            return result
+
+        preprocessing_needed = reprocess_preprocessing or not preprocess_metadata.exists()
+
+        try:
+            if preprocessing_needed:
+                preproc_outputs = anatomy_preproc.run(
+                    animal_id=animal.animal_id,
+                    session_id=session.session_id,
+                    raw_dir=
+                    (
+                        raw_path.parent
+                        if raw_path.is_file()
+                        or raw_path.suffix.lower() in {".tif", ".tiff"}
+                        else raw_path
+                    ),
+                    output_root=preprocess_root,
+                    settings=session.session_data.preprocessing_two_photon,
+                )
+                stack_path = Path(preproc_outputs.get("stack", preprocess_root / f"{animal.animal_id}_anatomy_stack.tif"))
+                result.outputs.update(
+                    {f"anatomy_preprocess_{key}": Path(value) for key, value in preproc_outputs.items()}
+                )
+                preproc_generated = True
+            else:
+                stack_path = preprocess_root / f"{animal.animal_id}_anatomy_stack.tif"
+                if preprocess_metadata.exists():
+                    result.outputs["anatomy_preprocess_metadata"] = preprocess_metadata
         except Exception as exc:  # pragma: no cover - external IO
             logger.exception("Anatomy preprocessing failed", exc_info=exc)
             result.message = f"anatomy preprocessing failed: {exc}"
             return result
     else:
-        stack_path = preprocess_root / f"{animal.animal_id}_anatomy_stack.tif"
-        result.outputs["anatomy_preprocess_metadata"] = preprocess_metadata
+        stack_candidate = preprocess_root / f"{animal.animal_id}_anatomy_stack.tif"
+        if stack_candidate.exists():
+            stack_path = stack_candidate
+            if preprocess_metadata.exists():
+                result.outputs["anatomy_preprocess_metadata"] = preprocess_metadata
 
     if stack_path is None or not stack_path.exists():
         result.message = f"anatomy stack not found at {stack_path}"
@@ -359,37 +428,63 @@ def process_anatomy_session(
     registration_root.mkdir(parents=True, exist_ok=True)
 
     warped_stack = registration_root / f"{animal.animal_id}_anatomy_warped_fireants.tif"
-    registration_needed = reprocess_registration or not warped_stack.exists()
+    registration_generated = False
 
-    if not registration_needed:
-        result.status = "skipped"
-        result.outputs["fireants_warped"] = warped_stack
-        result.message = "fireants registration already present"
-        return result
+    if enable_registration:
+        registration_needed = reprocess_registration or not warped_stack.exists()
 
-    config = _prepare_fireants_config(fireants_config, fireants_overrides)
+        if registration_needed:
+            config = _prepare_fireants_config(fireants_config, fireants_overrides)
+            reference_path = resolve_reference_brain(cfg=cfg)
 
-    reference_path = resolve_reference_brain(cfg=cfg)
+            try:
+                # Delegate to the validated FireANTs pipeline; collect artefact paths for reporting.
+                outputs = register_two_photon_anatomy(
+                    animal_id=animal.animal_id,
+                    session_id=session.session_id,
+                    stack_path=stack_path,
+                    reference_path=reference_path,
+                    output_root=registration_root,
+                    animal_metadata=animal,
+                    session_metadata=session,
+                    config=config,
+                )
+                result.outputs.update(
+                    {f"fireants_{key}": Path(value) if isinstance(value, Path) else value for key, value in outputs.items()}
+                )
+                registration_generated = True
+            except Exception as exc:  # pragma: no cover - GPU pipeline failure
+                logger.exception("FireANTs registration failed", exc_info=exc)
+                result.message = f"fireants registration failed: {exc}"
+                return result
+        else:
+            result.outputs["fireants_warped"] = warped_stack
+    else:
+        if warped_stack.exists():
+            result.outputs["fireants_warped"] = warped_stack
 
-    try:
-        # Delegate to the validated FireANTs pipeline; collect artefact paths for reporting.
-        outputs = register_two_photon_anatomy(
-            animal_id=animal.animal_id,
-            session_id=session.session_id,
-            stack_path=stack_path,
-            reference_path=reference_path,
-            output_root=registration_root,
-            animal_metadata=animal,
-            session_metadata=session,
-            config=config,
+    notes: list[str] = []
+    if enable_preprocessing:
+        notes.append(
+            "anatomy preprocessing ran"
+            if preproc_generated
+            else "anatomy preprocessing reused existing outputs"
         )
-        result.outputs.update(
-            {f"fireants_{key}": Path(value) if isinstance(value, Path) else value for key, value in outputs.items()}
+    else:
+        notes.append("anatomy preprocessing disabled")
+
+    if enable_registration:
+        notes.append(
+            "fireants registration ran"
+            if registration_generated
+            else "fireants registration reused existing outputs"
         )
-        result.status = "success"
-    except Exception as exc:  # pragma: no cover - GPU pipeline failure
-        logger.exception("FireANTs registration failed", exc_info=exc)
-        result.message = f"fireants registration failed: {exc}"
+    else:
+        notes.append("fireants registration disabled")
+
+    result.status = "success" if preproc_generated or registration_generated else "skipped"
+    if notes:
+        result.message = "; ".join(notes)
     return result
 
 
@@ -409,6 +504,10 @@ def run_pipeline(
     reprocess_motion: bool = False,
     reprocess_anatomy_pre: bool = False,
     reprocess_anatomy_registration: bool = False,
+    run_functional_preprocessing: bool = True,
+    run_motion_correction: bool = True,
+    run_anatomy_preprocessing: bool = True,
+    run_fireants_registration: bool = True,
     fireants_config: Optional[FireANTsRegistrationConfig] = None,
     fireants_overrides: Optional[dict] = None,
 ) -> PipelineResult:
@@ -422,7 +521,7 @@ def run_pipeline(
         if missing:
             raise KeyError(f"Unknown animal IDs requested: {sorted(missing)}")
 
-    ops_source = ops_path or Path("suite2p_ops_may2025.npy")
+    ops_source = ops_path or _default_ops_template_path()
     if not ops_source.exists():
         raise FileNotFoundError(f"Suite2p ops template not found: {ops_source}")
     ops_template = motion_correction.load_global_ops(ops_source)
@@ -458,6 +557,8 @@ def run_pipeline(
                     fast_disk=fast_disk,
                     reprocess=reprocess_functional,
                     reprocess_motion=reprocess_motion,
+                    enable_preprocessing=run_functional_preprocessing,
+                    enable_motion=run_motion_correction,
                 )
                 animal_result.sessions.append(session_result)
             elif (
@@ -473,6 +574,8 @@ def run_pipeline(
                     fireants_overrides=fireants_overrides,
                     reprocess_preprocessing=reprocess_anatomy_pre,
                     reprocess_registration=reprocess_anatomy_registration,
+                    enable_preprocessing=run_anatomy_preprocessing,
+                    enable_registration=run_fireants_registration,
                 )
                 animal_result.sessions.append(session_result)
             else:
