@@ -436,6 +436,12 @@ def process_anatomy_session(
         if registration_needed:
             config = _prepare_fireants_config(fireants_config, fireants_overrides)
             reference_path = resolve_reference_brain(cfg=cfg)
+            print(
+                f"[{animal.animal_id}::{session.session_id}] FireANTs reference brain: {reference_path}"
+            )
+            print(
+                f"[{animal.animal_id}::{session.session_id}] FireANTs reference exists: {reference_path.exists()}"
+            )
 
             try:
                 # Delegate to the validated FireANTs pipeline; collect artefact paths for reporting.
