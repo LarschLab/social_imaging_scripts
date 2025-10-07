@@ -4,7 +4,7 @@ owner: Matilde
 tank: L331
 date_of_birth: '2025-05-03'
 meta_sources: []
-root_dir: 07_data/matilde/L331_f01
+root_dir: L331_f01
 available_modalities:
   functional_2p: false
   anatomy_2p: false

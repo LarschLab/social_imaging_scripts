@@ -1,7 +1,9 @@
 # Base directories for resolving raw inputs, processed outputs, and optional fast-disk scratch space.
-raw_base_dir: null            # Absolute or relative path to raw data root (set to null to require per-session roots).
-output_base_dir: outputs      # Base directory where processed artefacts are written.
-fast_disk_base_dir: null      # Optional high-speed scratch location for Suite2p (null disables dedicated fast disk).
+raw_base_dir: /mnt/f/johannes/pipelineIn          # Base path for raw animal data.
+ref_base_dir: /mnt/nas_jlarsch/03_Common_Use/reference brains/ref_05_LB_Perrino_2p/          # Base path containing reference volumes.
+output_base_dir: /mnt/f/johannes/pipelineOut          # Base path for processed artefacts.
+fast_disk_base_dir: null                              # Optional high-speed scratch location for Suite2p (null disables dedicated fast disk).
+reference_brain_filename: average_2p_noRot_orig.nrrd  # Path relative to ref_base_dir.
 
 # Functional preprocessing: plane splitting and metadata export.
 functional_preprocessing:
@@ -24,9 +26,7 @@ motion_correction:
   segmentation_folder_template: "plane{plane_index}"          # Naming for Suite2p segmentation folders.
   motion_filename_template: "{animal_id}_plane{plane_index}_mcorrected.tif"  # Registered TIFF filename.
   metadata_filename: "motion_metadata.json"                   # Suite2p metadata filename per plane.
-  default_fps: 2.0                # Default frame rate (Hz) if no overrides are provided.
-  per_animal_fps: {}              # Optional per-animal FPS overrides (e.g., {L331_f01: 1.8}).
-  per_session_fps: {}             # Optional per-session FPS overrides (e.g., {L331_f01_functional_2025-05-20: 1.6}).
+  default_fps: 2.0                # Frame rate (Hz) applied to every functional session.
 
 # Anatomy preprocessing.
 anatomy_preprocessing:

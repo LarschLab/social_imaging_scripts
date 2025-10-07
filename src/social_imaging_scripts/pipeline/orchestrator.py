@@ -167,35 +167,14 @@ def _extract_plane_index(path: Path) -> int:
 
 
 def _resolve_fps(
-    fps_config: Optional[
-        float
-        | Mapping[str, float]
-        | Callable[[AnimalMetadata, FunctionalSession], Optional[float]]
-    ],
+    fps_config: Optional[float],
     animal: AnimalMetadata,
     session: FunctionalSession,
 ) -> float:
     if fps_config is None:
-        return 2.0
-    if isinstance(fps_config, Mapping):
-        value = fps_config.get(session.session_id)
-        if value is not None:
-            return value
-        value = fps_config.get(animal.animal_id)
-        if value is not None:
-            return value
-        if "default" in fps_config:
-            return fps_config["default"]
-        raise KeyError(
-            f"No frame-rate entry for session '{session.session_id}' or animal '{animal.animal_id}'"
+        raise ValueError(
+            f"Frame rate not provided for functional session {animal.animal_id}::{session.session_id}"
         )
-    if callable(fps_config):
-        value = fps_config(animal, session)
-        if value is None:
-            raise ValueError(
-                f"Frame-rate callback returned None for session {session.session_id}"
-            )
-        return float(value)
     return float(fps_config)
 
 
@@ -280,7 +259,6 @@ def process_functional_session(
     output_root = resolve_output_path(
         animal.animal_id,
         functional_cfg.root_subdir,
-        session.session_id,
         cfg=cfg,
     )
     output_root.mkdir(parents=True, exist_ok=True)
@@ -438,7 +416,6 @@ def process_anatomy_session(
     preprocess_root = resolve_output_path(
         animal.animal_id,
         anatomy_cfg.root_subdir,
-        session.session_id,
         cfg=cfg,
     )
     preprocess_root.mkdir(parents=True, exist_ok=True)
@@ -505,7 +482,6 @@ def process_anatomy_session(
     registration_root = resolve_output_path(
         animal.animal_id,
         fireants_stage_cfg.output_subdir,
-        session.session_id,
         cfg=cfg,
     )
     registration_root.mkdir(parents=True, exist_ok=True)
@@ -624,7 +600,6 @@ def process_functional_to_anatomy_registration(
     functional_root = resolve_output_path(
         animal.animal_id,
         cfg.functional_preprocessing.root_subdir,
-        functional_session.session_id,
         cfg=cfg,
     )
     motion_root = functional_root / cfg.motion_correction.motion_output_subdir
@@ -692,7 +667,6 @@ def process_functional_to_anatomy_registration(
     anatomy_root = resolve_output_path(
         animal.animal_id,
         cfg.anatomy_preprocessing.root_subdir,
-        anatomy_session.session_id,
         cfg=cfg,
     )
     stack_template = cfg.anatomy_preprocessing.stack_filename_template
@@ -760,6 +734,8 @@ def run_pipeline(
 
     cfg = cfg or load_project_config()
 
+    logger.info("========== Starting social imaging pipeline ==========")
+
     functional_cfg = cfg.functional_preprocessing
     motion_cfg = cfg.motion_correction
     anatomy_cfg = cfg.anatomy_preprocessing
@@ -782,9 +758,7 @@ def run_pipeline(
 
     fast_disk = cfg.fast_disk_base_dir or cfg.output_base_dir
 
-    fps_mapping: dict[str, float] = {"default": motion_cfg.default_fps}
-    fps_mapping.update(motion_cfg.per_animal_fps)
-    fps_mapping.update(motion_cfg.per_session_fps)
+    fps_value = motion_cfg.default_fps
 
     fireants_config: Optional[FireANTsRegistrationConfig] = None
     if fireants_stage_cfg.config_path:
@@ -799,7 +773,8 @@ def run_pipeline(
         animal_log: Optional[AnimalProcessingLog] = None
         log_path: Optional[Path] = None
         if processing_cfg.enabled:
-            log_path = build_processing_log_path(processing_cfg, animal.animal_id)
+            log_base = cfg.output_base_dir or Path.cwd()
+            log_path = build_processing_log_path(processing_cfg, animal.animal_id, base_dir=Path(log_base))
             if log_path.exists():
                 animal_log = load_processing_log(log_path)
             else:
@@ -831,8 +806,12 @@ def run_pipeline(
                 continue
 
             if session.session_type == "functional_stack":
-                # Functional stacks: plane splitting + Suite2p motion correction.
-                fps_value = _resolve_fps(fps_mapping, animal, session)
+                logger.info(
+                    "---------- Functional preprocessing + motion (%s, session %s) ----------",
+                    animal.animal_id,
+                    session.session_id,
+                )
+                fps_value = motion_cfg.default_fps
                 session_result = process_functional_session(
                     animal=animal,
                     session=session,  # type: ignore[arg-type]
@@ -848,6 +827,12 @@ def run_pipeline(
                 functional_session_ref = session  # type: ignore[assignment]
                 functional_session_result = session_result
                 animal_result.sessions.append(session_result)
+                logger.info(
+                    "---------- Completed functional preprocessing + motion (%s, session %s): %s ----------",
+                    animal.animal_id,
+                    session.session_id,
+                    session_result.status,
+                )
                 if animal_log is not None and log_path is not None:
                     _update_processing_log_stage(
                         animal_log,
@@ -867,7 +852,11 @@ def run_pipeline(
                 session.session_type == "anatomy_stack"
                 and getattr(session.session_data, "stack_type", "") == "two_photon"
             ):
-                # Two-photon anatomy stacks: preprocess then register via FireANTs.
+                logger.info(
+                    "---------- Anatomy preprocessing + FireANTs (%s, session %s) ----------",
+                    animal.animal_id,
+                    session.session_id,
+                )
                 session_result = process_anatomy_session(
                     animal=animal,
                     session=session,  # type: ignore[arg-type]
@@ -882,6 +871,12 @@ def run_pipeline(
                 anatomy_session_ref = session  # type: ignore[assignment]
                 anatomy_session_result = session_result
                 animal_result.sessions.append(session_result)
+                logger.info(
+                    "---------- Completed anatomy preprocessing + FireANTs (%s, session %s): %s ----------",
+                    animal.animal_id,
+                    session.session_id,
+                    session_result.status,
+                )
                 if animal_log is not None and log_path is not None:
                     _update_processing_log_stage(
                         animal_log,
@@ -931,6 +926,10 @@ def run_pipeline(
                     message="anatomy preprocessing failed; cannot register functional to anatomy",
                 )
             else:
+                logger.info(
+                    "---------- Functional-to-anatomy registration (%s) ----------",
+                    animal.animal_id,
+                )
                 stage_result = process_functional_to_anatomy_registration(
                     animal=animal,
                     functional_session=functional_session_ref,  # type: ignore[arg-type]
@@ -938,6 +937,11 @@ def run_pipeline(
                     cfg=cfg,
                 )
             animal_result.sessions.append(stage_result)
+            logger.info(
+                "---------- Completed functional-to-anatomy registration (%s): %s ----------",
+                animal.animal_id,
+                stage_result.status,
+            )
 
             if animal_log is not None and log_path is not None:
                 _update_processing_log_stage(
@@ -995,6 +999,8 @@ def run_pipeline(
             summary_full_path = resolve_output_path(
                 ftoa_stage_cfg.summary_full_csv, cfg=cfg
             )
+            summary_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_full_path.parent.mkdir(parents=True, exist_ok=True)
             align_substack.write_combined_log(
                 base_folder,
                 out_csv=summary_csv_path,

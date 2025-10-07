@@ -8,10 +8,6 @@ from typing import Any, Dict, Mapping, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-REFERENCE_BRAIN_RELATIVE = Path(
-    "03_Common_Use/reference brains/ref_05_LB_Perrino_2p/average_2p_noRot_orig.nrrd"
-)
-
 _DEFAULT_CONFIG_FILENAMES = (
     "metadata/pipeline_defaults.yaml",
     "metadata/pipeline_defaults.yml",
@@ -205,15 +201,7 @@ class MotionCorrectionConfig(BaseModel):
     )
     default_fps: float = Field(
         ...,
-        description="Default frame rate (Hz) used for Suite2p runs.",
-    )
-    per_animal_fps: Dict[str, float] = Field(
-        default_factory=dict,
-        description="Optional FPS overrides keyed by animal_id.",
-    )
-    per_session_fps: Dict[str, float] = Field(
-        default_factory=dict,
-        description="Optional FPS overrides keyed by session_id.",
+        description="Frame rate (Hz) used for Suite2p runs.",
     )
 
     @field_validator(
@@ -410,6 +398,14 @@ class ProjectConfig(BaseModel):
         default=None,
         description="Optional fast disk scratch path for Suite2p outputs.",
     )
+    ref_base_dir: Optional[Path] = Field(
+        default=None,
+        description="Base path containing reference volumes.",
+    )
+    reference_brain_filename: Path = Field(
+        default=Path("reference brains/ref_05_LB_Perrino_2p/average_2p_noRot_orig.nrrd"),
+        description="Path relative to ref_base_dir for the reference brain NRRD.",
+    )
 
     functional_preprocessing: FunctionalPreprocessingConfig = Field(...)
     motion_correction: MotionCorrectionConfig = Field(...)
@@ -420,7 +416,7 @@ class ProjectConfig(BaseModel):
     )
     processing_log: ProcessingLogConfig = Field(...)
 
-    @field_validator("raw_base_dir", "output_base_dir", mode="before")
+    @field_validator("raw_base_dir", "output_base_dir", "ref_base_dir", mode="before")
     @classmethod
     def _normalise_base(cls, value):
         return normalise_pathlike(value)
@@ -477,14 +473,15 @@ def load_project_config(path: Optional[Path] = None) -> ProjectConfig:
     return ProjectConfig.model_validate(data)
 
 
+
 def resolve_raw_path(p: Path, cfg: Optional[ProjectConfig] = None) -> Path:
     p = normalise_pathlike(p) or Path(p)
     if p.is_absolute():
         return p
     cfg = cfg or load_project_config()
-    if cfg.raw_base_dir is None:
-        return p
-    return Path(cfg.raw_base_dir) / p
+    if cfg.raw_base_dir is not None:
+        return Path(cfg.raw_base_dir) / p
+    return p
 
 
 def resolve_output_path(*parts: str | Path, cfg: Optional[ProjectConfig] = None) -> Path:
@@ -515,4 +512,9 @@ def resolve_raw_subpath(*parts: str | Path, cfg: Optional[ProjectConfig] = None)
 
 
 def resolve_reference_brain(cfg: Optional[ProjectConfig] = None) -> Path:
-    return resolve_raw_path(REFERENCE_BRAIN_RELATIVE, cfg=cfg)
+    cfg = cfg or load_project_config()
+    base = cfg.ref_base_dir or cfg.raw_base_dir or Path.cwd()
+    base = normalise_pathlike(base) or Path(base)
+    relative = cfg.reference_brain_filename
+    relative = normalise_pathlike(relative) or Path(relative)
+    return Path(base) / relative

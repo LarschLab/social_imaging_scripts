@@ -4,7 +4,7 @@ owner: Matilde
 tank: L395
 date_of_birth: '2025-06-16'
 meta_sources: []
-root_dir: 07_data/matilde/L395_f06
+root_dir: L395_f06
 available_modalities:
   functional_2p: false
   anatomy_2p: false

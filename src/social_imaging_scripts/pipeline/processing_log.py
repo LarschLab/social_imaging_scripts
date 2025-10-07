@@ -98,10 +98,13 @@ class AnimalProcessingLog(BaseModel):
         return self.stages[stage]
 
 
-def build_processing_log_path(cfg: ProcessingLogConfig, animal_id: str) -> Path:
+def build_processing_log_path(cfg: ProcessingLogConfig, animal_id: str, base_dir: Path) -> Path:
     """Resolve the path for the processing log of *animal_id*."""
 
-    directory = Path(cfg.directory or Path("metadata/processed"))
+    directory = Path(cfg.directory or "metadata/processed")
+    directory = normalise_pathlike(directory) or directory
+    if not directory.is_absolute():
+        directory = Path(base_dir) / directory
     filename = cfg.filename_template.format(animal_id=animal_id)
     return directory / filename
 
