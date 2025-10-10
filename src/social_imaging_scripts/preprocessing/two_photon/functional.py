@@ -80,6 +80,17 @@ def run(
     output_planes.mkdir(parents=True, exist_ok=True)
 
     block_paths = list(_select_blocks(raw_dir, settings))
+    if not block_paths:
+        raise FileNotFoundError(f"No functional TIFF blocks found in {raw_dir}")
+
+    pixel_size_xy = utils.extract_pixel_size_um(block_paths[0])
+    for extra_path in block_paths[1:]:
+        extra_size = utils.extract_pixel_size_um(extra_path)
+        if not np.allclose(extra_size, pixel_size_xy, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"Inconsistent pixel size detected across functional TIFFs: {pixel_size_xy} vs {extra_size} "
+                f"({extra_path.name})"
+            )
 
     frames_per_plane = settings.frames_per_plane or 1
     if frames_per_plane <= 0:
@@ -100,6 +111,7 @@ def run(
             "flyback_frames": settings.flyback_frames,
             "blocks": settings.blocks,
             "output_stack": str(stack_path),
+            "pixel_size_xy_um": [float(pixel_size_xy[0]), float(pixel_size_xy[1])],
         }
         metadata_path = output_root / metadata_filename.format(
             animal_id=animal_id, session_id=session_id
@@ -153,6 +165,7 @@ def run(
         "blocks": settings.blocks,
         "output_dir": str(output_planes),
         "volumes": volumes,
+        "pixel_size_xy_um": [float(pixel_size_xy[0]), float(pixel_size_xy[1])],
     }
     metadata_path = output_planes / metadata_filename.format(
         animal_id=animal_id, session_id=session_id

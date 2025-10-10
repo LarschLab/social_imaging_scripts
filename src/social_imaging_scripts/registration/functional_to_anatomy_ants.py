@@ -3,7 +3,8 @@
 Each functional plane is matched against all anatomy slices using
 scale-constrained NCC.  The solver searches a discrete set of scales within
 ``scale_range`` and finds the best (z, y, x) placement via FFT-based template
-matching.  Optional subpixel refinement is available through phase correlation.
+matching.  Progress updates can be emitted by passing ``progress=print`` (or any
+callable), and the search can short-circuit when ``early_stop_score`` is reached.
 
 The intent is to mimic the previous hierarchical matcher: optimise for z index,
 uniform in-plane scale, and x/y translation only.  No rotations or shearing are
@@ -14,14 +15,12 @@ quality checks.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import SimpleITK as sitk
-from scipy import ndimage as ndi
 from skimage.feature import match_template
 from skimage.filters import gaussian
-from skimage.registration import phase_cross_correlation
 from skimage.transform import rescale
 
 
@@ -113,12 +112,7 @@ def _prepare_templates(
     return templates
 
 
-def _match_template(
-    fixed: np.ndarray,
-    templ: np.ndarray,
-    *,
-    allow_subpixel: bool,
-) -> Tuple[float, float, float] | None:
+def _match_template(fixed: np.ndarray, templ: np.ndarray) -> Tuple[float, float, float] | None:
     """Return (y, x, score) in fixed coordinates or None if template does not fit."""
     if templ.shape[0] > fixed.shape[0] or templ.shape[1] > fixed.shape[1]:
         return None
@@ -129,46 +123,7 @@ def _match_template(
     y = float(ij[0])
     x = float(ij[1])
     score = float(response[ij])
-    if allow_subpixel:
-        y, x, score = _refine_subpixel_xy(fixed, templ, y, x)
     return y, x, score
-
-
-def _refine_subpixel_xy(fixed: np.ndarray, templ: np.ndarray, y: float, x: float) -> Tuple[float, float, float]:
-    """Subpixel refinement using phase correlation around (y, x)."""
-    th, tw = templ.shape
-    H, W = fixed.shape
-    y0 = int(np.floor(y))
-    x0 = int(np.floor(x))
-    y1 = max(0, y0)
-    x1 = max(0, x0)
-    y2 = min(H, y0 + th)
-    x2 = min(W, x0 + tw)
-
-    crop = fixed[y1:y2, x1:x2]
-    if crop.shape != templ.shape:
-        pad_y = th - crop.shape[0]
-        pad_x = tw - crop.shape[1]
-        crop = np.pad(crop, ((0, pad_y), (0, pad_x)), mode="edge")
-
-    shift, _, _ = phase_cross_correlation(crop, templ, upsample_factor=10)
-    y_ref = float(y1) - float(shift[0])
-    x_ref = float(x1) - float(shift[1])
-
-    yr = int(np.floor(y_ref))
-    xr = int(np.floor(x_ref))
-    yr1 = max(0, yr)
-    xr1 = max(0, xr)
-    yr2 = min(H, yr + th)
-    xr2 = min(W, xr + tw)
-    crop2 = fixed[yr1:yr2, xr1:xr2]
-    if crop2.shape != templ.shape:
-        pad_y = th - crop2.shape[0]
-        pad_x = tw - crop2.shape[1]
-        crop2 = np.pad(crop2, ((0, pad_y), (0, pad_x)), mode="edge")
-
-    score = _normalised_cross_correlation(crop2, templ)
-    return y_ref, x_ref, score
 
 
 def _compose_warped_volume(
@@ -178,7 +133,6 @@ def _compose_warped_volume(
     z_index: int,
     y_pos: float,
     x_pos: float,
-    allow_subpixel: bool,
 ) -> np.ndarray:
     volume = np.zeros(anatomy_shape, dtype=np.float32)
     plane = template
@@ -186,9 +140,6 @@ def _compose_warped_volume(
     x_floor = int(np.floor(x_pos))
     y_frac = y_pos - y_floor
     x_frac = x_pos - x_floor
-
-    if allow_subpixel and (abs(y_frac) > 1e-3 or abs(x_frac) > 1e-3):
-        plane = ndi.shift(plane, shift=(-y_frac, -x_frac), order=1, mode="nearest")
 
     dest_y = y_floor
     dest_x = x_floor
@@ -240,8 +191,13 @@ def register_planes_pass1(
     z_stride_coarse: int = 5,
     z_refine_radius: int = 4,
     gaussian_sigma: float = 0.5,
-    do_subpixel: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+    early_stop_score: Optional[float] = None,
 ) -> List[PlaneRegistrationResult]:
+    def _report(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
     anatomy_img = _to_sitk_image(anatomy_stack)
     if downscale_if_needed:
         anatomy_img = _shrink_if_needed(anatomy_img)
@@ -267,6 +223,10 @@ def register_planes_pass1(
         plane_smoothed = _smooth(plane_original, gaussian_sigma)
         templates = _prepare_templates(plane_smoothed, plane_original, scales)
 
+        _report(
+            f"[plane {plane_idx}] scales={len(templates)} coarse_z={len(coarse_z_candidates)}"
+        )
+
         if not templates:
             results.append(
                 PlaneRegistrationResult(
@@ -282,12 +242,15 @@ def register_planes_pass1(
             continue
 
         best = None
+        stop_score = early_stop_score
+        coarse_evaluations = 0
         for tpl_idx, (scale, templ_norm, _) in enumerate(templates):
             for z in coarse_z_candidates:
-                match = _match_template(anatomy_norm[z], templ_norm, allow_subpixel=False)
+                match = _match_template(anatomy_norm[z], templ_norm)
                 if match is None:
                     continue
                 y, x, score = match
+                coarse_evaluations += 1
                 if best is None or score > best["score"]:
                     best = {
                         "score": score,
@@ -297,6 +260,15 @@ def register_planes_pass1(
                         "x": x,
                         "template": tpl_idx,
                     }
+                if stop_score is not None and best["score"] >= stop_score:
+                    break
+            if stop_score is not None and best is not None and best["score"] >= stop_score:
+                break
+
+        _report(
+            f"[plane {plane_idx}] coarse evals={coarse_evaluations}, "
+            f"best z={best['z'] if best else 'n/a'} score={best['score'] if best else 'n/a'}"
+        )
 
         if best is None:
             results.append(
@@ -316,12 +288,14 @@ def register_planes_pass1(
         refine_z_max = min(z_count - 1, best["z"] + z_refine_radius)
         refine_z_candidates = range(refine_z_min, refine_z_max + 1)
 
+        refine_evaluations = 0
         for tpl_idx, (scale, templ_norm, _) in enumerate(templates):
             for z in refine_z_candidates:
-                match = _match_template(anatomy_norm[z], templ_norm, allow_subpixel=do_subpixel)
+                match = _match_template(anatomy_norm[z], templ_norm)
                 if match is None:
                     continue
                 y, x, score = match
+                refine_evaluations += 1
                 if score > best["score"]:
                     best.update(
                         {
@@ -333,6 +307,15 @@ def register_planes_pass1(
                             "template": tpl_idx,
                         }
                     )
+                if stop_score is not None and best["score"] >= stop_score:
+                    break
+            if stop_score is not None and best["score"] >= stop_score:
+                break
+
+        _report(
+            f"[plane {plane_idx}] refine evals={refine_evaluations}, "
+            f"final z={best['z']} score={best['score']:.3f} scale={best['scale']:.3f}"
+        )
 
         tpl_scale, _, tpl_original = templates[best["template"]]
         warped_volume = _compose_warped_volume(
@@ -341,7 +324,6 @@ def register_planes_pass1(
             z_index=best["z"],
             y_pos=best["y"],
             x_pos=best["x"],
-            allow_subpixel=do_subpixel,
         )
 
         transform = _make_affine(tpl_scale, best["x"], best["y"], best["z"])

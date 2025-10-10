@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from dataclasses import dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, Literal, Mapping, Optional
 
+import pandas as pd
 import tifffile
 
 from ..metadata.config import (
@@ -26,6 +28,7 @@ from ..preprocessing.two_photon import anatomy as anatomy_preproc
 from ..preprocessing.two_photon import functional as functional_preproc
 from ..preprocessing.two_photon import motion as motion_correction
 from ..registration import align_substack
+from ..registration.functional_to_anatomy_ants import register_planes_pass1
 from ..registration.fireants_pipeline import FireANTsRegistrationConfig, register_two_photon_anatomy
 from .processing_log import (
     AnimalProcessingLog,
@@ -178,6 +181,18 @@ def _resolve_fps(
             f"Frame rate not provided for functional session {animal.animal_id}::{session.session_id}"
         )
     return float(fps_config)
+
+
+def _load_session_pixel_size(metadata_path: Path) -> tuple[float, float]:
+    data = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+    pixel_size = data.get("pixel_size_xy_um")
+    if (
+        not isinstance(pixel_size, (list, tuple))
+        or len(pixel_size) != 2
+        or any(value is None for value in pixel_size)
+    ):
+        raise ValueError(f"Missing pixel_size_xy_um in metadata: {metadata_path}")
+    return float(pixel_size[0]), float(pixel_size[1])
 
 
 def _coerce_parameters(parameters: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -574,6 +589,8 @@ def process_functional_to_anatomy_registration(
     """Register functional projections to the anatomy stack for one animal."""
 
     stage_cfg = cfg.functional_to_anatomy_registration
+    functional_cfg = cfg.functional_preprocessing
+    anatomy_cfg = cfg.anatomy_preprocessing
     result = SessionResult(
         animal_id=animal.animal_id,
         session_id=functional_session.session_id,
@@ -693,33 +710,107 @@ def process_functional_to_anatomy_registration(
         result.message = f"failed to load functional projections: {exc}"
         return result
 
+    functional_root = resolve_output_path(
+        animal.animal_id,
+        functional_cfg.root_subdir,
+        cfg=cfg,
+    )
+    plane_dir = functional_root / functional_cfg.planes_subdir
+    functional_metadata_name = functional_cfg.metadata_filename_template.format(
+        animal_id=animal.animal_id,
+        session_id=functional_session.session_id,
+    )
+    functional_metadata_path = plane_dir / functional_metadata_name
+
+    anatomy_metadata_name = anatomy_cfg.metadata_filename_template.format(
+        animal_id=animal.animal_id,
+        session_id=anatomy_session.session_id,
+    )
+    anatomy_metadata_path = anatomy_root / anatomy_metadata_name
+
     try:
-        df_results = align_substack.register_moving_stack(
-            fixed_stack,
-            moving_stack,
-            fixed_z_spacing_um=stage_cfg.fixed_z_spacing_um,
-            scale_range=stage_cfg.scale_range,
+        functional_pixel_size = _load_session_pixel_size(functional_metadata_path)
+        anatomy_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
+    except Exception as exc:
+        logger.exception("Failed to read pixel size metadata", exc_info=exc)
+        result.message = f"missing pixel size metadata: {exc}"
+        return result
+
+    ratio_x = functional_pixel_size[0] / anatomy_pixel_size[0]
+    ratio_y = functional_pixel_size[1] / anatomy_pixel_size[1]
+    expected_scale = float((ratio_x + ratio_y) / 2.0)
+
+    scale_window = max(0.0, float(stage_cfg.scale_window))
+    if stage_cfg.n_scales <= 0:
+        raise ValueError("n_scales must be positive")
+    if scale_window == 0.0 and stage_cfg.n_scales > 1:
+        logger.warning(
+            "scale_window=0 but n_scales=%d; scales will be identical", stage_cfg.n_scales
+        )
+
+    min_scale = expected_scale * (1.0 - scale_window)
+    max_scale = expected_scale * (1.0 + scale_window)
+    if stage_cfg.n_scales == 1:
+        min_scale = max_scale = expected_scale
+    min_scale = max(min_scale, 1e-6)
+    max_scale = max(max_scale, min_scale)
+
+    plane_indices = list(range(moving_stack.shape[0]))
+    functional_planes = [moving_stack[idx] for idx in plane_indices]
+    progress_cb = (lambda m: logger.info("[%s] %s", animal.animal_id, m)) if stage_cfg.progress else None
+
+    try:
+        results = register_planes_pass1(
+            anatomy_stack=fixed_stack,
+            functional_planes=functional_planes,
+            plane_indices=plane_indices,
+            downscale_if_needed=False,
+            scale_range=(float(min_scale), float(max_scale)),
             n_scales=stage_cfg.n_scales,
             z_stride_coarse=stage_cfg.z_stride_coarse,
             z_refine_radius=stage_cfg.z_refine_radius,
-            pyramid_downscale=stage_cfg.pyramid_downscale,
-            pyramid_min_size=stage_cfg.pyramid_min_size,
             gaussian_sigma=stage_cfg.gaussian_sigma,
-            verbose=False,
-            animal_id=animal.animal_id,
-            do_subpixel=stage_cfg.do_subpixel,
+            early_stop_score=stage_cfg.early_stop_score,
+            progress=progress_cb,
         )
     except Exception as exc:  # pragma: no cover - algorithmic failure
         logger.exception("Functional-to-anatomy registration failed", exc_info=exc)
         result.message = f"functional-to-anatomy registration failed: {exc}"
         return result
 
+    rows: list[dict[str, object]] = []
+    for res in results:
+        translation = res.transform.GetTranslation()
+        matrix = res.transform.GetMatrix()
+        scale = float(matrix[0]) if matrix else float("nan")
+        rows.append(
+            {
+                "animal": animal.animal_id,
+                "moving_plane": res.plane_index,
+                "z_index": res.best_z,
+                "z_um": res.best_z * stage_cfg.fixed_z_spacing_um if res.best_z >= 0 else float("nan"),
+                "y_px": float(translation[1]) if len(translation) > 1 else float("nan"),
+                "x_px": float(translation[0]) if len(translation) > 0 else float("nan"),
+                "scale_moving_to_fixed": scale,
+                "ncc_score": res.ncc,
+                "success": res.success,
+                "message": res.message,
+                "qc_flag": "",
+                "expected_scale": expected_scale,
+                "scale_range_min": float(min_scale),
+                "scale_range_max": float(max_scale),
+            }
+        )
+
+    df_results = pd.DataFrame(rows)
+
     df_results.to_csv(per_animal_csv, index=False)
     result.outputs["registration_csv"] = per_animal_csv
     result.outputs["anatomy_stack"] = stack_path
 
     n_planes = len(df_results)
-    median_ncc = float(df_results["ncc_score"].median()) if n_planes else float("nan")
+    successful = df_results[df_results["success"]]
+    median_ncc = float(successful["ncc_score"].median()) if not successful.empty else float("nan")
     result.status = "success"
     result.message = f"registered {n_planes} planes; median NCC={median_ncc:.3f}"
     return result
@@ -854,18 +945,31 @@ def run_pipeline(
                     session_result.status,
                 )
                 if animal_log is not None and log_path is not None:
+                    metadata_path = session_result.outputs.get("preprocess_metadata")
+                    pixel_size_xy = None
+                    if metadata_path is not None:
+                        pixel_size_xy = _load_session_pixel_size(metadata_path)
+                    elif session_result.status != "skipped":
+                        raise ValueError(
+                            f"Preprocessing metadata missing for session {session.session_id}"
+                        )
+
+                    parameters = {
+                        "functional_enabled": functional_cfg.enabled,
+                        "functional_reprocess": functional_cfg.reprocess,
+                        "motion_enabled": motion_cfg.enabled,
+                        "motion_reprocess": motion_cfg.reprocess,
+                        "fast_disk": fast_disk,
+                        "fps_hz": fps_value,
+                    }
+                    if pixel_size_xy is not None:
+                        parameters["session_pixel_size_xy_um"] = [float(pixel_size_xy[0]), float(pixel_size_xy[1])]
+
                     _update_processing_log_stage(
                         animal_log,
                         _stage_key(session_result.session_type, session_result.session_id),
                         session_result,
-                        {
-                            "functional_enabled": functional_cfg.enabled,
-                            "functional_reprocess": functional_cfg.reprocess,
-                            "motion_enabled": motion_cfg.enabled,
-                            "motion_reprocess": motion_cfg.reprocess,
-                            "fast_disk": fast_disk,
-                            "fps_hz": fps_value,
-                        },
+                        parameters,
                     )
                     save_processing_log(animal_log, log_path)
             elif (
@@ -898,16 +1002,29 @@ def run_pipeline(
                     session_result.status,
                 )
                 if animal_log is not None and log_path is not None:
+                    metadata_path = session_result.outputs.get("anatomy_preprocess_metadata")
+                    pixel_size_xy = None
+                    if metadata_path is not None:
+                        pixel_size_xy = _load_session_pixel_size(metadata_path)
+                    elif session_result.status != "skipped":
+                        raise ValueError(
+                            f"Anatomy preprocessing metadata missing for session {session.session_id}"
+                        )
+
+                    parameters = {
+                        "anatomy_enabled": anatomy_cfg.enabled,
+                        "anatomy_reprocess": anatomy_cfg.reprocess,
+                        "fireants_enabled": fireants_stage_cfg.enabled,
+                        "fireants_reprocess": fireants_stage_cfg.reprocess,
+                    }
+                    if pixel_size_xy is not None:
+                        parameters["session_pixel_size_xy_um"] = [float(pixel_size_xy[0]), float(pixel_size_xy[1])]
+
                     _update_processing_log_stage(
                         animal_log,
                         _stage_key(session_result.session_type, session_result.session_id),
                         session_result,
-                        {
-                            "anatomy_enabled": anatomy_cfg.enabled,
-                            "anatomy_reprocess": anatomy_cfg.reprocess,
-                            "fireants_enabled": fireants_stage_cfg.enabled,
-                            "fireants_reprocess": fireants_stage_cfg.reprocess,
-                        },
+                        parameters,
                     )
                     save_processing_log(animal_log, log_path)
             else:
@@ -964,14 +1081,81 @@ def run_pipeline(
             )
 
             if animal_log is not None and log_path is not None:
+                source_pixel_sizes = {}
+                expected_scale_ratio: Optional[float] = None
+                try:
+                    functional_root = resolve_output_path(
+                        animal.animal_id,
+                        functional_cfg.root_subdir,
+                        cfg=cfg,
+                    )
+                    plane_dir = functional_root / functional_cfg.planes_subdir
+                    functional_metadata_name = functional_cfg.metadata_filename_template.format(
+                        animal_id=animal.animal_id,
+                        session_id=functional_session_ref.session_id,
+                    )
+                    functional_metadata_path = plane_dir / functional_metadata_name
+                    functional_pixel_size = _load_session_pixel_size(functional_metadata_path)
+
+                    anatomy_root = resolve_output_path(
+                        animal.animal_id,
+                        anatomy_cfg.root_subdir,
+                        cfg=cfg,
+                    )
+                    anatomy_metadata_name = anatomy_cfg.metadata_filename_template.format(
+                        animal_id=animal.animal_id,
+                        session_id=anatomy_session_ref.session_id,
+                    )
+                    anatomy_metadata_path = anatomy_root / anatomy_metadata_name
+                    anatomy_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
+
+                    source_pixel_sizes = {
+                        functional_session_ref.session_id: [
+                            float(functional_pixel_size[0]),
+                            float(functional_pixel_size[1]),
+                        ],
+                        anatomy_session_ref.session_id: [
+                            float(anatomy_pixel_size[0]),
+                            float(anatomy_pixel_size[1]),
+                        ],
+                    }
+                    ratio_x = functional_pixel_size[0] / anatomy_pixel_size[0]
+                    ratio_y = functional_pixel_size[1] / anatomy_pixel_size[1]
+                    expected_scale_ratio = float((ratio_x + ratio_y) / 2.0)
+                except Exception as exc:
+                    if stage_result.status != "skipped":
+                        raise
+
+                parameters = {
+                    "functional_to_anatomy_enabled": ftoa_stage_cfg.enabled,
+                    "functional_to_anatomy_reprocess": ftoa_stage_cfg.reprocess,
+                    "scale_window": ftoa_stage_cfg.scale_window,
+                    "n_scales": ftoa_stage_cfg.n_scales,
+                    "z_stride_coarse": ftoa_stage_cfg.z_stride_coarse,
+                    "z_refine_radius": ftoa_stage_cfg.z_refine_radius,
+                    "gaussian_sigma": ftoa_stage_cfg.gaussian_sigma,
+                    "early_stop_score": ftoa_stage_cfg.early_stop_score,
+                    "progress": ftoa_stage_cfg.progress,
+                }
+                if source_pixel_sizes:
+                    parameters["source_session_pixel_sizes_xy_um"] = source_pixel_sizes
+                if expected_scale_ratio is not None:
+                    parameters["expected_scale_ratio"] = expected_scale_ratio
+                    scale_window = max(0.0, float(ftoa_stage_cfg.scale_window))
+                    min_scale = expected_scale_ratio * (1.0 - scale_window)
+                    max_scale = expected_scale_ratio * (1.0 + scale_window)
+                    if ftoa_stage_cfg.n_scales == 1:
+                        min_scale = max_scale = expected_scale_ratio
+                    min_scale = max(min_scale, 1e-6)
+                    max_scale = max(max_scale, min_scale)
+                    parameters["scale_range_min"] = float(min_scale)
+                    parameters["scale_range_max"] = float(max_scale)
+
                 _update_processing_log_stage(
                     animal_log,
                     _stage_key(stage_result.session_type, stage_result.session_id),
                     stage_result,
-                    {
-                        "functional_to_anatomy_enabled": ftoa_stage_cfg.enabled,
-                        "functional_to_anatomy_reprocess": ftoa_stage_cfg.reprocess,
-                    },
+                    parameters,
                 )
                 save_processing_log(animal_log, log_path)
         elif ftoa_stage_cfg.enabled:

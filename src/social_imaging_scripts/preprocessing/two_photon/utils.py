@@ -6,10 +6,67 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 import logging
+from fractions import Fraction
+
 import numpy as np
 import tifffile
 
 logger = logging.getLogger(__name__)
+
+
+def extract_pixel_size_um(path: Path) -> tuple[float, float]:
+    """Return (x_um, y_um) pixel size derived from TIFF resolution tags.
+
+    Raises ValueError if the required metadata is missing or cannot be
+    interpreted. The caller is expected to handle the exception and decide
+    whether to abort or supply fallback values.
+    """
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with tifffile.TiffFile(path) as tif:
+        if not tif.pages:
+            raise ValueError(f"TIFF contains no pages: {path}")
+        page = tif.pages[0]
+        tags = page.tags
+        res_unit_tag = tags.get("ResolutionUnit")
+        x_res_tag = tags.get("XResolution")
+        y_res_tag = tags.get("YResolution")
+
+        if res_unit_tag is None or x_res_tag is None or y_res_tag is None:
+            raise ValueError(f"Missing resolution tags in TIFF header: {path}")
+
+        res_unit = int(res_unit_tag.value)
+        if res_unit == 2:  # inch
+            unit_to_um = 25400.0
+        elif res_unit == 3:  # centimeter
+            unit_to_um = 10000.0
+        else:
+            raise ValueError(
+                f"Unsupported or undefined ResolutionUnit ({res_unit}) in {path}"
+            )
+
+        def _to_um(res_tag) -> float:
+            value = res_tag.value
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                num, den = value
+            else:
+                frac = Fraction(value)
+                num, den = frac.numerator, frac.denominator
+            num = float(num)
+            den = float(den)
+            if den == 0 or num <= 0:
+                raise ValueError(f"Invalid resolution rational {value} in {path}")
+            pixels_per_unit = num / den
+            if pixels_per_unit <= 0:
+                raise ValueError(f"Non-positive resolution {value} in {path}")
+            return unit_to_um / pixels_per_unit
+
+        x_um = _to_um(x_res_tag)
+        y_um = _to_um(y_res_tag)
+        return float(x_um), float(y_um)
 
 
 def discover_tiff_blocks(raw_dir: Path, blocks: Optional[Iterable[int]] = None) -> List[Path]:

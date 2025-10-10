@@ -42,6 +42,15 @@ def run(
     if not tiff_paths:
         raise FileNotFoundError(f"No anatomy TIFF files found in {raw_dir}")
 
+    pixel_size_xy = utils.extract_pixel_size_um(tiff_paths[0])
+    for extra_path in tiff_paths[1:]:
+        extra_size = utils.extract_pixel_size_um(extra_path)
+        if not np.allclose(extra_size, pixel_size_xy, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"Inconsistent pixel size detected in anatomy TIFFs: {pixel_size_xy} vs {extra_size} "
+                f"({extra_path.name})"
+            )
+
     stacks = [utils.load_tiff_stack(path) for path in tiff_paths]
     concatenated = np.concatenate(stacks, axis=0)
     corrected = utils.correct_negative_values(concatenated)
@@ -61,6 +70,7 @@ def run(
         "remove_first_frame": settings.remove_first_frame if settings else None,
         "blocks": settings.blocks if settings else None,
         "output_stack": str(stack_path),
+        "pixel_size_xy_um": [float(pixel_size_xy[0]), float(pixel_size_xy[1])],
     }
     metadata_path = output_root / metadata_filename.format(
         animal_id=animal_id, session_id=session_id

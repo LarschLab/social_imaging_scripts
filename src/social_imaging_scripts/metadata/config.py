@@ -315,9 +315,9 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
         ...,
         description="Axial spacing (um) for the fixed anatomy stack.",
     )
-    scale_range: tuple[float, float] = Field(
+    scale_window: float = Field(
         ...,
-        description="Inclusive scale search range for template matching.",
+        description="Fractional window around the expected scale (0 ⇒ single scale).",
     )
     n_scales: int = Field(
         ...,
@@ -331,21 +331,17 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
         ...,
         description="Number of planes on each side sampled during z refinement.",
     )
-    pyramid_downscale: int = Field(
-        ...,
-        description="Downscale factor between pyramid levels.",
-    )
-    pyramid_min_size: int = Field(
-        ...,
-        description="Smallest dimension allowed in the search pyramid.",
-    )
     gaussian_sigma: float = Field(
         ...,
         description="Gaussian sigma used during preprocessing.",
     )
-    do_subpixel: bool = Field(
+    early_stop_score: Optional[float] = Field(
+        default=None,
+        description="Optional NCC threshold for terminating the search early.",
+    )
+    progress: bool = Field(
         ...,
-        description="Enable subpixel refinement during registration.",
+        description="Emit per-plane progress logs during registration.",
     )
     flip_fixed_horizontal: bool = Field(
         ...,

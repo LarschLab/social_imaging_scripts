@@ -60,14 +60,13 @@ functional_to_anatomy_registration:
   avg_projection_filename_template: "{animal_id}_avg_projections.tif"  # Average projection filename.
   rotation_angle_deg: 0.0      # Rotation applied to functional projections before registration.
   fixed_z_spacing_um: 1.0      # Axial spacing (µm) of anatomy stack slices.
-  scale_range: [0.65, 1.05]    # Scale search range for template matching.
-  n_scales: 12                 # Number of scales sampled within the range.
-  z_stride_coarse: 5           # Coarse z stride for initial search.
-  z_refine_radius: 4           # Radius (planes) used for z refinement.
-  pyramid_downscale: 2         # Downscale factor between pyramid levels.
-  pyramid_min_size: 160        # Minimum image dimension at the coarsest pyramid level.
-  gaussian_sigma: 0.5          # Gaussian smoothing sigma applied during preprocessing.
-  do_subpixel: false           # Enable subpixel refinement.
+  scale_window: 0.0            # Fractional window around expected scale (0 → single scale).
+  n_scales: 1                  # Number of scales sampled within the window.
+  z_stride_coarse: 8           # Coarse z stride for initial search.
+  z_refine_radius: 10          # Radius (planes) used for z refinement.
+  gaussian_sigma: 1.0          # Gaussian smoothing sigma applied during preprocessing.
+  early_stop_score: 0.995      # Stop search once NCC exceeds this threshold (set null to disable).
+  progress: true               # Emit per-plane progress logs during registration.
   flip_fixed_horizontal: false # Flip anatomy stack left-right before registration.
 
 # Processing log output (optional).
