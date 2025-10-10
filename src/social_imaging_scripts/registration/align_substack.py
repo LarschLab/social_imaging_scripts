@@ -688,6 +688,7 @@ def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_over
 
 
 
+
 def interactive_checker(fixed_stack, moving_stack, df_results, rot_deg=140):
     """Slider UI to browse matches per moving plane."""
 
