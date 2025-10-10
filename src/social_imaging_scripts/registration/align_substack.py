@@ -10,7 +10,7 @@ _HAS_WIDGETS = True
 
 import skimage
 from skimage.feature import match_template
-from skimage.transform import rescale, resize, rotate
+from skimage.transform import rescale, resize
 from skimage.registration import phase_cross_correlation
 from skimage.util import img_as_float32
 from skimage.filters import gaussian
@@ -526,10 +526,10 @@ def register_moving_stack(
     return df
 
 
-def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_overlay=0.35, rot_deg=0.0):
+def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_overlay=0.35):
     import numpy as np
     import matplotlib.pyplot as plt
-    from skimage.transform import resize, rotate as sk_rotate
+    from skimage.transform import resize
 
     assert 0 <= moving_index < moving_stack.shape[0], "moving_index out of range"
     row = df_results[df_results["moving_plane"] == moving_index]
@@ -582,7 +582,7 @@ def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_over
             p1, p99 = im.min(), max(im.max(), im.min()+1e-3)
         return np.clip((im - p1) / (p99 - p1 + 1e-6), 0, 1)
 
-    # scale moving + prepare matched crop (UNROTATED data; rotation happens after compositing)
+    # scale moving + prepare matched crop
     moving_scaled = _rescale(moving, s)
     h, w          = moving_scaled.shape
     fixed_n       = _norm(fixed)
@@ -621,44 +621,24 @@ def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_over
         overlay[y_all, x_left,  :] = [0, 1, 0]
         overlay[y_all, x_right, :] = [0, 1, 0]
 
-    # rotate BOTH panels for visualization
-    # rotate overlay (whole left panel)
-    if abs(float(rot_deg)) > 1e-6:
-        overlay_disp = sk_rotate(overlay, angle=rot_deg, resize=False,
-                                preserve_range=True, mode="constant", cval=0.0, order=1)
-    else:
-        overlay_disp = overlay
+    if matched_n.shape != moving_n.shape:
+        matched_n = resize(matched_n, moving_n.shape, preserve_range=True, anti_aliasing=True)
 
-    # rotate the right panel images individually, then concatenate
-    if abs(float(rot_deg)) > 1e-6:
-        moving_disp  = sk_rotate(moving_n, angle=rot_deg, resize=False,
-                                preserve_range=True, mode="constant", cval=0.0, order=1)
-        matched_disp = sk_rotate(matched_n, angle=rot_deg, resize=False,
-                                preserve_range=True, mode="constant", cval=0.0, order=1)
-    else:
-        moving_disp, matched_disp = moving_n, matched_n
-
-    if matched_disp.shape != moving_disp.shape:
-        from skimage.transform import resize
-        matched_disp = resize(matched_disp, moving_disp.shape,
-                            preserve_range=True, anti_aliasing=True)
-
-    right_disp = np.concatenate([moving_disp, matched_disp], axis=1)
-    
+    right_disp = np.concatenate([moving_n, matched_n], axis=1)
 
     # ---- Plot
     fig = plt.figure(figsize=(14, 6))
 
     # left
     ax1 = fig.add_subplot(1, 2, 1)
-    ax1.imshow(np.clip(overlay_disp, 0, 1), interpolation="nearest")
-    ax1.set_title("Fixed with moving overlay (rotated display)")
+    ax1.imshow(np.clip(overlay, 0, 1), interpolation="nearest")
+    ax1.set_title("Fixed with moving overlay")
     ax1.set_axis_off()
 
     # right
     ax2 = fig.add_subplot(1, 2, 2)
     ax2.imshow(right_disp, cmap="gray", interpolation="nearest")
-    ax2.set_title("Left: moving (scaled) | Right: matched crop  (rotated display)")
+    ax2.set_title("Left: moving (scaled) | Right: matched crop")
     ax2.set_axis_off()
 
     # info box (2 columns, 3-dec floats)
@@ -689,15 +669,15 @@ def show_match(fixed_stack, moving_stack, df_results, moving_index=0, alpha_over
 
 
 
-def interactive_checker(fixed_stack, moving_stack, df_results, rot_deg=140):
+def interactive_checker(fixed_stack, moving_stack, df_results):
     """Slider UI to browse matches per moving plane."""
 
     slider = widgets.IntSlider(
         value=0, min=0, max=moving_stack.shape[0]-1, step=1, description="moving plane"
     )
     out = widgets.interactive_output(
-        lambda moving_index: show_match(fixed_stack, moving_stack, df_results, moving_index=moving_index, rot_deg=rot_deg),
-        {"moving_index": slider}
+        lambda moving_index: show_match(fixed_stack, moving_stack, df_results, moving_index=moving_index),
+        {"moving_index": slider},
     )
     display(widgets.HBox([slider]), out)
 
@@ -720,12 +700,8 @@ def _temporal_filter_and_subsample(ts, movavg=10, limit=1000, step=10):
     ts_f = uniform_filter1d(ts, size=movavg, axis=0, mode='reflect')  # centered MA
     return ts_f[::step]  # (100, Y, X)
 
-def _process_plane_stack(path, scale_xy, rot_deg=140.0, bg_value=0.0):
-    """
-    Load -> limit to 1000 -> MA(10) -> every 10th (100 frames)
-    -> rotate 140° (no canvas growth) -> resize by scale_xy.
-    Returns float32 (100, Ys, Xs).
-    """
+def _process_plane_stack(path, scale_xy, bg_value=0.0):
+    """Load -> limit to 1000 -> MA(10) -> every 10th (100 frames) -> resize by scale_xy."""
     ts = _load_timeseries_stack(path)                     # (T,512,512)
     ts = _temporal_filter_and_subsample(ts, 10, 1000, 10) # (100,512,512)
 
@@ -736,10 +712,7 @@ def _process_plane_stack(path, scale_xy, rot_deg=140.0, bg_value=0.0):
 
     for t in range(T_out):
         fr = ts[t]
-        fr_r = rotate(fr, angle=rot_deg, resize=False, mode='constant', cval=bg_value,
-                      order=1, preserve_range=True)
-        out[t] = resize(fr_r, (Ys, Xs), anti_aliasing=True,
-                        preserve_range=True).astype(np.float32, copy=False)
+        out[t] = resize(fr, (Ys, Xs), anti_aliasing=True, preserve_range=True).astype(np.float32, copy=False)
     return out
 
 def _safe_paste_max(dst2d, src2d, top, left):
@@ -785,14 +758,14 @@ def build_hyperstack_uint8_in_memory(
             float(r["scale_moving_to_fixed"])
         )
 
-    # 1) Process all planes (rotation + scale) and keep in RAM (list)
+    # 1) Process all planes (scale to anatomy space) and keep in RAM (list)
     processed = []  # list of dicts: {"idx": i, "z": z, "y": y, "x": x, "s": s, "data": (100,Ys,Xs)}
     for i, p in enumerate(funcStacks):
         if i not in meta:
             print(f"[skip] plane {i}: no registration row")
             continue
         z, y, x, s = meta[i]
-        arr = _process_plane_stack(p, s, rot_deg=140.0)   # (100, Ys, Xs) float32
+        arr = _process_plane_stack(p, s)   # (100, Ys, Xs) float32
         processed.append({"idx": i, "z": z, "y": y, "x": x, "s": s, "data": arr})
         print(f"[proc] plane {i}: -> z={z}, pos=({y:.1f},{x:.1f}), scale={s:.3f}, shape={arr.shape}")
 
@@ -872,40 +845,61 @@ def write_combined_log(base_folder, out_csv=None, out_full_csv=None):
     return agg, big
 
 
-def read_good_nrrd_uint8(path: Path, flip_horizontal: bool = False) -> np.ndarray:
+def _read_stack_zyx(path: Path) -> np.ndarray:
     """
-    Read 3D stack as uint8 with your axis handling. Tries NRRD first, then
-    falls back to TIFF if the file is mis-labeled. Returns array shaped (Z, Y, X).
+    Core reader that loads NRRD or TIFF volumes and returns an array shaped (Z, Y, X)
+    preserving the on-disk bit depth.
     """
     path = Path(path)
     try:
         data, _ = nrrd.read(str(path))
-    except (nrrd.NRRDError, UnicodeDecodeError) as err:
+    except (nrrd.NRRDError, UnicodeDecodeError):
         try:
             im = tiff.imread(str(path))
         except Exception as tif_err:
             raise RuntimeError(f"Failed to read anatomy stack {path}: {tif_err}") from tif_err
-        im = np.asarray(im, dtype=np.uint8, order="C")
+        im = np.asarray(im, order="C")
         if im.ndim == 2:
             im = im[np.newaxis, :, :]
         elif im.ndim != 3:
             raise ValueError(f"Unexpected TIFF shape {im.shape} for {path}")
     else:
-        im = np.asarray(data, dtype=np.uint8, order="C")
+        im = np.asarray(data, order="C")
         if im.ndim != 3:
             raise ValueError(f"Expected 3D NRRD; got shape {im.shape} for {path}")
+        # NRRD exports often arrive as (X, Y, Z); align to (Z, Y, X).
         im = np.moveaxis(im, 2, 0)
         im = np.moveaxis(im, 1, 2)
-    if flip_horizontal:
-        im = im[:, :, ::-1]  # flip X
+    return im
+
+
+def read_stack_float32(path: Path) -> np.ndarray:
+    """
+    Load a volumetric stack as float32 with shape (Z, Y, X) while preserving dynamic range.
+    """
+    im = _read_stack_zyx(path)
+    if im.dtype != np.float32:
+        im = im.astype(np.float32, copy=False)
+    return im
+
+
+def read_good_nrrd_uint8(path: Path) -> np.ndarray:
+    """
+    Legacy helper that returns the volume as uint8. Prefer :func:`read_stack_float32`
+    for new code paths so that bit depth is preserved.
+    """
+    im = _read_stack_zyx(path)
+    if im.dtype != np.uint8:
+        im = im.astype(np.uint8, copy=False)
     return im
 
 
 def get_spacing_origin_ZYX(nrrd_path: Path):
     """
-    Return (spacing_zyx, origin_zyx) aligned to the array produced by
-    read_good_nrrd_uint8. Handles true NRRDs as well as TIFF files that were
-    mislabeled with a .nrrd suffix (ImageJ export with embedded NRRD metadata).
+    Return (spacing_zyx, origin_zyx) aligned to arrays produced by
+    :func:`read_stack_float32` / :func:`read_good_nrrd_uint8`. Handles true NRRDs as
+    well as TIFF files that were mislabeled with a .nrrd suffix (ImageJ export with
+    embedded NRRD metadata).
     """
     path = Path(nrrd_path)
 

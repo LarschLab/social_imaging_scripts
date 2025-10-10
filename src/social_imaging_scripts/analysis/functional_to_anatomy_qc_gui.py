@@ -11,12 +11,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from IPython.display import display
-from skimage.transform import resize, rotate as sk_rotate
+from skimage.transform import resize
 
 from ..metadata.config import load_project_config, resolve_output_path
 from ..metadata.models import AnimalMetadata
 from ..pipeline import iter_animals_with_yaml
-from ..registration.align_substack import read_good_nrrd_uint8
+from ..registration.align_substack import read_stack_float32
 
 
 @dataclass
@@ -62,7 +62,6 @@ class RegistrationQC:
             self._animals = list(animal_ids)
 
         self._data_cache: Dict[str, RegistrationArtefacts] = {}
-        self.default_rotation = float(self._cfg.functional_to_anatomy_registration.rotation_angle_deg)
 
     @property
     def summary(self) -> pd.DataFrame:
@@ -179,10 +178,7 @@ class RegistrationQC:
         anatomy_path = paths["anatomy_stack"]
         projection_path = paths["avg_projection"]
 
-        fixed_stack = read_good_nrrd_uint8(
-            anatomy_path,
-            flip_horizontal=self._cfg.functional_to_anatomy_registration.flip_fixed_horizontal,
-        )
+        fixed_stack = read_stack_float32(anatomy_path)
         moving_stack = tiff.imread(str(projection_path))
         df_results = pd.read_csv(paths["registration_csv"])
         artefacts = RegistrationArtefacts(
@@ -205,7 +201,7 @@ class RegistrationQC:
             p1, p99 = im.min(), max(im.max(), im.min() + 1e-3)
         return np.clip((im - p1) / (p99 - p1 + 1e-6), 0, 1)
 
-    def _build_figure(self, artefacts: RegistrationArtefacts, moving_index: int, rot_deg: float) -> plt.Figure:
+    def _build_figure(self, artefacts: RegistrationArtefacts, moving_index: int) -> plt.Figure:
         df_results = artefacts.df_results
         if not (0 <= moving_index < artefacts.moving_stack.shape[0]):
             raise ValueError("moving_index out of range")
@@ -271,28 +267,20 @@ class RegistrationQC:
             overlay[max(0, y0):min(overlay.shape[0], y0 + h), max(0, x0):min(overlay.shape[1], x0 + rr_thick), :] = [0, 1, 0]
             overlay[max(0, y0):min(overlay.shape[0], y0 + h), max(0, x0 + w - rr_thick):min(overlay.shape[1], x0 + w), :] = [0, 1, 0]
 
-        def _rotate(img: np.ndarray) -> np.ndarray:
-            if abs(float(rot_deg)) > 1e-6:
-                return sk_rotate(img, angle=rot_deg, resize=False, preserve_range=True, mode="constant", cval=0.0, order=1)
-            return img
+        if matched_norm.shape != moving_norm.shape:
+            matched_norm = resize(matched_norm, moving_norm.shape, preserve_range=True, anti_aliasing=True)
 
-        overlay_disp = _rotate(overlay)
-        moving_disp = _rotate(moving_norm)
-        matched_disp = _rotate(matched_norm)
-        if matched_disp.shape != moving_disp.shape:
-            matched_disp = resize(matched_disp, moving_disp.shape, preserve_range=True, anti_aliasing=True)
-
-        right_disp = np.concatenate([moving_disp, matched_disp], axis=1)
+        right_disp = np.concatenate([moving_norm, matched_norm], axis=1)
 
         fig = plt.figure(figsize=(14, 6))
         ax1 = fig.add_subplot(1, 2, 1)
-        ax1.imshow(np.clip(overlay_disp, 0, 1), interpolation="nearest")
-        ax1.set_title("Fixed with moving overlay (rotated display)")
+        ax1.imshow(np.clip(overlay, 0, 1), interpolation="nearest")
+        ax1.set_title("Fixed with moving overlay")
         ax1.set_axis_off()
 
         ax2 = fig.add_subplot(1, 2, 2)
         ax2.imshow(right_disp, cmap="gray", interpolation="nearest")
-        ax2.set_title("Left: moving (scaled) | Right: matched crop  (rotated display)")
+        ax2.set_title("Left: moving (scaled) | Right: matched crop")
         ax2.set_axis_off()
 
         info_items = []
@@ -334,14 +322,6 @@ class RegistrationQC:
             raise RuntimeError("No animals available for QC")
 
         dropdown = widgets.Dropdown(options=self._animals, description="Animal:")
-        rotation = widgets.FloatSlider(
-            value=self.default_rotation,
-            min=-180.0,
-            max=180.0,
-            step=1.0,
-            description="Rotation",
-            continuous_update=False,
-        )
         plane_slider = widgets.IntSlider(value=0, min=0, step=1, description="moving plane")
         output = widgets.Output()
 
@@ -353,7 +333,7 @@ class RegistrationQC:
         def _render(*_):
             animal_id = dropdown.value
             data = self._load_animal_data(animal_id)
-            fig = self._build_figure(data, plane_slider.value, rotation.value)
+            fig = self._build_figure(data, plane_slider.value)
             with output:
                 output.clear_output(wait=True)
                 display(fig)
@@ -366,17 +346,16 @@ class RegistrationQC:
             _render()
 
         dropdown.observe(_on_animal, names='value')
-        rotation.observe(_render, names='value')
         plane_slider.observe(_render, names='value')
 
         _update_plane_bounds(self._animals[0])
         _render()
 
-        controls = widgets.VBox([dropdown, rotation, plane_slider])
+        controls = widgets.VBox([dropdown, plane_slider])
         return widgets.VBox([controls, output])
 
-    def show_static(self, animal_id: str, plane_index: int = 0, rot_deg: Optional[float] = None) -> None:
+    def show_static(self, animal_id: str, plane_index: int = 0) -> None:
         data = self._load_animal_data(animal_id)
-        fig = self._build_figure(data, plane_index, self.default_rotation if rot_deg is None else rot_deg)
+        fig = self._build_figure(data, plane_index)
         display(fig)
         plt.close(fig)

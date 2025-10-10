@@ -195,6 +195,20 @@ def _load_session_pixel_size(metadata_path: Path) -> tuple[float, float]:
     return float(pixel_size[0]), float(pixel_size[1])
 
 
+def _load_expected_plane_count(metadata_path: Path) -> Optional[int]:
+    try:
+        data = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    value = data.get("n_planes")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid n_planes value in metadata: {metadata_path}: {value!r}")
+
+
 def _coerce_parameters(parameters: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     if not parameters:
         return {}
@@ -643,13 +657,10 @@ def process_functional_to_anatomy_registration(
         stage_cfg.avg_projection_filename_template
     )
 
-    if stage_cfg.reprocess or not (
-        max_projection_path.exists() and avg_projection_path.exists()
-    ):
+    if not (max_projection_path.exists() and avg_projection_path.exists()):
         try:
             functional_projections.save_max_avg_projections(
                 motion_root,
-                angle_deg=stage_cfg.rotation_angle_deg,
                 out_dir=projections_dir,
                 animal_name=animal.animal_id,
                 recursive=True,
@@ -658,6 +669,13 @@ def process_functional_to_anatomy_registration(
             logger.exception("Failed to build functional projections", exc_info=exc)
             result.message = f"failed to compute functional projections: {exc}"
             return result
+    else:
+        logger.info(
+            "Reusing existing functional projections for %s (max=%s, avg=%s)",
+            animal.animal_id,
+            max_projection_path,
+            avg_projection_path,
+        )
 
     if not max_projection_path.exists() or not avg_projection_path.exists():
         result.message = (
@@ -695,19 +713,10 @@ def process_functional_to_anatomy_registration(
         return result
 
     try:
-        fixed_stack = align_substack.read_good_nrrd_uint8(
-            stack_path, flip_horizontal=stage_cfg.flip_fixed_horizontal
-        )
+        fixed_stack = align_substack.read_stack_float32(stack_path)
     except Exception as exc:  # pragma: no cover - IO heavy
         logger.exception("Failed to load anatomy stack", exc_info=exc)
         result.message = f"failed to load anatomy stack: {exc}"
-        return result
-
-    try:
-        moving_stack = tifffile.imread(str(avg_projection_path))
-    except Exception as exc:  # pragma: no cover - IO heavy
-        logger.exception("Failed to load functional projections", exc_info=exc)
-        result.message = f"failed to load functional projections: {exc}"
         return result
 
     functional_root = resolve_output_path(
@@ -721,6 +730,44 @@ def process_functional_to_anatomy_registration(
         session_id=functional_session.session_id,
     )
     functional_metadata_path = plane_dir / functional_metadata_name
+    expected_plane_count = _load_expected_plane_count(functional_metadata_path)
+
+    try:
+        moving_stack = tifffile.imread(str(avg_projection_path))
+    except Exception as exc:  # pragma: no cover - IO heavy
+        logger.exception("Failed to load functional projections", exc_info=exc)
+        result.message = f"failed to load functional projections: {exc}"
+        return result
+    if expected_plane_count is not None and moving_stack.shape[0] != expected_plane_count:
+        logger.warning(
+            "Detected %s projection planes for %s but metadata reports %s; regenerating projections",
+            moving_stack.shape[0],
+            animal.animal_id,
+            expected_plane_count,
+        )
+        try:
+            functional_projections.save_max_avg_projections(
+                motion_root,
+                out_dir=projections_dir,
+                animal_name=animal.animal_id,
+                recursive=True,
+            )
+        except Exception as exc:
+            logger.exception("Failed to rebuild functional projections", exc_info=exc)
+            result.message = f"failed to rebuild functional projections: {exc}"
+            return result
+        try:
+            moving_stack = tifffile.imread(str(avg_projection_path))
+        except Exception as exc:
+            logger.exception("Failed to reload regenerated projections", exc_info=exc)
+            result.message = f"failed to reload regenerated projections: {exc}"
+            return result
+        if moving_stack.shape[0] != expected_plane_count:
+            result.message = (
+                f"projection plane mismatch persists after regeneration: "
+                f"found {moving_stack.shape[0]}, expected {expected_plane_count}"
+            )
+            return result
 
     anatomy_metadata_name = anatomy_cfg.metadata_filename_template.format(
         animal_id=animal.animal_id,

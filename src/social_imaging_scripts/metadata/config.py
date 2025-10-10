@@ -307,10 +307,6 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
         ...,
         description="Filename template for saved average projection stacks.",
     )
-    rotation_angle_deg: float = Field(
-        ...,
-        description="Rotation applied to functional projections prior to registration.",
-    )
     fixed_z_spacing_um: float = Field(
         ...,
         description="Axial spacing (um) for the fixed anatomy stack.",
@@ -342,10 +338,6 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
     progress: bool = Field(
         ...,
         description="Emit per-plane progress logs during registration.",
-    )
-    flip_fixed_horizontal: bool = Field(
-        ...,
-        description="Flip anatomy stacks horizontally before registration.",
     )
 
     @field_validator(
