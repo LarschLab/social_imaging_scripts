@@ -23,11 +23,12 @@ from ..metadata.config import (
 )
 from ..metadata.loader import load_animals
 from ..metadata.models import AnatomySession, AnimalMetadata, FunctionalSession
-from ..preprocessing import functional_projections
+from ..preprocessing import confocal as confocal_preproc, functional_projections
 from ..preprocessing.two_photon import anatomy as anatomy_preproc
 from ..preprocessing.two_photon import functional as functional_preproc
 from ..preprocessing.two_photon import motion as motion_correction
 from ..registration import align_substack
+from ..registration.confocal_to_anatomy import register_confocal_to_anatomy
 from ..registration.functional_to_anatomy_ants import register_planes_pass1
 from ..registration.fireants_pipeline import FireANTsRegistrationConfig, register_two_photon_anatomy
 from .processing_log import (
@@ -593,6 +594,200 @@ def process_anatomy_session(
     return result
 
 
+def process_confocal_session(
+    *,
+    animal: AnimalMetadata,
+    session: AnatomySession,
+    cfg: ProjectConfig,
+    stage_cfg,
+) -> tuple[SessionResult, Optional[confocal_preproc.ConfocalPreprocessOutputs]]:
+    result = SessionResult(
+        animal_id=animal.animal_id,
+        session_id=session.session_id,
+        session_type="confocal_preprocessing",
+        status="skipped",
+    )
+
+    if not stage_cfg.enabled:
+        result.message = "confocal preprocessing disabled"
+        return result, None
+
+    output_root = resolve_output_path(
+        animal.animal_id,
+        stage_cfg.root_subdir,
+        cfg=cfg,
+    )
+    try:
+        raw_path = _resolve_session_raw_path(
+            animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
+        )
+    except Exception as exc:
+        result.status = "failed"
+        result.message = f"failed to resolve confocal raw path: {exc}"
+        return result, None
+    try:
+        outputs = confocal_preproc.run(
+            animal=animal,
+            session=session,
+            cfg_root=output_root,
+            channel_template=stage_cfg.channel_filename_template,
+            metadata_filename=stage_cfg.metadata_filename_template,
+            flip_horizontal=stage_cfg.flip_horizontal,
+            reprocess=stage_cfg.reprocess,
+            raw_path_override=raw_path,
+        )
+    except Exception as exc:  # pragma: no cover - IO heavy
+        logger.exception("Confocal preprocessing failed", exc_info=exc)
+        result.status = "failed"
+        result.message = f"confocal preprocessing failed: {exc}"
+        return result, None
+
+    for name, path in outputs.channel_paths.items():
+        result.outputs[f"channel_{name}"] = Path(path)
+    result.outputs["metadata"] = outputs.metadata_path
+    result.status = "success"
+    result.message = (
+        "confocal preprocessing reused existing outputs"
+        if outputs.reused
+        else "confocal preprocessing ran"
+    )
+    return result, outputs
+
+
+def process_confocal_to_anatomy_registration(
+    *,
+    animal: AnimalMetadata,
+    confocal_session: AnatomySession,
+    anatomy_session: AnatomySession,
+    preprocess_outputs: confocal_preproc.ConfocalPreprocessOutputs,
+    cfg: ProjectConfig,
+    stage_cfg,
+    fireants_config: Optional[FireANTsRegistrationConfig],
+) -> SessionResult:
+    result = SessionResult(
+        animal_id=animal.animal_id,
+        session_id=confocal_session.session_id,
+        session_type="confocal_to_anatomy_registration",
+        status="skipped",
+    )
+
+    if not stage_cfg.enabled:
+        result.message = "confocal-to-anatomy registration disabled"
+        return result
+
+    channel_paths = preprocess_outputs.channel_paths
+    if not channel_paths:
+        result.status = "failed"
+        result.message = "no confocal channels available after preprocessing"
+        return result
+
+    reference_channel = stage_cfg.reference_channel_name.lower()
+    moving_name = None
+    moving_path = None
+    for name, path in channel_paths.items():
+        if name.lower() == reference_channel:
+            moving_name = name
+            moving_path = path
+            break
+    if moving_path is None:
+        moving_name, moving_path = next(iter(channel_paths.items()))
+
+    additional_channels = {
+        name: Path(path)
+        for name, path in channel_paths.items()
+        if name != moving_name
+    }
+
+    registration_subdir = stage_cfg.registration_subdir_template.format(
+        animal_id=animal.animal_id,
+        confocal_session_id=confocal_session.session_id,
+        anatomy_session_id=anatomy_session.session_id,
+    )
+    registration_root = resolve_output_path(
+        animal.animal_id,
+        stage_cfg.output_root_subdir,
+        registration_subdir,
+        cfg=cfg,
+    )
+    registration_root.mkdir(parents=True, exist_ok=True)
+
+    result.outputs["reference_channel_source"] = Path(moving_path)
+    result.outputs["registration_dir"] = registration_root
+
+    anatomy_root = resolve_output_path(
+        animal.animal_id,
+        cfg.anatomy_preprocessing.root_subdir,
+        cfg=cfg,
+    )
+    stack_name = cfg.anatomy_preprocessing.stack_filename_template.format(
+        animal_id=animal.animal_id,
+        session_id=anatomy_session.session_id,
+    )
+    anatomy_stack_path = anatomy_root / stack_name
+    if not anatomy_stack_path.exists():
+        result.status = "failed"
+        result.message = f"anatomy stack missing at {anatomy_stack_path}"
+        return result
+
+    fixed_pixel_size = (1.0, 1.0)
+    try:
+        anatomy_metadata_name = cfg.anatomy_preprocessing.metadata_filename_template.format(
+            animal_id=animal.animal_id,
+            session_id=anatomy_session.session_id,
+        )
+        anatomy_metadata_path = anatomy_root / anatomy_metadata_name
+        fixed_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
+    except Exception:
+        pass
+
+    z_spacing = getattr(anatomy_session.session_data, "plane_spacing", None)
+    if z_spacing is None:
+        z_spacing = getattr(anatomy_session.session_data, "z_step_um", None)
+    if z_spacing is None:
+        z_spacing = 1.0
+    fixed_spacing_um = (
+        float(fixed_pixel_size[0]),
+        float(fixed_pixel_size[1]),
+        float(z_spacing),
+    )
+
+    metadata_outputs = register_confocal_to_anatomy(
+        animal_id=animal.animal_id,
+        confocal_session_id=confocal_session.session_id,
+        anatomy_session_id=anatomy_session.session_id,
+        moving_channel_path=moving_path,
+        fixed_stack_path=anatomy_stack_path,
+        additional_channels=additional_channels,
+        output_root=registration_root,
+        config=copy.deepcopy(fireants_config) if fireants_config is not None else FireANTsRegistrationConfig(),
+        overrides=stage_cfg.overrides or None,
+        voxel_spacing_um=preprocess_outputs.voxel_size_um,
+        fixed_spacing_um=fixed_spacing_um,
+        warped_channel_template=stage_cfg.warped_channel_template,
+        metadata_filename=stage_cfg.metadata_filename_template,
+        transforms_subdir=stage_cfg.transforms_subdir,
+        qc_subdir=stage_cfg.qc_subdir,
+        reference_channel_name=moving_name,
+    )
+
+    for key, value in metadata_outputs.items():
+        if isinstance(value, Path):
+            result.outputs[key] = value
+        elif isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, Path):
+                    result.outputs[f"{key}_{sub_key}"] = sub_value
+        elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+            for idx, entry in enumerate(value):
+                if isinstance(entry, Path):
+                    result.outputs[f"{key}_{idx}"] = entry
+    result.status = "success"
+    result.message = (
+        f"warped {len(metadata_outputs['warped_channels'])} confocal channels (ref={moving_name})"
+    )
+    return result
+
+
 def process_functional_to_anatomy_registration(
     *,
     animal: AnimalMetadata,
@@ -897,7 +1092,9 @@ def run_pipeline(
     functional_cfg = cfg.functional_preprocessing
     motion_cfg = cfg.motion_correction
     anatomy_cfg = cfg.anatomy_preprocessing
+    confocal_preproc_cfg = cfg.confocal_preprocessing
     fireants_stage_cfg = cfg.fireants_registration
+    confocal_stage_cfg = cfg.confocal_to_anatomy_registration
     ftoa_stage_cfg = cfg.functional_to_anatomy_registration
     processing_cfg = cfg.processing_log
 
@@ -923,6 +1120,16 @@ def run_pipeline(
         file_overrides = load_yaml_mapping(fireants_stage_cfg.config_path)
         fireants_config = FireANTsRegistrationConfig.with_overrides(file_overrides)
 
+    if fireants_config is None:
+        fireants_config = FireANTsRegistrationConfig()
+
+    confocal_fireants_config: Optional[FireANTsRegistrationConfig] = None
+    if confocal_stage_cfg.config_path:
+        confocal_overrides = load_yaml_mapping(confocal_stage_cfg.config_path)
+        confocal_fireants_config = FireANTsRegistrationConfig.with_overrides(confocal_overrides)
+    else:
+        confocal_fireants_config = FireANTsRegistrationConfig()
+
     results: list[AnimalResult] = []
 
     for animal in animals:
@@ -942,6 +1149,7 @@ def run_pipeline(
         functional_session_result: Optional[SessionResult] = None
         anatomy_session_ref: Optional[AnatomySession] = None
         anatomy_session_result: Optional[SessionResult] = None
+        confocal_sessions: list[tuple[AnatomySession, confocal_preproc.ConfocalPreprocessOutputs]] = []
 
         for session in animal.sessions:
             if not session.include_in_analysis:
@@ -1067,6 +1275,51 @@ def run_pipeline(
                     if pixel_size_xy is not None:
                         parameters["session_pixel_size_xy_um"] = [float(pixel_size_xy[0]), float(pixel_size_xy[1])]
 
+                    _update_processing_log_stage(
+                        animal_log,
+                        _stage_key(session_result.session_type, session_result.session_id),
+                        session_result,
+                        parameters,
+                    )
+                    save_processing_log(animal_log, log_path)
+            elif (
+                session.session_type == "anatomy_stack"
+                and getattr(session.session_data, "stack_type", "") == "confocal"
+            ):
+                logger.info(
+                    "---------- Confocal preprocessing (%s, session %s) ----------",
+                    animal.animal_id,
+                    session.session_id,
+                )
+                session_result, confocal_outputs = process_confocal_session(
+                    animal=animal,
+                    session=session,  # type: ignore[arg-type]
+                    cfg=cfg,
+                    stage_cfg=confocal_preproc_cfg,
+                )
+                animal_result.sessions.append(session_result)
+                logger.info(
+                    "---------- Completed confocal preprocessing (%s, session %s): %s ----------",
+                    animal.animal_id,
+                    session.session_id,
+                    session_result.status,
+                )
+                if confocal_outputs is not None:
+                    confocal_sessions.append((session, confocal_outputs))
+                if animal_log is not None and log_path is not None:
+                    parameters = {
+                        "confocal_preprocess_enabled": confocal_preproc_cfg.enabled,
+                        "confocal_preprocess_reprocess": confocal_preproc_cfg.reprocess,
+                        "flip_horizontal": confocal_preproc_cfg.flip_horizontal,
+                    }
+                    if confocal_outputs is not None:
+                        parameters["voxel_size_um"] = [
+                            float(confocal_outputs.voxel_size_um[0]),
+                            float(confocal_outputs.voxel_size_um[1]),
+                            float(confocal_outputs.voxel_size_um[2]),
+                        ]
+                        parameters["channels"] = sorted(confocal_outputs.channel_paths.keys())
+                        parameters["reused"] = confocal_outputs.reused
                     _update_processing_log_stage(
                         animal_log,
                         _stage_key(session_result.session_type, session_result.session_id),
@@ -1234,6 +1487,118 @@ def run_pipeline(
                     },
                 )
                 save_processing_log(animal_log, log_path)
+
+        if confocal_sessions:
+            if not confocal_stage_cfg.enabled:
+                for conf_session, _ in confocal_sessions:
+                    stage_result = SessionResult(
+                        animal_id=animal.animal_id,
+                        session_id=conf_session.session_id,
+                        session_type="confocal_to_anatomy_registration",
+                        status="skipped",
+                        message="confocal-to-anatomy registration disabled",
+                    )
+                    animal_result.sessions.append(stage_result)
+                    if animal_log is not None and log_path is not None:
+                        _update_processing_log_stage(
+                            animal_log,
+                            _stage_key(stage_result.session_type, stage_result.session_id),
+                            stage_result,
+                            {
+                                "confocal_to_anatomy_enabled": confocal_stage_cfg.enabled,
+                                "confocal_to_anatomy_reprocess": confocal_stage_cfg.reprocess,
+                            },
+                        )
+                        save_processing_log(animal_log, log_path)
+            elif anatomy_session_ref is None:
+                for conf_session, _ in confocal_sessions:
+                    stage_result = SessionResult(
+                        animal_id=animal.animal_id,
+                        session_id=conf_session.session_id,
+                        session_type="confocal_to_anatomy_registration",
+                        status="skipped",
+                        message="two-photon anatomy session missing; cannot register confocal",
+                    )
+                    animal_result.sessions.append(stage_result)
+                    if animal_log is not None and log_path is not None:
+                        _update_processing_log_stage(
+                            animal_log,
+                            _stage_key(stage_result.session_type, stage_result.session_id),
+                            stage_result,
+                            {"reason": "missing_two_photon_anatomy"},
+                        )
+                        save_processing_log(animal_log, log_path)
+            elif anatomy_session_result and anatomy_session_result.status == "failed":
+                for conf_session, _ in confocal_sessions:
+                    stage_result = SessionResult(
+                        animal_id=animal.animal_id,
+                        session_id=conf_session.session_id,
+                        session_type="confocal_to_anatomy_registration",
+                        status="skipped",
+                        message="anatomy preprocessing failed; cannot register confocal to anatomy",
+                    )
+                    animal_result.sessions.append(stage_result)
+                    if animal_log is not None and log_path is not None:
+                        _update_processing_log_stage(
+                            animal_log,
+                            _stage_key(stage_result.session_type, stage_result.session_id),
+                            stage_result,
+                            {"reason": "anatomy_preprocessing_failed"},
+                        )
+                        save_processing_log(animal_log, log_path)
+            else:
+                for conf_session, conf_outputs in confocal_sessions:
+                    logger.info(
+                        "---------- Confocal-to-anatomy registration (%s :: %s) ----------",
+                        animal.animal_id,
+                        conf_session.session_id,
+                    )
+                    stage_result = process_confocal_to_anatomy_registration(
+                        animal=animal,
+                        confocal_session=conf_session,
+                        anatomy_session=anatomy_session_ref,  # type: ignore[arg-type]
+                        preprocess_outputs=conf_outputs,
+                        cfg=cfg,
+                        stage_cfg=confocal_stage_cfg,
+                        fireants_config=confocal_fireants_config,
+                    )
+                    animal_result.sessions.append(stage_result)
+                    logger.info(
+                        "---------- Completed confocal-to-anatomy registration (%s :: %s): %s ----------",
+                        animal.animal_id,
+                        conf_session.session_id,
+                        stage_result.status,
+                    )
+                    if animal_log is not None and log_path is not None:
+                        metadata_path = stage_result.outputs.get("metadata")
+                        fixed_spacing = None
+                        if metadata_path is not None:
+                            try:
+                                data = json.loads(Path(metadata_path).read_text())
+                                fixed_spacing = data.get("fixed_spacing_um")
+                            except Exception:
+                                fixed_spacing = None
+
+                        parameters = {
+                            "confocal_to_anatomy_enabled": confocal_stage_cfg.enabled,
+                            "confocal_to_anatomy_reprocess": confocal_stage_cfg.reprocess,
+                            "reference_channel": confocal_stage_cfg.reference_channel_name,
+                            "available_channels": sorted(conf_outputs.channel_paths.keys()),
+                            "voxel_size_um": [
+                                float(conf_outputs.voxel_size_um[0]),
+                                float(conf_outputs.voxel_size_um[1]),
+                                float(conf_outputs.voxel_size_um[2]),
+                            ],
+                        }
+                        if fixed_spacing is not None:
+                            parameters["fixed_spacing_um"] = fixed_spacing
+                        _update_processing_log_stage(
+                            animal_log,
+                            _stage_key(stage_result.session_type, stage_result.session_id),
+                            stage_result,
+                            parameters,
+                        )
+                        save_processing_log(animal_log, log_path)
 
         results.append(animal_result)
 

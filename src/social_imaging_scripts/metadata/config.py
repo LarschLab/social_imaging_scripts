@@ -242,6 +242,36 @@ class AnatomyPreprocessingConfig(BaseModel):
         return normalise_pathlike(value)
 
 
+class ConfocalPreprocessingConfig(BaseModel):
+    """Configuration for confocal stack preprocessing."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Run confocal stack preprocessing.")
+    reprocess: bool = Field(..., description="Re-run even if outputs already exist.")
+    root_subdir: Path = Field(
+        ...,
+        description="Relative output directory for confocal preprocessing artefacts.",
+    )
+    channel_filename_template: str = Field(
+        ...,
+        description="Filename pattern for per-channel confocal stacks.",
+    )
+    metadata_filename_template: str = Field(
+        ...,
+        description="Filename template for confocal preprocessing metadata.",
+    )
+    flip_horizontal: bool = Field(
+        ...,
+        description="Flip confocal stacks left-right during preprocessing.",
+    )
+
+    @field_validator("root_subdir", mode="before")
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
 class FireantsRegistrationStageConfig(BaseModel):
     """Configuration for FireANTs anatomy registration stage."""
 
@@ -267,6 +297,62 @@ class FireantsRegistrationStageConfig(BaseModel):
     )
 
     @field_validator("output_subdir", "config_path", mode="before")
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
+class ConfocalToAnatomyRegistrationConfig(BaseModel):
+    """Configuration for registering confocal stacks to two-photon anatomy."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(..., description="Enable confocal-to-anatomy registration.")
+    reprocess: bool = Field(..., description="Re-run registration even if outputs exist.")
+    output_root_subdir: Path = Field(
+        ...,
+        description="Base output directory for confocal registration artefacts.",
+    )
+    registration_subdir_template: str = Field(
+        ...,
+        description="Template for per-session registration subdirectories.",
+    )
+    reference_channel_name: str = Field(
+        ...,
+        description="Channel name used as the moving image during registration.",
+    )
+    warped_channel_template: str = Field(
+        ...,
+        description="Filename template for warped channel outputs.",
+    )
+    metadata_filename_template: str = Field(
+        ...,
+        description="Filename template for registration metadata JSON.",
+    )
+    transforms_subdir: Path = Field(
+        ...,
+        description="Subdirectory name for saved FireANTs transforms.",
+    )
+    qc_subdir: Path = Field(
+        ...,
+        description="Subdirectory name for QC artefacts.",
+    )
+    config_path: Optional[Path] = Field(
+        default=None,
+        description="Optional FireANTs configuration file for this stage.",
+    )
+    overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Inline overrides applied to the FireANTs configuration.",
+    )
+
+    @field_validator(
+        "output_root_subdir",
+        "transforms_subdir",
+        "qc_subdir",
+        "config_path",
+        mode="before",
+    )
     @classmethod
     def _normalise_paths(cls, value):
         return normalise_pathlike(value)
@@ -406,7 +492,9 @@ class ProjectConfig(BaseModel):
     functional_preprocessing: FunctionalPreprocessingConfig = Field(...)
     motion_correction: MotionCorrectionConfig = Field(...)
     anatomy_preprocessing: AnatomyPreprocessingConfig = Field(...)
+    confocal_preprocessing: ConfocalPreprocessingConfig = Field(...)
     fireants_registration: FireantsRegistrationStageConfig = Field(...)
+    confocal_to_anatomy_registration: ConfocalToAnatomyRegistrationConfig = Field(...)
     functional_to_anatomy_registration: FunctionalToAnatomyRegistrationConfig = Field(
         ...
     )

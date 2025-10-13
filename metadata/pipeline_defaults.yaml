@@ -38,6 +38,15 @@ anatomy_preprocessing:
   metadata_filename_template: "{animal_id}_anatomy_metadata.json"  # Anatomy metadata filename.
   stack_filename_template: "{animal_id}_anatomy_stack.tif"     # Preprocessed anatomy stack filename.
 
+# Confocal preprocessing.
+confocal_preprocessing:
+  enabled: true
+  reprocess: false
+  root_subdir: 02_reg/00_preprocessing
+  channel_filename_template: "channel_{channel}.tif"
+  metadata_filename_template: "{session_id}_confocal_metadata.json"
+  flip_horizontal: true
+
 # FireANTs registration (anatomy → reference brain).
 fireants_registration:
   enabled: true                # Run FireANTs registration.
@@ -66,6 +75,20 @@ functional_to_anatomy_registration:
   gaussian_sigma: 1.0          # Gaussian smoothing sigma applied during preprocessing.
   early_stop_score: 0.995      # Stop search once NCC exceeds this threshold (set null to disable).
   progress: true               # Emit per-plane progress logs during registration.
+
+# Confocal → anatomy registration.
+confocal_to_anatomy_registration:
+  enabled: true
+  reprocess: false
+  output_root_subdir: 02_reg
+  registration_subdir_template: "{confocal_session_id}_to_{anatomy_session_id}"
+  reference_channel_name: gcamp
+  warped_channel_template: "{animal_id}_{confocal_session_id}_{channel}_warped.tif"
+  metadata_filename_template: "{animal_id}_{confocal_session_id}_registration_metadata.json"
+  transforms_subdir: transforms
+  qc_subdir: qc
+  config_path: null
+  overrides: {}
 
 # Processing log output (optional).
 processing_log:
