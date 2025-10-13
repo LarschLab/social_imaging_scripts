@@ -1,15 +1,15 @@
-apply_log_settings: true
-log_level: INFO
+apply_log_settings: true  # Configure Python logging when running the pipeline.
+log_level: INFO  # Root logger level used if apply_log_settings is true.
 # Base directories for resolving raw inputs, processed outputs, and optional fast-disk scratch space.
 raw_base_dir: /mnt/f/johannes/pipelineIn          # Base path for raw animal data.
 ref_base_dir: /mnt/nas_jlarsch/03_Common_Use/reference brains/ref_05_LB_Perrino_2p/          # Base path containing reference volumes.
 output_base_dir: /mnt/f/johannes/pipelineOut          # Base path for processed artefacts.
 fast_disk_base_dir: null                              # Optional high-speed scratch location for Suite2p (null disables dedicated fast disk).
-reference_brain_filename: average_2p_noRot_orig.nrrd  # Path relative to ref_base_dir.
+reference_brain_filename: average_2p_noRot_orig.nrrd  # Path relative to ref_base_dir for the reference brain volume.
 
 # Functional preprocessing: plane splitting and metadata export.
 functional_preprocessing:
-  mode: reuse
+  mode: reuse  # Stage execution mode (skip/reuse/force) for functional preprocessing.
   root_subdir: 02_reg/00_preprocessing/2p_functional           # Relative output folder for functional preprocessing.
   planes_subdir: 01_individualPlanes                          # Subdirectory containing per-plane TIFF stacks.
   plane_filename_template: "{animal_id}_plane{plane_index}.tif"    # Naming pattern for individual plane TIFFs.
@@ -17,7 +17,7 @@ functional_preprocessing:
 
 # Motion correction (Suite2p) configuration.
 motion_correction:
-  mode: reuse
+  mode: reuse  # Stage execution mode for motion correction.
   planes_subdir: 01_individualPlanes                          # Location of plane TIFFs relative to functional root.
   motion_output_subdir: 02_motionCorrected                    # Destination for registered TIFFs.
   plane_folder_template: "plane{plane_index}"                 # Subdirectory naming for each plane.
@@ -30,58 +30,58 @@ motion_correction:
 
 # Anatomy preprocessing.
 anatomy_preprocessing:
-  mode: reuse
+  mode: reuse  # Stage execution mode for two-photon anatomy preprocessing.
   root_subdir: 02_reg/00_preprocessing/2p_anatomy              # Relative output folder for anatomy preprocessing.
   metadata_filename_template: "{animal_id}_anatomy_metadata.json"  # Anatomy metadata filename.
   stack_filename_template: "{animal_id}_anatomy_stack.tif"     # Preprocessed anatomy stack filename.
 
 # Confocal preprocessing.
 confocal_preprocessing:
-  mode: reuse
-  root_subdir: 02_reg/00_preprocessing
-  channel_filename_template: "channel_{channel}.tif"
-  metadata_filename_template: "{session_id}_confocal_metadata.json"
-  flip_horizontal: true
-  flip_z: true
+  mode: reuse  # Stage execution mode (skip/reuse/force) for confocal preprocessing.
+  root_subdir: 02_reg/00_preprocessing  # Output directory for per-session confocal artefacts.
+  channel_filename_template: "channel_{channel}.tif"  # Naming pattern for per-channel TIFF stacks.
+  metadata_filename_template: "{session_id}_confocal_metadata.json"  # Confocal preprocessing metadata filename.
+  flip_horizontal: true  # Flip stacks left-right to match two-photon orientation.
+  flip_z: true  # Reverse slice (Z) order to match two-photon orientation.
 
 # FireANTs registration (anatomy → reference brain).
 fireants_registration:
-  mode: reuse
-  output_subdir: 02_reg/02_fireants                           # Relative output folder for FireANTs artefacts.
-  warped_stack_template: "{animal_id}_anatomy_warped_fireants.tif"  # Warped anatomy stack filename.
+  mode: reuse  # Stage execution mode for anatomy→reference registration.
+  output_subdir: 02_reg/02_fireants  # Output directory for FireANTs artefacts.
+  warped_stack_template: "{animal_id}_anatomy_warped_fireants.tif"  # Warped anatomy stack filename pattern.
   fireants:
-    device: cuda
+    device: cuda  # Preferred device used by FireANTs (falls back to CPU if unavailable).
     winsorize:
-      enabled: true
-      lower_percentile: 1.0
-      upper_percentile: 99.0
-    moments_scale: 4
+      enabled: true  # Apply percentile clipping before registration.
+      lower_percentile: 1.0  # Lower percentile used for winsorisation.
+      upper_percentile: 99.0  # Upper percentile used for winsorisation.
+    moments_scale: 4  # Downsampling factor for the initial moments registration.
     affine:
-      scales: [12, 8, 4, 2, 1]
-      iterations: [200, 200, 200, 100, 50]
-      optimizer: Adam
-      optimizer_lr: 0.003
-      cc_kernel_size: 31
-      tolerance: 1e-6
-      max_tolerance_iters: 10
-      loss_type: fusedcc
-      extra_args: {}
+      scales: [12, 8, 4, 2, 1]  # Multiscale pyramid levels for affine registration.
+      iterations: [200, 200, 200, 100, 50]  # Iterations at each affine scale.
+      optimizer: Adam  # Optimiser used during affine registration.
+      optimizer_lr: 0.003  # Learning rate for the affine optimiser.
+      cc_kernel_size: 31  # Cross-correlation kernel size.
+      tolerance: 1e-6  # Convergence tolerance for affine stage.
+      max_tolerance_iters: 10  # Max iterations to check tolerance before stopping.
+      loss_type: fusedcc  # Loss function used during affine registration.
+      extra_args: {}  # Additional FireANTs affine parameters.
     greedy:
-      enabled: true
-      scales: [12, 8, 4, 2, 1]
-      iterations: [200, 200, 200, 100, 25]
-      optimizer: Adam
-      optimizer_lr: 0.5
-      cc_kernel_size: 31
-      loss_type: fusedcc
-      smooth_grad_sigma: 5.0
-      smooth_warp_sigma: 3.0
-      deformation_type: compositive
-      optimizer_params: {}
-      loss_params: {}
-      extra_args: {}
-    qc_middle_plane: null
-    qc_figsize: [10, 6]
+      enabled: true  # Enable greedy (non-linear) registration stage.
+      scales: [12, 8, 4, 2, 1]  # Multiscale pyramid levels for greedy registration.
+      iterations: [200, 200, 200, 100, 25]  # Iterations at each greedy scale.
+      optimizer: Adam  # Optimiser used during greedy registration.
+      optimizer_lr: 0.5  # Learning rate for the greedy optimiser.
+      cc_kernel_size: 31  # Cross-correlation kernel size for greedy stage.
+      loss_type: fusedcc  # Loss function used during greedy registration.
+      smooth_grad_sigma: 5.0  # Gradient smoothing sigma for greedy updates.
+      smooth_warp_sigma: 3.0  # Warp smoothing sigma for greedy updates.
+      deformation_type: compositive  # Greedy deformation model.
+      optimizer_params: {}  # Additional optimiser parameters.
+      loss_params: {}  # Additional loss parameters.
+      extra_args: {}  # Additional FireANTs greedy parameters.
+    qc_middle_plane: null  # Optional QC slice index (null uses middle).
+    qc_figsize: [10, 6]  # QC figure size in inches.
 
 # Functional → anatomy registration.
 functional_to_anatomy_registration:
@@ -112,10 +112,10 @@ confocal_to_anatomy_registration:
   transforms_subdir: transforms  # Subdirectory storing affine/warp transforms.
   qc_subdir: qc  # Subdirectory storing QC figures.
   crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
-  crop_padding_um: 0.0  # Extra padding (µm) kept around the cropped confocal volume.
-  mask_margin_xy: 0.08  # Fraction or voxels trimmed laterally when masking.
-  mask_margin_z: 0.05  # Fraction or voxels trimmed along Z when masking.
-  histogram_match: false  # Apply histogram matching before registration.
+  crop_padding_um: 5.0  # Extra padding (µm) kept around the cropped confocal volume.
+  mask_margin_xy: 0.02  # Fraction or voxels trimmed laterally when masking.
+  mask_margin_z: 0.02  # Fraction or voxels trimmed along Z when masking.
+  histogram_match: true  # Apply histogram matching before registration.
   histogram_levels: 64  # Histogram levels used during histogram matching.
   histogram_match_points: 12  # Number of match points for histogram matching.
   histogram_threshold_at_mean: true  # Threshold histogram matching at mean intensity.
@@ -123,29 +123,29 @@ confocal_to_anatomy_registration:
     device: cuda
     winsorize:
       enabled: true
-      lower_percentile: 1.0
-      upper_percentile: 99.0
+      lower_percentile: 2.5
+      upper_percentile: 97.5
     moments_scale: 4
     affine:
       scales: [12, 8, 4, 2, 1]
-      iterations: [200, 200, 200, 100, 50]
+      iterations: [200, 200, 200, 100, 100]
       optimizer: Adam
       optimizer_lr: 0.003
-      cc_kernel_size: 31
-      tolerance: 1e-6
+      cc_kernel_size: 41
+      tolerance: 1e-7
       max_tolerance_iters: 10
-      loss_type: fusedcc
+      loss_type: fusedmi
       extra_args: {}
     greedy:
       enabled: true
       scales: [12, 8, 4, 2, 1]
-      iterations: [200, 200, 200, 100, 25]
+      iterations: [200, 200, 200, 100, 50]
       optimizer: Adam
-      optimizer_lr: 0.5
-      cc_kernel_size: 31
-      loss_type: fusedcc
-      smooth_grad_sigma: 5.0
-      smooth_warp_sigma: 3.0
+      optimizer_lr: 0.3
+      cc_kernel_size: 21
+      loss_type: fusedmi
+      smooth_grad_sigma: 4.0
+      smooth_warp_sigma: 2.0
       deformation_type: compositive
       optimizer_params: {}
       loss_params: {}

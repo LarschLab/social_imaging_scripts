@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -19,6 +20,9 @@ from .fireants_pipeline import (
     _winsorize_image,
     _write_qc_figure,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _to_sitk_image(array: np.ndarray, spacing: Tuple[float, float, float]) -> sitk.Image:
@@ -140,7 +144,7 @@ def register_confocal_to_anatomy(
     if not moving_channel_path.exists():
         raise FileNotFoundError(moving_channel_path)
     if not fixed_stack_path.exists():
-        raise FileNotFoundError(fixed_stack_path)
+       raise FileNotFoundError(fixed_stack_path)
 
     moving_array = tifffile.imread(moving_channel_path).astype(np.float32, copy=False)
     fixed_array = tifffile.imread(fixed_stack_path).astype(np.float32, copy=False)
@@ -155,10 +159,22 @@ def register_confocal_to_anatomy(
             fixed_spacing_um,
             crop_padding_um,
         )
+        logger.info(
+            "Confocal cropping enabled; y:%s x:%s padding %.2f µm",
+            crop_info["y_vox"] if crop_info else None,
+            crop_info["x_vox"] if crop_info else None,
+            crop_padding_um,
+        )
         moving_array = moving_array[crop_slices]
 
     moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z)
     fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z)
+    if np.any(moving_mask != 1.0) or np.any(fixed_mask != 1.0):
+        logger.info(
+            "Applying central masks (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
+            mask_margin_xy,
+            mask_margin_z,
+        )
     moving_array *= moving_mask
     fixed_array *= fixed_mask
 
@@ -167,6 +183,12 @@ def register_confocal_to_anatomy(
     fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
 
     if histogram_match:
+        logger.info(
+            "Histogram matching enabled (levels=%d, match_points=%d, threshold_at_mean=%s)",
+            histogram_levels,
+            histogram_match_points,
+            histogram_threshold_at_mean,
+        )
         matcher = sitk.HistogramMatchingImageFilter()
         matcher.SetNumberOfHistogramLevels(int(histogram_levels))
         matcher.SetNumberOfMatchPoints(int(histogram_match_points))
