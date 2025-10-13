@@ -15,8 +15,8 @@ import tifffile
 
 from ..metadata.config import (
     ProjectConfig,
+    StageMode,
     load_project_config,
-    load_yaml_mapping,
     resolve_output_path,
     resolve_raw_path,
     resolve_reference_brain,
@@ -30,7 +30,13 @@ from ..preprocessing.two_photon import motion as motion_correction
 from ..registration import align_substack
 from ..registration.confocal_to_anatomy import register_confocal_to_anatomy
 from ..registration.functional_to_anatomy_ants import register_planes_pass1
-from ..registration.fireants_pipeline import FireANTsRegistrationConfig, register_two_photon_anatomy
+from ..registration.fireants_pipeline import (
+    AffineSettings,
+    FireANTsRegistrationConfig,
+    GreedySettings,
+    WinsorizeSettings,
+    register_two_photon_anatomy,
+)
 from .processing_log import (
     AnimalProcessingLog,
     ArtefactRef,
@@ -143,25 +149,20 @@ def _resolve_session_raw_path(
     return resolve_raw_path(base, cfg=cfg)
 
 
-def _apply_overrides(target, overrides: Mapping[str, object]) -> None:
-    for key, value in overrides.items():
-        if not hasattr(target, key):
-            raise AttributeError(f"Unknown configuration field '{key}'")
-        current = getattr(target, key)
-        if is_dataclass(current) and isinstance(value, Mapping):
-            _apply_overrides(current, value)
-        else:
-            setattr(target, key, value)
-
-
-def _prepare_fireants_config(
-    base_config: Optional[FireANTsRegistrationConfig],
-    overrides: Optional[Mapping[str, object]],
-) -> FireANTsRegistrationConfig:
-    config = copy.deepcopy(base_config) if base_config is not None else FireANTsRegistrationConfig()
-    if overrides:
-        _apply_overrides(config, overrides)
-    return config
+def _build_fireants_config(payload: Mapping[str, Any] | FireANTsRegistrationConfig) -> FireANTsRegistrationConfig:
+    if isinstance(payload, FireANTsRegistrationConfig):
+        return copy.deepcopy(payload)
+    data = dict(payload)
+    winsorize = data.get("winsorize")
+    if winsorize is not None and not isinstance(winsorize, WinsorizeSettings):
+        data["winsorize"] = WinsorizeSettings(**winsorize)
+    affine = data.get("affine")
+    if affine is not None and not isinstance(affine, AffineSettings):
+        data["affine"] = AffineSettings(**affine)
+    greedy = data.get("greedy")
+    if greedy is not None and not isinstance(greedy, GreedySettings):
+        data["greedy"] = GreedySettings(**greedy)
+    return FireANTsRegistrationConfig(**data)
 
 
 def _extract_plane_index(path: Path) -> int:
@@ -262,10 +263,8 @@ def process_functional_session(
         | Callable[[AnimalMetadata, FunctionalSession], Optional[float]]
     ] = None,
     fast_disk: Optional[Path] = None,
-    reprocess: bool = False,
-    reprocess_motion: bool = False,
-    enable_preprocessing: bool = True,
-    enable_motion: bool = True,
+    preprocess_mode: StageMode = StageMode.REUSE,
+    motion_mode: StageMode = StageMode.REUSE,
 ) -> SessionResult:
     functional_cfg = cfg.functional_preprocessing
     motion_cfg = cfg.motion_correction
@@ -275,16 +274,19 @@ def process_functional_session(
         animal_id=animal.animal_id,
         session_id=session.session_id,
         session_type=session.session_type,
-        status="failed",
+        status="skipped",
     )
 
-    if not enable_preprocessing and not enable_motion:
-        result.status = "skipped"
-        result.message = "functional pipeline disabled"
+    run_preprocess = preprocess_mode != StageMode.SKIP
+    run_motion = motion_mode != StageMode.SKIP
+
+    if not run_preprocess and not run_motion:
+        result.message = "functional preprocessing and motion skipped"
         return result
 
     settings = session.session_data.preprocessing_two_photon
-    if enable_preprocessing and settings is None:
+    if run_preprocess and settings is None:
+        result.status = "failed"
         result.message = "missing two-photon preprocessing settings"
         return result
 
@@ -300,22 +302,24 @@ def process_functional_session(
 
     metadata_name = functional_cfg.metadata_filename_template.format(**context)
     metadata_path = plane_dir / metadata_name
-    preproc_generated = False
+    preproc_ran = False
     notes: list[str] = []
 
-    if enable_preprocessing:
+    if run_preprocess:
         try:
             raw_dir = _resolve_session_raw_path(
                 animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
             )
         except Exception as exc:
+            result.status = "failed"
             result.message = f"failed to resolve raw path: {exc}"
             return result
 
-        preprocessing_needed = reprocess or not metadata_path.exists()
+        preprocessing_needed = (
+            preprocess_mode == StageMode.FORCE or not metadata_path.exists()
+        )
         try:
             if preprocessing_needed:
-                # Plane splitting mirrors the single-animal notebook but now feeds the batch driver.
                 preproc_outputs = functional_preproc.run(
                     animal_id=animal.animal_id,
                     session_id=session.session_id,
@@ -329,11 +333,12 @@ def process_functional_session(
                 result.outputs.update(
                     {f"preprocess_{key}": Path(value) for key, value in preproc_outputs.items()}
                 )
-                preproc_generated = True
-            else:
+                preproc_ran = True
+            if metadata_path.exists():
                 result.outputs["preprocess_metadata"] = metadata_path
         except Exception as exc:  # pragma: no cover - pipeline side effects
             logger.exception("Functional preprocessing failed", exc_info=exc)
+            result.status = "failed"
             result.message = f"functional preprocessing failed: {exc}"
             return result
     else:
@@ -345,15 +350,17 @@ def process_functional_session(
         session_id=session.session_id,
         plane_index="*",
     )
-    plane_paths = (
-        sorted(plane_dir.glob(plane_pattern))
-        if enable_motion or preproc_generated
-        else []
-    )
+    plane_paths = sorted(plane_dir.glob(plane_pattern))
 
-    motion_generated = False
-    if enable_motion:
+    if run_motion and not plane_paths and not preproc_ran:
+        result.status = "failed"
+        result.message = f"no plane TIFFs found in {plane_dir}"
+        return result
+
+    motion_ran = False
+    if run_motion:
         if not plane_paths:
+            result.status = "failed"
             result.message = f"no plane TIFFs found in {plane_dir}"
             return result
 
@@ -362,11 +369,11 @@ def process_functional_session(
 
         motion_subdir = motion_cfg.motion_output_subdir
         suite2p_subdir = motion_cfg.suite2p_output_subdir
+        reprocess_motion = motion_mode == StageMode.FORCE
 
         for plane_path in plane_paths:
             plane_idx = _extract_plane_index(plane_path)
             try:
-                # Run Suite2p plane-by-plane so outputs match the legacy project layout.
                 motion_outputs = motion_correction.run_motion_correction(
                     animal=animal,
                     plane_idx=plane_idx,
@@ -387,47 +394,47 @@ def process_functional_session(
                 for key, value in motion_outputs.items():
                     result.outputs[f"plane{plane_idx}_{key}"] = Path(value)
                 if {"motion_tiff", "segmentation_folder"}.intersection(motion_outputs.keys()):
-                    motion_generated = True
+                    motion_ran = True
             except Exception as exc:  # pragma: no cover - external tool failure
                 logger.exception("Motion correction failed", exc_info=exc)
+                result.status = "failed"
                 result.message = f"motion correction failed for plane {plane_idx}: {exc}"
                 motion_outputs_collected = False
                 break
 
         if not motion_outputs_collected:
             return result
-    else:
-        notes.append("motion correction disabled")
 
-    if enable_preprocessing:
+    if run_preprocess:
         notes.append(
-            "plane splitting ran" if preproc_generated else "plane splitting reused existing outputs"
+            "plane splitting ran" if preproc_ran else "plane splitting reused existing outputs"
         )
     else:
-        notes.append("plane splitting disabled")
+        notes.append("plane splitting skipped")
 
-    if enable_motion:
+    if run_motion:
         notes.append(
-            "motion correction ran" if motion_generated else "motion correction reused existing outputs"
+            "motion correction ran" if motion_ran else "motion correction reused existing outputs"
         )
+    else:
+        notes.append("motion correction skipped")
 
-    result.status = "success" if preproc_generated or motion_generated else "skipped"
+    if (run_preprocess and preproc_ran) or (run_motion and motion_ran):
+        result.status = "success"
+    elif run_preprocess or run_motion:
+        result.status = "skipped"
     if notes:
         result.message = "; ".join(notes)
     return result
-
 
 def process_anatomy_session(
     *,
     animal: AnimalMetadata,
     session: AnatomySession,
     cfg: ProjectConfig,
-    fireants_config: Optional[FireANTsRegistrationConfig] = None,
-    fireants_overrides: Optional[dict] = None,
-    reprocess_preprocessing: bool = False,
-    reprocess_registration: bool = False,
-    enable_preprocessing: bool = True,
-    enable_registration: bool = True,
+    fireants_config: FireANTsRegistrationConfig,
+    preprocess_mode: StageMode = StageMode.REUSE,
+    registration_mode: StageMode = StageMode.REUSE,
 ) -> SessionResult:
     anatomy_cfg = cfg.anatomy_preprocessing
     fireants_stage_cfg = cfg.fireants_registration
@@ -437,12 +444,14 @@ def process_anatomy_session(
         animal_id=animal.animal_id,
         session_id=session.session_id,
         session_type=session.session_type,
-        status="failed",
+        status="skipped",
     )
 
-    if not enable_preprocessing and not enable_registration:
-        result.status = "skipped"
-        result.message = "anatomy pipeline disabled"
+    run_preprocess = preprocess_mode != StageMode.SKIP
+    run_registration = registration_mode != StageMode.SKIP
+
+    if not run_preprocess and not run_registration:
+        result.message = "anatomy preprocessing and registration skipped"
         return result
 
     preprocess_root = resolve_output_path(
@@ -452,32 +461,35 @@ def process_anatomy_session(
     )
     preprocess_root.mkdir(parents=True, exist_ok=True)
 
-    metadata_name = anatomy_cfg.metadata_filename_template.format(**context)
-    preprocess_metadata = preprocess_root / metadata_name
-    preproc_generated = False
-    stack_path: Optional[Path] = None
+    metadata_path = preprocess_root / anatomy_cfg.metadata_filename_template.format(**context)
+    stack_path = preprocess_root / anatomy_cfg.stack_filename_template.format(**context)
+    preproc_ran = False
+    notes: list[str] = []
 
-    if enable_preprocessing:
+    if run_preprocess:
         try:
             raw_path = _resolve_session_raw_path(
                 animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
             )
         except Exception as exc:
+            result.status = "failed"
             result.message = f"failed to resolve raw anatomy path: {exc}"
             return result
 
-        preprocessing_needed = reprocess_preprocessing or not preprocess_metadata.exists()
+        preprocessing_needed = (
+            preprocess_mode == StageMode.FORCE
+            or not metadata_path.exists()
+            or not stack_path.exists()
+        )
 
         try:
             if preprocessing_needed:
                 preproc_outputs = anatomy_preproc.run(
                     animal_id=animal.animal_id,
                     session_id=session.session_id,
-                    raw_dir=
-                    (
+                    raw_dir=(
                         raw_path.parent
-                        if raw_path.is_file()
-                        or raw_path.suffix.lower() in {".tif", ".tiff"}
+                        if raw_path.is_file() or raw_path.suffix.lower() in {".tif", ".tiff"}
                         else raw_path
                     ),
                     output_root=preprocess_root,
@@ -485,29 +497,24 @@ def process_anatomy_session(
                     stack_filename=anatomy_cfg.stack_filename_template,
                     metadata_filename=anatomy_cfg.metadata_filename_template,
                 )
-                default_stack = preprocess_root / anatomy_cfg.stack_filename_template.format(**context)
-                stack_path = Path(preproc_outputs.get("stack", default_stack))
                 result.outputs.update(
                     {f"anatomy_preprocess_{key}": Path(value) for key, value in preproc_outputs.items()}
                 )
-                preproc_generated = True
-            else:
-                stack_name = anatomy_cfg.stack_filename_template.format(**context)
-                stack_path = preprocess_root / stack_name
-                if preprocess_metadata.exists():
-                    result.outputs["anatomy_preprocess_metadata"] = preprocess_metadata
+                stack_path = Path(preproc_outputs.get("stack", stack_path))
+                preproc_ran = True
+            if metadata_path.exists():
+                result.outputs["anatomy_preprocess_metadata"] = metadata_path
         except Exception as exc:  # pragma: no cover - external IO
             logger.exception("Anatomy preprocessing failed", exc_info=exc)
+            result.status = "failed"
             result.message = f"anatomy preprocessing failed: {exc}"
             return result
     else:
-        stack_candidate = preprocess_root / anatomy_cfg.stack_filename_template.format(**context)
-        if stack_candidate.exists():
-            stack_path = stack_candidate
-            if preprocess_metadata.exists():
-                result.outputs["anatomy_preprocess_metadata"] = preprocess_metadata
+        if metadata_path.exists():
+            result.outputs["anatomy_preprocess_metadata"] = metadata_path
 
-    if stack_path is None or not stack_path.exists():
+    if not stack_path.exists():
+        result.status = "failed"
         result.message = f"anatomy stack not found at {stack_path}"
         return result
 
@@ -520,79 +527,70 @@ def process_anatomy_session(
 
     warped_name = fireants_stage_cfg.warped_stack_template.format(**context)
     warped_stack = registration_root / warped_name
-    registration_generated = False
+    registration_ran = False
 
-    if enable_registration:
-        registration_needed = reprocess_registration or not warped_stack.exists()
-
+    if run_registration:
+        registration_needed = (
+            registration_mode == StageMode.FORCE or not warped_stack.exists()
+        )
         if registration_needed:
-            config = _prepare_fireants_config(fireants_config, fireants_overrides)
-            reference_path = resolve_reference_brain(cfg=cfg)
-            print(
-                f"[{animal.animal_id}::{session.session_id}] FireANTs reference brain: {reference_path}"
-            )
-            print(
-                f"[{animal.animal_id}::{session.session_id}] FireANTs reference exists: {reference_path.exists()}"
-            )
-
             try:
-                # Delegate to the validated FireANTs pipeline; collect artefact paths for reporting.
                 outputs = register_two_photon_anatomy(
                     animal_id=animal.animal_id,
                     session_id=session.session_id,
                     stack_path=stack_path,
-                    reference_path=reference_path,
+                    reference_path=resolve_reference_brain(cfg=cfg),
                     output_root=registration_root,
                     animal_metadata=animal,
                     session_metadata=session,
-                    config=config,
+                    config=fireants_config,
                 )
-
                 warped_from_runner = Path(outputs.get("warped_stack", warped_stack))
                 if warped_from_runner != warped_stack and warped_from_runner.exists():
                     if warped_stack.exists():
                         warped_stack.unlink()
                     warped_from_runner.rename(warped_stack)
                     outputs["warped_stack"] = warped_stack
-
                 result.outputs.update(
                     {f"fireants_{key}": Path(value) if isinstance(value, Path) else value for key, value in outputs.items()}
                 )
-                registration_generated = True
+                registration_ran = True
             except Exception as exc:  # pragma: no cover - GPU pipeline failure
                 logger.exception("FireANTs registration failed", exc_info=exc)
+                result.status = "failed"
                 result.message = f"fireants registration failed: {exc}"
                 return result
         else:
-            result.outputs["fireants_warped"] = warped_stack
+            if warped_stack.exists():
+                result.outputs["fireants_warped"] = warped_stack
+            else:
+                result.status = "failed"
+                result.message = f"warped anatomy stack not found at {warped_stack}"
+                return result
     else:
-        if warped_stack.exists():
-            result.outputs["fireants_warped"] = warped_stack
+        notes.append("fireants registration skipped")
 
-    notes: list[str] = []
-    if enable_preprocessing:
+    if run_preprocess:
         notes.append(
-            "anatomy preprocessing ran"
-            if preproc_generated
-            else "anatomy preprocessing reused existing outputs"
+            "anatomy preprocessing ran" if preproc_ran else "anatomy preprocessing reused existing outputs"
         )
     else:
-        notes.append("anatomy preprocessing disabled")
+        notes.append("anatomy preprocessing skipped")
 
-    if enable_registration:
+    if run_registration:
         notes.append(
-            "fireants registration ran"
-            if registration_generated
-            else "fireants registration reused existing outputs"
+            "fireants registration ran" if registration_ran else "fireants registration reused existing outputs"
         )
     else:
-        notes.append("fireants registration disabled")
+        notes.append("fireants registration skipped")
 
-    result.status = "success" if preproc_generated or registration_generated else "skipped"
+    if (run_preprocess and preproc_ran) or (run_registration and registration_ran):
+        result.status = "success"
+    elif run_preprocess or run_registration:
+        result.status = "skipped"
     if notes:
         result.message = "; ".join(notes)
     return result
-
 
 def process_confocal_session(
     *,
@@ -608,8 +606,10 @@ def process_confocal_session(
         status="skipped",
     )
 
-    if not stage_cfg.enabled:
-        result.message = "confocal preprocessing disabled"
+    mode = stage_cfg.mode
+
+    if mode == StageMode.SKIP:
+        result.message = "confocal preprocessing skipped"
         return result, None
 
     output_root = resolve_output_path(
@@ -633,7 +633,7 @@ def process_confocal_session(
             channel_template=stage_cfg.channel_filename_template,
             metadata_filename=stage_cfg.metadata_filename_template,
             flip_horizontal=stage_cfg.flip_horizontal,
-            reprocess=stage_cfg.reprocess,
+            reprocess=mode == StageMode.FORCE,
             raw_path_override=raw_path,
         )
     except Exception as exc:  # pragma: no cover - IO heavy
@@ -662,7 +662,7 @@ def process_confocal_to_anatomy_registration(
     preprocess_outputs: confocal_preproc.ConfocalPreprocessOutputs,
     cfg: ProjectConfig,
     stage_cfg,
-    fireants_config: Optional[FireANTsRegistrationConfig],
+    fireants_config: FireANTsRegistrationConfig,
 ) -> SessionResult:
     result = SessionResult(
         animal_id=animal.animal_id,
@@ -671,8 +671,9 @@ def process_confocal_to_anatomy_registration(
         status="skipped",
     )
 
-    if not stage_cfg.enabled:
-        result.message = "confocal-to-anatomy registration disabled"
+    mode = stage_cfg.mode
+    if mode == StageMode.SKIP:
+        result.message = "confocal-to-anatomy registration skipped"
         return result
 
     channel_paths = preprocess_outputs.channel_paths
@@ -711,64 +712,80 @@ def process_confocal_to_anatomy_registration(
     )
     registration_root.mkdir(parents=True, exist_ok=True)
 
-    result.outputs["reference_channel_source"] = Path(moving_path)
-    result.outputs["registration_dir"] = registration_root
+    metadata_file = registration_root / stage_cfg.metadata_filename_template.format(
+        animal_id=animal.animal_id,
+        confocal_session_id=confocal_session.session_id,
+        anatomy_session_id=anatomy_session.session_id,
+    )
 
     anatomy_root = resolve_output_path(
         animal.animal_id,
         cfg.anatomy_preprocessing.root_subdir,
         cfg=cfg,
     )
-    stack_name = cfg.anatomy_preprocessing.stack_filename_template.format(
+    anatomy_metadata_path = anatomy_root / cfg.anatomy_preprocessing.metadata_filename_template.format(
         animal_id=animal.animal_id,
         session_id=anatomy_session.session_id,
     )
-    anatomy_stack_path = anatomy_root / stack_name
-    if not anatomy_stack_path.exists():
-        result.status = "failed"
-        result.message = f"anatomy stack missing at {anatomy_stack_path}"
-        return result
-
     fixed_pixel_size = (1.0, 1.0)
     try:
-        anatomy_metadata_name = cfg.anatomy_preprocessing.metadata_filename_template.format(
-            animal_id=animal.animal_id,
-            session_id=anatomy_session.session_id,
-        )
-        anatomy_metadata_path = anatomy_root / anatomy_metadata_name
         fixed_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
     except Exception:
         pass
-
     z_spacing = getattr(anatomy_session.session_data, "plane_spacing", None)
     if z_spacing is None:
         z_spacing = getattr(anatomy_session.session_data, "z_step_um", None)
     if z_spacing is None:
         z_spacing = 1.0
-    fixed_spacing_um = (
+    fixed_spacing_um = [
         float(fixed_pixel_size[0]),
         float(fixed_pixel_size[1]),
         float(z_spacing),
-    )
+    ]
 
-    metadata_outputs = register_confocal_to_anatomy(
-        animal_id=animal.animal_id,
-        confocal_session_id=confocal_session.session_id,
-        anatomy_session_id=anatomy_session.session_id,
-        moving_channel_path=moving_path,
-        fixed_stack_path=anatomy_stack_path,
-        additional_channels=additional_channels,
-        output_root=registration_root,
-        config=copy.deepcopy(fireants_config) if fireants_config is not None else FireANTsRegistrationConfig(),
-        overrides=stage_cfg.overrides or None,
-        voxel_spacing_um=preprocess_outputs.voxel_size_um,
-        fixed_spacing_um=fixed_spacing_um,
-        warped_channel_template=stage_cfg.warped_channel_template,
-        metadata_filename=stage_cfg.metadata_filename_template,
-        transforms_subdir=stage_cfg.transforms_subdir,
-        qc_subdir=stage_cfg.qc_subdir,
-        reference_channel_name=moving_name,
-    )
+    warped_channels: Dict[str, Path] = {}
+    metadata_outputs: Dict[str, Any]
+    if mode == StageMode.FORCE or not metadata_file.exists():
+        metadata_outputs = register_confocal_to_anatomy(
+            animal_id=animal.animal_id,
+            confocal_session_id=confocal_session.session_id,
+            anatomy_session_id=anatomy_session.session_id,
+            moving_channel_path=moving_path,
+            fixed_stack_path=anatomy_root
+            / cfg.anatomy_preprocessing.stack_filename_template.format(
+                animal_id=animal.animal_id,
+                session_id=anatomy_session.session_id,
+            ),
+            additional_channels=additional_channels,
+            output_root=registration_root,
+            config=fireants_config,
+            voxel_spacing_um=preprocess_outputs.voxel_size_um,
+            fixed_spacing_um=fixed_spacing_um,
+            warped_channel_template=stage_cfg.warped_channel_template,
+            metadata_filename=stage_cfg.metadata_filename_template,
+            transforms_subdir=stage_cfg.transforms_subdir,
+            qc_subdir=stage_cfg.qc_subdir,
+            reference_channel_name=moving_name,
+        )
+        warped_channels = metadata_outputs.get("warped_channels", {})
+    else:
+        reg_meta = json.loads(metadata_file.read_text())
+        outputs_meta = reg_meta.get("outputs", {})
+        warped_channels = {
+            name: Path(path) for name, path in outputs_meta.get("warped_channels", {}).items()
+        }
+        metadata_outputs = {
+            "warped_channels": warped_channels,
+            "gcamp_warp": Path(outputs_meta.get(moving_name)) if outputs_meta.get(moving_name) else None,
+            "affine_transform": Path(outputs_meta.get("affine_transform")) if outputs_meta.get("affine_transform") else None,
+            "greedy_transform": Path(outputs_meta.get("greedy_transform")) if outputs_meta.get("greedy_transform") else None,
+            "greedy_inverse_transform": Path(outputs_meta.get("greedy_inverse_transform")) if outputs_meta.get("greedy_inverse_transform") else None,
+            "metadata": metadata_file,
+            "qc": Path(outputs_meta.get("qc")) if outputs_meta.get("qc") else None,
+            "inverse_qc": reg_meta.get("inverse_qc"),
+        }
+    result.outputs["reference_channel_source"] = Path(moving_path)
+    result.outputs["registration_dir"] = registration_root
 
     for key, value in metadata_outputs.items():
         if isinstance(value, Path):
@@ -781,11 +798,12 @@ def process_confocal_to_anatomy_registration(
             for idx, entry in enumerate(value):
                 if isinstance(entry, Path):
                     result.outputs[f"{key}_{idx}"] = entry
+
     result.status = "success"
-    result.message = (
-        f"warped {len(metadata_outputs['warped_channels'])} confocal channels (ref={moving_name})"
-    )
+    result.message = f"warped {len(warped_channels)} confocal channels (ref={moving_name})"
     return result
+
+
 
 
 def process_functional_to_anatomy_registration(
@@ -794,6 +812,7 @@ def process_functional_to_anatomy_registration(
     functional_session: FunctionalSession,
     anatomy_session: AnatomySession,
     cfg: ProjectConfig,
+    mode: StageMode = StageMode.REUSE,
 ) -> SessionResult:
     """Register functional projections to the anatomy stack for one animal."""
 
@@ -804,12 +823,11 @@ def process_functional_to_anatomy_registration(
         animal_id=animal.animal_id,
         session_id=functional_session.session_id,
         session_type="functional_to_anatomy_registration",
-        status="failed",
+        status="skipped",
     )
 
-    if not stage_cfg.enabled:
-        result.status = "skipped"
-        result.message = "functional-to-anatomy registration disabled"
+    if mode == StageMode.SKIP:
+        result.message = "functional-to-anatomy registration skipped"
         return result
 
     context = {
@@ -832,6 +850,7 @@ def process_functional_to_anatomy_registration(
     )
     motion_root = functional_root / cfg.motion_correction.motion_output_subdir
     if not motion_root.exists():
+        result.status = "failed"
         result.message = f"motion outputs not found: {motion_root}"
         return result
 
@@ -839,6 +858,7 @@ def process_functional_to_anatomy_registration(
         motion_root, recursive=True
     )
     if not motion_tiffs:
+        result.status = "failed"
         result.message = f"no motion-corrected TIFFs discovered under {motion_root}"
         return result
 
@@ -862,6 +882,7 @@ def process_functional_to_anatomy_registration(
             )
         except Exception as exc:  # pragma: no cover - external IO
             logger.exception("Failed to build functional projections", exc_info=exc)
+            result.status = "failed"
             result.message = f"failed to compute functional projections: {exc}"
             return result
     else:
@@ -873,6 +894,7 @@ def process_functional_to_anatomy_registration(
         )
 
     if not max_projection_path.exists() or not avg_projection_path.exists():
+        result.status = "failed"
         result.message = (
             "functional projections missing after generation attempt: "
             f"max={max_projection_path}, avg={avg_projection_path}"
@@ -890,12 +912,6 @@ def process_functional_to_anatomy_registration(
     registration_root.mkdir(parents=True, exist_ok=True)
     per_animal_csv = registration_root / _format(stage_cfg.registration_csv_template)
 
-    if per_animal_csv.exists() and not stage_cfg.reprocess:
-        result.outputs["registration_csv"] = per_animal_csv
-        result.status = "success"
-        result.message = "functional-to-anatomy registration reused existing outputs"
-        return result
-
     anatomy_root = resolve_output_path(
         animal.animal_id,
         cfg.anatomy_preprocessing.root_subdir,
@@ -904,13 +920,22 @@ def process_functional_to_anatomy_registration(
     stack_template = cfg.anatomy_preprocessing.stack_filename_template
     stack_path = anatomy_root / _format(stack_template)
     if not stack_path.exists():
+        result.status = "failed"
         result.message = f"anatomy stack not found at {stack_path}"
+        return result
+
+    if per_animal_csv.exists() and mode != StageMode.FORCE:
+        result.outputs["registration_csv"] = per_animal_csv
+        result.outputs["anatomy_stack"] = stack_path
+        result.status = "success"
+        result.message = "functional-to-anatomy registration reused existing outputs"
         return result
 
     try:
         fixed_stack = align_substack.read_stack_float32(stack_path)
     except Exception as exc:  # pragma: no cover - IO heavy
         logger.exception("Failed to load anatomy stack", exc_info=exc)
+        result.status = "failed"
         result.message = f"failed to load anatomy stack: {exc}"
         return result
 
@@ -931,6 +956,7 @@ def process_functional_to_anatomy_registration(
         moving_stack = tifffile.imread(str(avg_projection_path))
     except Exception as exc:  # pragma: no cover - IO heavy
         logger.exception("Failed to load functional projections", exc_info=exc)
+        result.status = "failed"
         result.message = f"failed to load functional projections: {exc}"
         return result
     if expected_plane_count is not None and moving_stack.shape[0] != expected_plane_count:
@@ -949,15 +975,18 @@ def process_functional_to_anatomy_registration(
             )
         except Exception as exc:
             logger.exception("Failed to rebuild functional projections", exc_info=exc)
+            result.status = "failed"
             result.message = f"failed to rebuild functional projections: {exc}"
             return result
         try:
             moving_stack = tifffile.imread(str(avg_projection_path))
         except Exception as exc:
             logger.exception("Failed to reload regenerated projections", exc_info=exc)
+            result.status = "failed"
             result.message = f"failed to reload regenerated projections: {exc}"
             return result
         if moving_stack.shape[0] != expected_plane_count:
+            result.status = "failed"
             result.message = (
                 f"projection plane mismatch persists after regeneration: "
                 f"found {moving_stack.shape[0]}, expected {expected_plane_count}"
@@ -975,6 +1004,7 @@ def process_functional_to_anatomy_registration(
         anatomy_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
     except Exception as exc:
         logger.exception("Failed to read pixel size metadata", exc_info=exc)
+        result.status = "failed"
         result.message = f"missing pixel size metadata: {exc}"
         return result
 
@@ -999,7 +1029,9 @@ def process_functional_to_anatomy_registration(
 
     plane_indices = list(range(moving_stack.shape[0]))
     functional_planes = [moving_stack[idx] for idx in plane_indices]
-    progress_cb = (lambda m: logger.info("[%s] %s", animal.animal_id, m)) if stage_cfg.progress else None
+    progress_cb = None
+    if logger.isEnabledFor(logging.INFO):
+        progress_cb = lambda m: logger.info("[%s] %s", animal.animal_id, m)
 
     try:
         results = register_planes_pass1(
@@ -1017,6 +1049,7 @@ def process_functional_to_anatomy_registration(
         )
     except Exception as exc:  # pragma: no cover - algorithmic failure
         logger.exception("Functional-to-anatomy registration failed", exc_info=exc)
+        result.status = "failed"
         result.message = f"functional-to-anatomy registration failed: {exc}"
         return result
 
@@ -1045,7 +1078,6 @@ def process_functional_to_anatomy_registration(
         )
 
     df_results = pd.DataFrame(rows)
-
     df_results.to_csv(per_animal_csv, index=False)
     result.outputs["registration_csv"] = per_animal_csv
     result.outputs["anatomy_stack"] = stack_path
@@ -1056,7 +1088,6 @@ def process_functional_to_anatomy_registration(
     result.status = "success"
     result.message = f"registered {n_planes} planes; median NCC={median_ncc:.3f}"
     return result
-
 
 def run_pipeline(
     animal_ids: Optional[Iterable[str]] = None,
@@ -1115,20 +1146,8 @@ def run_pipeline(
 
     fps_value = motion_cfg.default_fps
 
-    fireants_config: Optional[FireANTsRegistrationConfig] = None
-    if fireants_stage_cfg.config_path:
-        file_overrides = load_yaml_mapping(fireants_stage_cfg.config_path)
-        fireants_config = FireANTsRegistrationConfig.with_overrides(file_overrides)
-
-    if fireants_config is None:
-        fireants_config = FireANTsRegistrationConfig()
-
-    confocal_fireants_config: Optional[FireANTsRegistrationConfig] = None
-    if confocal_stage_cfg.config_path:
-        confocal_overrides = load_yaml_mapping(confocal_stage_cfg.config_path)
-        confocal_fireants_config = FireANTsRegistrationConfig.with_overrides(confocal_overrides)
-    else:
-        confocal_fireants_config = FireANTsRegistrationConfig()
+    fireants_config_data = fireants_stage_cfg.fireants
+    confocal_fireants_config_data = confocal_stage_cfg.fireants
 
     results: list[AnimalResult] = []
 
@@ -1185,10 +1204,8 @@ def run_pipeline(
                     ops_template=ops_template,
                     fps_config=fps_value,
                     fast_disk=fast_disk,
-                    reprocess=functional_cfg.reprocess,
-                    reprocess_motion=motion_cfg.reprocess,
-                    enable_preprocessing=functional_cfg.enabled,
-                    enable_motion=motion_cfg.enabled,
+                    preprocess_mode=functional_cfg.mode,
+                    motion_mode=motion_cfg.mode,
                 )
                 functional_session_ref = session  # type: ignore[assignment]
                 functional_session_result = session_result
@@ -1210,10 +1227,8 @@ def run_pipeline(
                         )
 
                     parameters = {
-                        "functional_enabled": functional_cfg.enabled,
-                        "functional_reprocess": functional_cfg.reprocess,
-                        "motion_enabled": motion_cfg.enabled,
-                        "motion_reprocess": motion_cfg.reprocess,
+                        "functional_mode": functional_cfg.mode.value,
+                        "motion_mode": motion_cfg.mode.value,
                         "fast_disk": fast_disk,
                         "fps_hz": fps_value,
                     }
@@ -1240,12 +1255,9 @@ def run_pipeline(
                     animal=animal,
                     session=session,  # type: ignore[arg-type]
                     cfg=cfg,
-                    fireants_config=fireants_config,
-                    fireants_overrides=fireants_stage_cfg.overrides or None,
-                    reprocess_preprocessing=anatomy_cfg.reprocess,
-                    reprocess_registration=fireants_stage_cfg.reprocess,
-                    enable_preprocessing=anatomy_cfg.enabled,
-                    enable_registration=fireants_stage_cfg.enabled,
+                    fireants_config=_build_fireants_config(fireants_config_data),
+                    preprocess_mode=anatomy_cfg.mode,
+                    registration_mode=fireants_stage_cfg.mode,
                 )
                 anatomy_session_ref = session  # type: ignore[assignment]
                 anatomy_session_result = session_result
@@ -1267,10 +1279,8 @@ def run_pipeline(
                         )
 
                     parameters = {
-                        "anatomy_enabled": anatomy_cfg.enabled,
-                        "anatomy_reprocess": anatomy_cfg.reprocess,
-                        "fireants_enabled": fireants_stage_cfg.enabled,
-                        "fireants_reprocess": fireants_stage_cfg.reprocess,
+                        "anatomy_mode": anatomy_cfg.mode.value,
+                        "fireants_mode": fireants_stage_cfg.mode.value,
                     }
                     if pixel_size_xy is not None:
                         parameters["session_pixel_size_xy_um"] = [float(pixel_size_xy[0]), float(pixel_size_xy[1])]
@@ -1308,8 +1318,7 @@ def run_pipeline(
                     confocal_sessions.append((session, confocal_outputs))
                 if animal_log is not None and log_path is not None:
                     parameters = {
-                        "confocal_preprocess_enabled": confocal_preproc_cfg.enabled,
-                        "confocal_preprocess_reprocess": confocal_preproc_cfg.reprocess,
+                        "confocal_preprocess_mode": confocal_preproc_cfg.mode.value,
                         "flip_horizontal": confocal_preproc_cfg.flip_horizontal,
                     }
                     if confocal_outputs is not None:
@@ -1362,6 +1371,14 @@ def run_pipeline(
                     status="skipped",
                     message="anatomy preprocessing failed; cannot register functional to anatomy",
                 )
+            elif ftoa_stage_cfg.mode == StageMode.SKIP:
+                stage_result = SessionResult(
+                    animal_id=animal.animal_id,
+                    session_id=functional_session_ref.session_id,
+                    session_type="functional_to_anatomy_registration",
+                    status="skipped",
+                    message="functional-to-anatomy registration skipped",
+                )
             else:
                 logger.info(
                     "---------- Functional-to-anatomy registration (%s) ----------",
@@ -1372,6 +1389,7 @@ def run_pipeline(
                     functional_session=functional_session_ref,  # type: ignore[arg-type]
                     anatomy_session=anatomy_session_ref,  # type: ignore[arg-type]
                     cfg=cfg,
+                    mode=ftoa_stage_cfg.mode,
                 )
             animal_result.sessions.append(stage_result)
             logger.info(
@@ -1427,15 +1445,13 @@ def run_pipeline(
                         raise
 
                 parameters = {
-                    "functional_to_anatomy_enabled": ftoa_stage_cfg.enabled,
-                    "functional_to_anatomy_reprocess": ftoa_stage_cfg.reprocess,
+                    "functional_to_anatomy_mode": ftoa_stage_cfg.mode.value,
                     "scale_window": ftoa_stage_cfg.scale_window,
                     "n_scales": ftoa_stage_cfg.n_scales,
                     "z_stride_coarse": ftoa_stage_cfg.z_stride_coarse,
                     "z_refine_radius": ftoa_stage_cfg.z_refine_radius,
                     "gaussian_sigma": ftoa_stage_cfg.gaussian_sigma,
                     "early_stop_score": ftoa_stage_cfg.early_stop_score,
-                    "progress": ftoa_stage_cfg.progress,
                 }
                 if source_pixel_sizes:
                     parameters["source_session_pixel_sizes_xy_um"] = source_pixel_sizes
@@ -1451,14 +1467,14 @@ def run_pipeline(
                     parameters["scale_range_min"] = float(min_scale)
                     parameters["scale_range_max"] = float(max_scale)
 
-                _update_processing_log_stage(
-                    animal_log,
-                    _stage_key(stage_result.session_type, stage_result.session_id),
-                    stage_result,
-                    parameters,
-                )
-                save_processing_log(animal_log, log_path)
-        elif ftoa_stage_cfg.enabled:
+                    _update_processing_log_stage(
+                        animal_log,
+                        _stage_key(stage_result.session_type, stage_result.session_id),
+                        stage_result,
+                        parameters,
+                    )
+                    save_processing_log(animal_log, log_path)
+        elif ftoa_stage_cfg.mode != StageMode.SKIP:
             session_id = (
                 functional_session_ref.session_id
                 if functional_session_ref
@@ -1482,21 +1498,20 @@ def run_pipeline(
                     _stage_key("functional_to_anatomy_registration", session_id),
                     missing_result,
                     {
-                        "functional_to_anatomy_enabled": ftoa_stage_cfg.enabled,
-                        "functional_to_anatomy_reprocess": ftoa_stage_cfg.reprocess,
+                        "functional_to_anatomy_mode": ftoa_stage_cfg.mode.value,
                     },
                 )
                 save_processing_log(animal_log, log_path)
 
         if confocal_sessions:
-            if not confocal_stage_cfg.enabled:
+            if confocal_stage_cfg.mode == StageMode.SKIP:
                 for conf_session, _ in confocal_sessions:
                     stage_result = SessionResult(
                         animal_id=animal.animal_id,
                         session_id=conf_session.session_id,
                         session_type="confocal_to_anatomy_registration",
                         status="skipped",
-                        message="confocal-to-anatomy registration disabled",
+                        message="confocal-to-anatomy registration skipped",
                     )
                     animal_result.sessions.append(stage_result)
                     if animal_log is not None and log_path is not None:
@@ -1504,10 +1519,7 @@ def run_pipeline(
                             animal_log,
                             _stage_key(stage_result.session_type, stage_result.session_id),
                             stage_result,
-                            {
-                                "confocal_to_anatomy_enabled": confocal_stage_cfg.enabled,
-                                "confocal_to_anatomy_reprocess": confocal_stage_cfg.reprocess,
-                            },
+                            {"confocal_to_anatomy_mode": confocal_stage_cfg.mode.value},
                         )
                         save_processing_log(animal_log, log_path)
             elif anatomy_session_ref is None:
@@ -1560,7 +1572,7 @@ def run_pipeline(
                         preprocess_outputs=conf_outputs,
                         cfg=cfg,
                         stage_cfg=confocal_stage_cfg,
-                        fireants_config=confocal_fireants_config,
+                        fireants_config=_build_fireants_config(confocal_fireants_config_data),
                     )
                     animal_result.sessions.append(stage_result)
                     logger.info(
@@ -1580,8 +1592,7 @@ def run_pipeline(
                                 fixed_spacing = None
 
                         parameters = {
-                            "confocal_to_anatomy_enabled": confocal_stage_cfg.enabled,
-                            "confocal_to_anatomy_reprocess": confocal_stage_cfg.reprocess,
+                            "confocal_to_anatomy_mode": confocal_stage_cfg.mode.value,
                             "reference_channel": confocal_stage_cfg.reference_channel_name,
                             "available_channels": sorted(conf_outputs.channel_paths.keys()),
                             "voxel_size_um": [
@@ -1605,7 +1616,7 @@ def run_pipeline(
         if animal_log is not None and log_path is not None:
             save_processing_log(animal_log, log_path)
 
-    if ftoa_stage_cfg.enabled and cfg.output_base_dir:
+    if ftoa_stage_cfg.mode != StageMode.SKIP and cfg.output_base_dir:
         # Persist combined registration quality logs so downstream analysis can reference a single table.
         try:
             base_folder = Path(cfg.output_base_dir)

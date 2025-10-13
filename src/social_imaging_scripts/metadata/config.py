@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import platform
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ..registration.fireants_pipeline import FireANTsRegistrationConfig
 
 
 _DEFAULT_CONFIG_FILENAMES = (
@@ -130,13 +133,20 @@ def _deep_update(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, 
     return base
 
 
+class StageMode(str, Enum):
+    """Controls whether a pipeline stage runs, reuses, or forces outputs."""
+
+    SKIP = "skip"
+    REUSE = "reuse"
+    FORCE = "force"
+
+
 class FunctionalPreprocessingConfig(BaseModel):
     """Configuration for functional plane splitting and basic preprocessing."""
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Run functional plane splitting stage.")
-    reprocess: bool = Field(..., description="Re-run even if metadata already exists.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     root_subdir: Path = Field(
         ...,
         description="Relative output path for functional preprocessing artefacts.",
@@ -165,8 +175,7 @@ class MotionCorrectionConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Run Suite2p motion correction.")
-    reprocess: bool = Field(..., description="Re-run Suite2p even if metadata exists.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     planes_subdir: Path = Field(
         ...,
         description="Location of per-plane TIFFs relative to the functional root.",
@@ -221,8 +230,7 @@ class AnatomyPreprocessingConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Run anatomy stack preprocessing.")
-    reprocess: bool = Field(..., description="Re-run even if outputs already exist.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     root_subdir: Path = Field(
         ...,
         description="Relative output path for anatomy preprocessing artefacts.",
@@ -247,8 +255,7 @@ class ConfocalPreprocessingConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Run confocal stack preprocessing.")
-    reprocess: bool = Field(..., description="Re-run even if outputs already exist.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     root_subdir: Path = Field(
         ...,
         description="Relative output directory for confocal preprocessing artefacts.",
@@ -277,26 +284,21 @@ class FireantsRegistrationStageConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Run FireANTs registration.")
-    reprocess: bool = Field(..., description="Re-run FireANTs even if warped stack exists.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     output_subdir: Path = Field(
         ...,
         description="Relative output path for FireANTs outputs.",
-    )
-    config_path: Optional[Path] = Field(
-        default=None,
-        description="Optional path to a FireANTs configuration YAML/JSON file.",
-    )
-    overrides: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Dictionary of overrides applied to the FireANTs config model.",
     )
     warped_stack_template: str = Field(
         ...,
         description="Filename template for the warped anatomy stack.",
     )
+    fireants: FireANTsRegistrationConfig = Field(
+        ...,
+        description="FireANTs configuration for this stage.",
+    )
 
-    @field_validator("output_subdir", "config_path", mode="before")
+    @field_validator("output_subdir", mode="before")
     @classmethod
     def _normalise_paths(cls, value):
         return normalise_pathlike(value)
@@ -307,8 +309,7 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Enable confocal-to-anatomy registration.")
-    reprocess: bool = Field(..., description="Re-run registration even if outputs exist.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     output_root_subdir: Path = Field(
         ...,
         description="Base output directory for confocal registration artefacts.",
@@ -337,20 +338,15 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
         ...,
         description="Subdirectory name for QC artefacts.",
     )
-    config_path: Optional[Path] = Field(
-        default=None,
-        description="Optional FireANTs configuration file for this stage.",
-    )
-    overrides: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Inline overrides applied to the FireANTs configuration.",
+    fireants: FireANTsRegistrationConfig = Field(
+        ...,
+        description="FireANTs configuration for this stage.",
     )
 
     @field_validator(
         "output_root_subdir",
         "transforms_subdir",
         "qc_subdir",
-        "config_path",
         mode="before",
     )
     @classmethod
@@ -363,8 +359,7 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = Field(..., description="Enable functional-to-anatomy registration.")
-    reprocess: bool = Field(..., description="Re-run registration even if CSV exists.")
+    mode: StageMode = Field(..., description="Stage execution mode.")
     registration_output_subdir: Path = Field(
         ...,
         description="Relative output path for functional-to-anatomy registration artefacts.",
@@ -420,10 +415,6 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
     early_stop_score: Optional[float] = Field(
         default=None,
         description="Optional NCC threshold for terminating the search early.",
-    )
-    progress: bool = Field(
-        ...,
-        description="Emit per-plane progress logs during registration.",
     )
 
     @field_validator(

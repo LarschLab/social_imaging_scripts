@@ -9,8 +9,7 @@ reference_brain_filename: average_2p_noRot_orig.nrrd  # Path relative to ref_bas
 
 # Functional preprocessing: plane splitting and metadata export.
 functional_preprocessing:
-  enabled: true                # Run functional plane splitting stage.
-  reprocess: false             # Re-run even if metadata already exists.
+  mode: reuse
   root_subdir: 02_reg/00_preprocessing/2p_functional           # Relative output folder for functional preprocessing.
   planes_subdir: 01_individualPlanes                          # Subdirectory containing per-plane TIFF stacks.
   plane_filename_template: "{animal_id}_plane{plane_index}.tif"    # Naming pattern for individual plane TIFFs.
@@ -18,8 +17,7 @@ functional_preprocessing:
 
 # Motion correction (Suite2p) configuration.
 motion_correction:
-  enabled: true                # Run Suite2p motion correction.
-  reprocess: false             # Re-run Suite2p even if metadata exists.
+  mode: reuse
   planes_subdir: 01_individualPlanes                          # Location of plane TIFFs relative to functional root.
   motion_output_subdir: 02_motionCorrected                    # Destination for registered TIFFs.
   plane_folder_template: "plane{plane_index}"                 # Subdirectory naming for each plane.
@@ -32,16 +30,14 @@ motion_correction:
 
 # Anatomy preprocessing.
 anatomy_preprocessing:
-  enabled: true                # Run anatomy stack preprocessing.
-  reprocess: false             # Re-run even if outputs already exist.
+  mode: reuse
   root_subdir: 02_reg/00_preprocessing/2p_anatomy              # Relative output folder for anatomy preprocessing.
   metadata_filename_template: "{animal_id}_anatomy_metadata.json"  # Anatomy metadata filename.
   stack_filename_template: "{animal_id}_anatomy_stack.tif"     # Preprocessed anatomy stack filename.
 
 # Confocal preprocessing.
 confocal_preprocessing:
-  enabled: true
-  reprocess: false
+  mode: reuse
   root_subdir: 02_reg/00_preprocessing
   channel_filename_template: "channel_{channel}.tif"
   metadata_filename_template: "{session_id}_confocal_metadata.json"
@@ -49,17 +45,46 @@ confocal_preprocessing:
 
 # FireANTs registration (anatomy → reference brain).
 fireants_registration:
-  enabled: true                # Run FireANTs registration.
-  reprocess: false             # Re-run FireANTs even if warped stack exists.
+  mode: reuse
   output_subdir: 02_reg/02_fireants                           # Relative output folder for FireANTs artefacts.
-  config_path: null            # Optional external FireANTs config file path.
-  overrides: {}                # Inline overrides for FireANTs config fields.
   warped_stack_template: "{animal_id}_anatomy_warped_fireants.tif"  # Warped anatomy stack filename.
+  fireants:
+    device: cuda
+    winsorize:
+      enabled: true
+      lower_percentile: 1.0
+      upper_percentile: 99.0
+    moments_scale: 4
+    affine:
+      scales: [12, 8, 4, 2, 1]
+      iterations: [200, 200, 200, 100, 50]
+      optimizer: Adam
+      optimizer_lr: 0.003
+      cc_kernel_size: 31
+      tolerance: 1e-6
+      max_tolerance_iters: 10
+      loss_type: fusedcc
+      extra_args: {}
+    greedy:
+      enabled: true
+      scales: [12, 8, 4, 2, 1]
+      iterations: [200, 200, 200, 100, 25]
+      optimizer: Adam
+      optimizer_lr: 0.5
+      cc_kernel_size: 31
+      loss_type: fusedcc
+      smooth_grad_sigma: 5.0
+      smooth_warp_sigma: 3.0
+      deformation_type: compositive
+      optimizer_params: {}
+      loss_params: {}
+      extra_args: {}
+    qc_middle_plane: null
+    qc_figsize: [10, 6]
 
 # Functional → anatomy registration.
 functional_to_anatomy_registration:
-  enabled: true                # Enable functional-to-anatomy registration step.
-  reprocess: false             # Re-run registration even if CSV exists.
+  mode: reuse
   registration_output_subdir: 02_reg/07_2pf-a                 # Output folder for registration CSVs.
   projections_subdir: projections                             # Folder (under motion outputs) containing projection stacks.
   summary_csv: 02_reg/07_2pf-a/combined_registration_log.csv  # Aggregate registration summary CSV.
@@ -74,12 +99,10 @@ functional_to_anatomy_registration:
   z_refine_radius: 10          # Radius (planes) used for z refinement.
   gaussian_sigma: 1.0          # Gaussian smoothing sigma applied during preprocessing.
   early_stop_score: 0.995      # Stop search once NCC exceeds this threshold (set null to disable).
-  progress: true               # Emit per-plane progress logs during registration.
 
 # Confocal → anatomy registration.
 confocal_to_anatomy_registration:
-  enabled: true
-  reprocess: false
+  mode: reuse
   output_root_subdir: 02_reg
   registration_subdir_template: "{confocal_session_id}_to_{anatomy_session_id}"
   reference_channel_name: gcamp
@@ -87,8 +110,39 @@ confocal_to_anatomy_registration:
   metadata_filename_template: "{animal_id}_{confocal_session_id}_registration_metadata.json"
   transforms_subdir: transforms
   qc_subdir: qc
-  config_path: null
-  overrides: {}
+  fireants:
+    device: cuda
+    winsorize:
+      enabled: true
+      lower_percentile: 1.0
+      upper_percentile: 99.0
+    moments_scale: 4
+    affine:
+      scales: [12, 8, 4, 2, 1]
+      iterations: [200, 200, 200, 100, 50]
+      optimizer: Adam
+      optimizer_lr: 0.003
+      cc_kernel_size: 31
+      tolerance: 1e-6
+      max_tolerance_iters: 10
+      loss_type: fusedcc
+      extra_args: {}
+    greedy:
+      enabled: true
+      scales: [12, 8, 4, 2, 1]
+      iterations: [200, 200, 200, 100, 25]
+      optimizer: Adam
+      optimizer_lr: 0.5
+      cc_kernel_size: 31
+      loss_type: fusedcc
+      smooth_grad_sigma: 5.0
+      smooth_warp_sigma: 3.0
+      deformation_type: compositive
+      optimizer_params: {}
+      loss_params: {}
+      extra_args: {}
+    qc_middle_plane: null
+    qc_figsize: [10, 6]
 
 # Processing log output (optional).
 processing_log:

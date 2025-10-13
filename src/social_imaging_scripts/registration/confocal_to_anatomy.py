@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -14,7 +15,6 @@ import tifffile
 
 from .fireants_pipeline import (
     FireANTsRegistrationConfig,
-    _apply_overrides,
     _import_fireants,
     _winsorize_image,
     _write_qc_figure,
@@ -36,8 +36,7 @@ def register_confocal_to_anatomy(
     fixed_stack_path: Path,
     additional_channels: Dict[str, Path],
     output_root: Path,
-    config: Optional[FireANTsRegistrationConfig] = None,
-    overrides: Optional[Dict[str, object]] = None,
+    config: FireANTsRegistrationConfig,
     voxel_spacing_um: Tuple[float, float, float],
     fixed_spacing_um: Tuple[float, float, float],
     warped_channel_template: str,
@@ -48,9 +47,7 @@ def register_confocal_to_anatomy(
 ) -> Dict[str, object]:
     """Register a confocal channel to two-photon anatomy and warp additional channels."""
 
-    cfg = config or FireANTsRegistrationConfig()
-    if overrides:
-        _apply_overrides(cfg, overrides)
+    cfg = copy.deepcopy(config)
 
     if cfg.device.startswith("cuda") and not torch.cuda.is_available():
         cfg.device = "cpu"
