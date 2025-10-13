@@ -633,6 +633,7 @@ def process_confocal_session(
             channel_template=stage_cfg.channel_filename_template,
             metadata_filename=stage_cfg.metadata_filename_template,
             flip_horizontal=stage_cfg.flip_horizontal,
+            flip_z=stage_cfg.flip_z,
             reprocess=mode == StageMode.FORCE,
             raw_path_override=raw_path,
         )
@@ -766,6 +767,14 @@ def process_confocal_to_anatomy_registration(
             transforms_subdir=stage_cfg.transforms_subdir,
             qc_subdir=stage_cfg.qc_subdir,
             reference_channel_name=moving_name,
+            mask_margin_xy=stage_cfg.mask_margin_xy,
+            mask_margin_z=stage_cfg.mask_margin_z,
+            histogram_match=stage_cfg.histogram_match,
+            histogram_levels=stage_cfg.histogram_levels,
+            histogram_match_points=stage_cfg.histogram_match_points,
+            histogram_threshold_at_mean=stage_cfg.histogram_threshold_at_mean,
+            crop_to_extent=stage_cfg.crop_to_extent,
+            crop_padding_um=stage_cfg.crop_padding_um,
         )
         warped_channels = metadata_outputs.get("warped_channels", {})
     else:
@@ -1320,6 +1329,7 @@ def run_pipeline(
                     parameters = {
                         "confocal_preprocess_mode": confocal_preproc_cfg.mode.value,
                         "flip_horizontal": confocal_preproc_cfg.flip_horizontal,
+                        "flip_z": confocal_preproc_cfg.flip_z,
                     }
                     if confocal_outputs is not None:
                         parameters["voxel_size_um"] = [
@@ -1328,7 +1338,10 @@ def run_pipeline(
                             float(confocal_outputs.voxel_size_um[2]),
                         ]
                         parameters["channels"] = sorted(confocal_outputs.channel_paths.keys())
+                        parameters["pixels_xyz"] = [int(value) for value in confocal_outputs.pixels_xyz]
                         parameters["reused"] = confocal_outputs.reused
+                        parameters["flip_horizontal_applied"] = confocal_outputs.flip_horizontal
+                        parameters["flip_z_applied"] = confocal_outputs.flip_z
                     _update_processing_log_stage(
                         animal_log,
                         _stage_key(session_result.session_type, session_result.session_id),

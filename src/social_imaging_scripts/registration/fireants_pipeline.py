@@ -16,7 +16,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,10 +25,18 @@ import tifffile
 import torch
 import pandas as pd
 
-from social_imaging_scripts.metadata.config import resolve_raw_path
-from social_imaging_scripts.metadata.models import AnimalMetadata, AnatomySession
+if TYPE_CHECKING:
+    from social_imaging_scripts.metadata.models import AnimalMetadata, AnatomySession
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_raw_path(path: Path) -> Path:
+    """Deferred import helper to avoid circular dependency with config."""
+
+    from social_imaging_scripts.metadata.config import resolve_raw_path as _resolve
+
+    return _resolve(path)
 
 
 @dataclass
@@ -245,7 +253,7 @@ def _lookup_z_step_um(animal: AnimalMetadata, session: AnatomySession) -> Option
     """Read step_size_um_anatomy from the microscope metadata CSV if present."""
 
     try:
-        metadata_dir = resolve_raw_path(Path(animal.root_dir) / "01_raw/2p/metadata")
+        metadata_dir = _resolve_raw_path(Path(animal.root_dir) / "01_raw/2p/metadata")
     except FileNotFoundError:
         return None
 
@@ -277,7 +285,7 @@ def _prepare_voxel_spacing(
     pixel_size = session.session_data.pixel_size_xy_um
     z_step = session.session_data.z_step_um
 
-    raw_stack_path = resolve_raw_path(Path(animal.root_dir) / session.session_data.raw_path)
+    raw_stack_path = _resolve_raw_path(Path(animal.root_dir) / session.session_data.raw_path)
 
     if pixel_size is None:
         pixel_size = _compute_pixel_size_from_tiff(raw_stack_path)

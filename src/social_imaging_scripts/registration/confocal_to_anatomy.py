@@ -27,6 +27,69 @@ def _to_sitk_image(array: np.ndarray, spacing: Tuple[float, float, float]) -> si
     return image
 
 
+def _margin_to_voxels(value: float, size: int) -> int:
+    """Convert fractional or absolute margin specifications into voxels."""
+
+    if value <= 0:
+        return 0
+    if value < 1.0:
+        return max(0, int(round(value * size)))
+    return max(0, int(round(value)))
+
+
+def _build_central_mask(
+    shape: tuple[int, int, int],
+    margin_xy: float,
+    margin_z: float,
+) -> np.ndarray:
+    """Binary mask that keeps the central region of a volume."""
+
+    z, y, x = shape
+    margin_z_vox = min(_margin_to_voxels(margin_z, z), z // 2)
+    margin_y_vox = min(_margin_to_voxels(margin_xy, y), y // 2)
+    margin_x_vox = min(_margin_to_voxels(margin_xy, x), x // 2)
+
+    if margin_z_vox <= 0 and margin_y_vox <= 0 and margin_x_vox <= 0:
+        return np.ones(shape, dtype=np.float32)
+
+    mask = np.zeros(shape, dtype=np.float32)
+    z0 = margin_z_vox
+    z1 = max(z - margin_z_vox, z0 + 1)
+    y0 = margin_y_vox
+    y1 = max(y - margin_y_vox, y0 + 1)
+    x0 = margin_x_vox
+    x1 = max(x - margin_x_vox, x0 + 1)
+    mask[z0:z1, y0:y1, x0:x1] = 1.0
+    return mask
+
+
+def _compute_extent_crop_slices(
+    moving_shape: tuple[int, int, int],
+    moving_spacing: Tuple[float, float, float],
+    fixed_shape: tuple[int, int, int],
+    fixed_spacing: Tuple[float, float, float],
+    padding_um: float,
+) -> tuple[tuple[slice, slice, slice], dict[str, list[int]]]:
+    """Determine symmetric crop slices so confocal XY extent matches anatomy."""
+
+    def _axis_bounds(size: int, spacing: float, target_extent: float) -> tuple[int, int]:
+        current_extent = size * spacing
+        if current_extent <= target_extent or spacing <= 0:
+            return 0, size
+        trim_um = max(0.0, (current_extent - target_extent) / 2.0)
+        trim_vox = min(size // 2, int(round(trim_um / spacing)))
+        return trim_vox, size - trim_vox
+
+    target_x_extent = fixed_shape[2] * fixed_spacing[0] + 2.0 * max(0.0, padding_um)
+    target_y_extent = fixed_shape[1] * fixed_spacing[1] + 2.0 * max(0.0, padding_um)
+
+    x0, x1 = _axis_bounds(moving_shape[2], moving_spacing[0], target_x_extent)
+    y0, y1 = _axis_bounds(moving_shape[1], moving_spacing[1], target_y_extent)
+
+    crop_info = {"y_vox": [int(y0), int(y1)], "x_vox": [int(x0), int(x1)]}
+    return (slice(None), slice(y0, y1), slice(x0, x1)), crop_info
+
+
 def register_confocal_to_anatomy(
     *,
     animal_id: str,
@@ -44,6 +107,14 @@ def register_confocal_to_anatomy(
     transforms_subdir: Path,
     qc_subdir: Path,
     reference_channel_name: str,
+    mask_margin_xy: float,
+    mask_margin_z: float,
+    histogram_match: bool,
+    histogram_levels: int,
+    histogram_match_points: int,
+    histogram_threshold_at_mean: bool,
+    crop_to_extent: bool,
+    crop_padding_um: float,
 ) -> Dict[str, object]:
     """Register a confocal channel to two-photon anatomy and warp additional channels."""
 
@@ -74,9 +145,36 @@ def register_confocal_to_anatomy(
     moving_array = tifffile.imread(moving_channel_path).astype(np.float32, copy=False)
     fixed_array = tifffile.imread(fixed_stack_path).astype(np.float32, copy=False)
 
+    crop_slices = (slice(None), slice(None), slice(None))
+    crop_info: dict[str, list[int]] | None = None
+    if crop_to_extent:
+        crop_slices, crop_info = _compute_extent_crop_slices(
+            moving_array.shape,
+            voxel_spacing_um,
+            fixed_array.shape,
+            fixed_spacing_um,
+            crop_padding_um,
+        )
+        moving_array = moving_array[crop_slices]
+
+    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z)
+    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z)
+    moving_array *= moving_mask
+    fixed_array *= fixed_mask
+
     spacing = tuple(float(s) for s in voxel_spacing_um)
     moving_image = _to_sitk_image(moving_array, spacing)
     fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
+
+    if histogram_match:
+        matcher = sitk.HistogramMatchingImageFilter()
+        matcher.SetNumberOfHistogramLevels(int(histogram_levels))
+        matcher.SetNumberOfMatchPoints(int(histogram_match_points))
+        if histogram_threshold_at_mean:
+            matcher.ThresholdAtMeanIntensityOn()
+        else:
+            matcher.ThresholdAtMeanIntensityOff()
+        moving_image = matcher.Execute(moving_image, fixed_image)
 
     moving_image, moving_winsor = _winsorize_image(moving_image, cfg.winsorize)
     fixed_image, fixed_winsor = _winsorize_image(fixed_image, cfg.winsorize)
@@ -172,6 +270,12 @@ def register_confocal_to_anatomy(
 
     def _warp_additional_channel(name: str, channel_path: Path) -> Path:
         arr = tifffile.imread(channel_path).astype(np.float32, copy=False)
+        arr = arr[crop_slices]
+        if arr.shape != moving_mask.shape:
+            raise ValueError(
+                f"Additional channel {name} shape {arr.shape} does not match reference {moving_mask.shape}"
+            )
+        arr = arr * moving_mask
         img = _to_sitk_image(arr, spacing)
         img, _ = _winsorize_image(img, cfg.winsorize)
         channel_fa = FAImage(img, device=cfg.device, dtype=torch.float32)
@@ -217,6 +321,22 @@ def register_confocal_to_anatomy(
         "winsorize": {
             "moving": moving_winsor,
             "fixed": fixed_winsor,
+        },
+        "mask": {
+            "margin_xy": float(mask_margin_xy),
+            "margin_z": float(mask_margin_z),
+        },
+        "histogram_match": {
+            "enabled": bool(histogram_match),
+            "levels": int(histogram_levels),
+            "match_points": int(histogram_match_points),
+            "threshold_at_mean": bool(histogram_threshold_at_mean),
+        },
+        "cropping": {
+            "enabled": bool(crop_to_extent),
+            "y_vox": (crop_info["y_vox"] if crop_info else None),
+            "x_vox": (crop_info["x_vox"] if crop_info else None),
+            "padding_um": float(crop_padding_um),
         },
         "outputs": {
             "gcamp": str(gcamp_output),

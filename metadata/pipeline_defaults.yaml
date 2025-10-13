@@ -42,6 +42,7 @@ confocal_preprocessing:
   channel_filename_template: "channel_{channel}.tif"
   metadata_filename_template: "{session_id}_confocal_metadata.json"
   flip_horizontal: true
+  flip_z: true
 
 # FireANTs registration (anatomy → reference brain).
 fireants_registration:
@@ -102,14 +103,22 @@ functional_to_anatomy_registration:
 
 # Confocal → anatomy registration.
 confocal_to_anatomy_registration:
-  mode: reuse
-  output_root_subdir: 02_reg
-  registration_subdir_template: "{confocal_session_id}_to_{anatomy_session_id}"
-  reference_channel_name: gcamp
-  warped_channel_template: "{animal_id}_{confocal_session_id}_{channel}_warped.tif"
-  metadata_filename_template: "{animal_id}_{confocal_session_id}_registration_metadata.json"
-  transforms_subdir: transforms
-  qc_subdir: qc
+  mode: reuse  # Stage execution mode (skip/reuse/force).
+  output_root_subdir: 02_reg  # Base directory for confocal→anatomy artefacts.
+  registration_subdir_template: "{confocal_session_id}_to_{anatomy_session_id}"  # Folder name pattern per confocal session.
+  reference_channel_name: gcamp  # Confocal channel used as moving volume.
+  warped_channel_template: "{animal_id}_{confocal_session_id}_{channel}_warped.tif"  # Output warped-channel filename pattern.
+  metadata_filename_template: "{animal_id}_{confocal_session_id}_registration_metadata.json"  # Registration metadata filename.
+  transforms_subdir: transforms  # Subdirectory storing affine/warp transforms.
+  qc_subdir: qc  # Subdirectory storing QC figures.
+  crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
+  crop_padding_um: 0.0  # Extra padding (µm) kept around the cropped confocal volume.
+  mask_margin_xy: 0.08  # Fraction or voxels trimmed laterally when masking.
+  mask_margin_z: 0.05  # Fraction or voxels trimmed along Z when masking.
+  histogram_match: false  # Apply histogram matching before registration.
+  histogram_levels: 64  # Histogram levels used during histogram matching.
+  histogram_match_points: 12  # Number of match points for histogram matching.
+  histogram_threshold_at_mean: true  # Threshold histogram matching at mean intensity.
   fireants:
     device: cuda
     winsorize:

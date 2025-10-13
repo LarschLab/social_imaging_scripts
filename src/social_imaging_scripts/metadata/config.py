@@ -272,6 +272,10 @@ class ConfocalPreprocessingConfig(BaseModel):
         ...,
         description="Flip confocal stacks left-right during preprocessing.",
     )
+    flip_z: bool = Field(
+        ...,
+        description="Reverse confocal stack order along the axial (Z) dimension.",
+    )
 
     @field_validator("root_subdir", mode="before")
     @classmethod
@@ -337,6 +341,38 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
     qc_subdir: Path = Field(
         ...,
         description="Subdirectory name for QC artefacts.",
+    )
+    mask_margin_xy: float = Field(
+        default=0.08,
+        description="Fraction (<=1) or absolute voxel margin to crop laterally before registration.",
+    )
+    mask_margin_z: float = Field(
+        default=0.05,
+        description="Fraction (<=1) or absolute voxel margin to crop axially before registration.",
+    )
+    histogram_match: bool = Field(
+        default=True,
+        description="Apply histogram matching between confocal and anatomy reference volumes.",
+    )
+    histogram_levels: int = Field(
+        default=64,
+        description="Histogram levels used during intensity histogram matching.",
+    )
+    histogram_match_points: int = Field(
+        default=12,
+        description="Number of match points used for histogram matching.",
+    )
+    histogram_threshold_at_mean: bool = Field(
+        default=True,
+        description="Threshold histogram matching at the mean intensity (SimpleITK behaviour).",
+    )
+    crop_to_extent: bool = Field(
+        default=True,
+        description="Crop confocal XY extent to approximate the anatomy field of view.",
+    )
+    crop_padding_um: float = Field(
+        default=0.0,
+        description="Extra padding (µm) preserved around the cropped confocal volume.",
     )
     fireants: FireANTsRegistrationConfig = Field(
         ...,

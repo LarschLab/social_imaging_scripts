@@ -20,7 +20,9 @@ class ConfocalPreprocessOutputs:
     metadata_path: Path
     channel_paths: Dict[str, Path]
     voxel_size_um: Tuple[float, float, float]
+    pixels_xyz: Tuple[int, int, int]
     flip_horizontal: bool
+    flip_z: bool
     reused: bool
 
 
@@ -83,6 +85,7 @@ def run(
     channel_template: str,
     metadata_filename: str,
     flip_horizontal: bool,
+    flip_z: bool,
     reprocess: bool = False,
     raw_path_override: Optional[Path] = None,
 ) -> ConfocalPreprocessOutputs:
@@ -99,12 +102,23 @@ def run(
         channel_paths = {name: Path(path) for name, path in payload.get("channels", {}).items()}
         voxel = payload.get("voxel_size_um") or [1.0, 1.0, 1.0]
         flip = bool(payload.get("flip_horizontal", False))
+        flip_axial = bool(payload.get("flip_z", False))
+        pixels = payload.get("pixels_xyz")
+        if pixels is None:
+            example = next(iter(channel_paths.values()), None)
+            if example and example.exists():
+                example_shape = tifffile.imread(example).shape
+                pixels = [int(example_shape[0]), int(example_shape[1]), int(example_shape[2])]
+            else:
+                pixels = [0, 0, 0]
         return ConfocalPreprocessOutputs(
             session_id=session_id,
             metadata_path=metadata_path,
             channel_paths=channel_paths,
             voxel_size_um=(float(voxel[0]), float(voxel[1]), float(voxel[2])),
+            pixels_xyz=(int(pixels[0]), int(pixels[1]), int(pixels[2])),
             flip_horizontal=flip,
+            flip_z=flip_axial,
             reused=True,
         )
 
@@ -124,6 +138,8 @@ def run(
 
     if flip_horizontal:
         stack = np.flip(stack, axis=-1)
+    if flip_z:
+        stack = np.flip(stack, axis=0)
 
     channel_names = _resolve_channel_names(session)
     if not channel_names:
@@ -151,7 +167,9 @@ def run(
         "session_id": session_id,
         "raw_path": str(raw_path),
         "flip_horizontal": flip_horizontal,
+        "flip_z": flip_z,
         "voxel_size_um": list(voxel),
+        "pixels_xyz": [int(stack.shape[0]), int(stack.shape[2]), int(stack.shape[3])],
         "channels": {name: str(path) for name, path in channel_paths.items()},
     }
     metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -161,6 +179,8 @@ def run(
         metadata_path=metadata_path,
         channel_paths=channel_paths,
         voxel_size_um=voxel,
+        pixels_xyz=(int(stack.shape[0]), int(stack.shape[2]), int(stack.shape[3])),
         flip_horizontal=flip_horizontal,
+        flip_z=flip_z,
         reused=False,
     )
