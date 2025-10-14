@@ -111,41 +111,43 @@ confocal_to_anatomy_registration:
   metadata_filename_template: "{animal_id}_{confocal_session_id}_registration_metadata.json"  # Registration metadata filename.
   transforms_subdir: transforms  # Subdirectory storing affine/warp transforms.
   qc_subdir: qc  # Subdirectory storing QC figures.
-  crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
-  crop_padding_um: 5.0  # Extra padding (µm) kept around the cropped confocal volume.
-  mask_margin_xy: 0.02  # Fraction or voxels trimmed laterally when masking.
-  mask_margin_z: 0.02  # Fraction or voxels trimmed along Z when masking.
-  histogram_match: true  # Apply histogram matching before registration.
+  crop_to_extent: false  # Crop confocal XY extent to approximate anatomy coverage.
+  crop_padding_um: 0  # Extra padding (µm) kept around the cropped confocal volume.
+  mask_margin_xy: .0  # Fraction or voxels trimmed laterally when masking.
+  mask_margin_z: .0  # Fraction or voxels trimmed along Z when masking.
+  mask_soft_edges: false  # Blend mask edges with a raised-cosine taper instead of a hard cutoff.
+  histogram_match: false  # Apply histogram matching before registration.
   histogram_levels: 64  # Histogram levels used during histogram matching.
   histogram_match_points: 12  # Number of match points for histogram matching.
-  histogram_threshold_at_mean: true  # Threshold histogram matching at mean intensity.
+  histogram_threshold_at_mean: false  # Threshold histogram matching at mean intensity.
+  initial_translation_mode: none  # Seed affine translation (none|crop|centroid).
   fireants:
     device: cuda
     winsorize:
       enabled: true
       lower_percentile: 2.5
-      upper_percentile: 97.5
+      upper_percentile: 99.0
     moments_scale: 4
     affine:
       scales: [12, 8, 4, 2, 1]
-      iterations: [200, 200, 200, 100, 100]
+      iterations: [200, 200, 200, 100, 50]
       optimizer: Adam
-      optimizer_lr: 0.003
-      cc_kernel_size: 41
+      optimizer_lr: 0.001
+      cc_kernel_size: 51
       tolerance: 1e-7
-      max_tolerance_iters: 10
+      max_tolerance_iters: 20
       loss_type: fusedmi
       extra_args: {}
     greedy:
-      enabled: true
+      enabled: false
       scales: [12, 8, 4, 2, 1]
       iterations: [200, 200, 200, 100, 50]
       optimizer: Adam
-      optimizer_lr: 0.3
-      cc_kernel_size: 21
-      loss_type: fusedmi
-      smooth_grad_sigma: 4.0
-      smooth_warp_sigma: 2.0
+      optimizer_lr: 0.2
+      cc_kernel_size: 41
+      loss_type: fusedcc
+      smooth_grad_sigma: 6.0
+      smooth_warp_sigma: 5.0
       deformation_type: compositive
       optimizer_params: {}
       loss_params: {}

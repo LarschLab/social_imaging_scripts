@@ -45,6 +45,7 @@ def _build_central_mask(
     shape: tuple[int, int, int],
     margin_xy: float,
     margin_z: float,
+    soft_edges: bool,
 ) -> np.ndarray:
     """Binary mask that keeps the central region of a volume."""
 
@@ -56,15 +57,36 @@ def _build_central_mask(
     if margin_z_vox <= 0 and margin_y_vox <= 0 and margin_x_vox <= 0:
         return np.ones(shape, dtype=np.float32)
 
-    mask = np.zeros(shape, dtype=np.float32)
-    z0 = margin_z_vox
-    z1 = max(z - margin_z_vox, z0 + 1)
-    y0 = margin_y_vox
-    y1 = max(y - margin_y_vox, y0 + 1)
-    x0 = margin_x_vox
-    x1 = max(x - margin_x_vox, x0 + 1)
-    mask[z0:z1, y0:y1, x0:x1] = 1.0
-    return mask
+    def _axis_window(length: int, margin: int) -> np.ndarray:
+        if margin <= 0:
+            return np.ones(length, dtype=np.float32)
+        window = np.ones(length, dtype=np.float32)
+        if soft_edges:
+            idx = np.arange(margin, dtype=np.float32) / max(margin, 1)
+            taper = 0.5 * (1 - np.cos(np.pi * idx))
+            window[:margin] = taper[::-1]
+            window[-margin:] = taper
+        else:
+            window[:margin] = 0.0
+            window[-margin:] = 0.0
+        return window
+
+    z_window = _axis_window(z, margin_z_vox)
+    y_window = _axis_window(y, margin_y_vox)
+    x_window = _axis_window(x, margin_x_vox)
+    mask = z_window[:, None, None] * y_window[None, :, None] * x_window[None, None, :]
+    return mask.astype(np.float32)
+
+
+def _compute_centroid(volume: np.ndarray) -> np.ndarray:
+    total = float(volume.sum(dtype=np.float64))
+    if total <= 0.0:
+        return np.array([(dim - 1) / 2.0 for dim in volume.shape], dtype=np.float64)
+    coords = np.indices(volume.shape, dtype=np.float64)
+    return np.array(
+        [(coords[i] * volume).sum(dtype=np.float64) / total for i in range(volume.ndim)],
+        dtype=np.float64,
+    )
 
 
 def _compute_extent_crop_slices(
@@ -113,10 +135,12 @@ def register_confocal_to_anatomy(
     reference_channel_name: str,
     mask_margin_xy: float,
     mask_margin_z: float,
+    mask_soft_edges: bool,
     histogram_match: bool,
     histogram_levels: int,
     histogram_match_points: int,
     histogram_threshold_at_mean: bool,
+    initial_translation_mode: str,
     crop_to_extent: bool,
     crop_padding_um: float,
 ) -> Dict[str, object]:
@@ -148,6 +172,7 @@ def register_confocal_to_anatomy(
 
     moving_array = tifffile.imread(moving_channel_path).astype(np.float32, copy=False)
     fixed_array = tifffile.imread(fixed_stack_path).astype(np.float32, copy=False)
+    original_shape = moving_array.shape
 
     crop_slices = (slice(None), slice(None), slice(None))
     crop_info: dict[str, list[int]] | None = None
@@ -166,9 +191,10 @@ def register_confocal_to_anatomy(
             crop_padding_um,
         )
         moving_array = moving_array[crop_slices]
+    cropped_shape = moving_array.shape
 
-    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z)
-    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z)
+    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
     if np.any(moving_mask != 1.0) or np.any(fixed_mask != 1.0):
         logger.info(
             "Applying central masks (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
@@ -181,6 +207,39 @@ def register_confocal_to_anatomy(
     spacing = tuple(float(s) for s in voxel_spacing_um)
     moving_image = _to_sitk_image(moving_array, spacing)
     fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
+    dim = moving_image.GetDimension()
+
+    translation_mode = (initial_translation_mode or "none").lower()
+    translation_vec = np.zeros(3, dtype=np.float64)
+    if translation_mode == "crop" and crop_info is not None:
+        orig_center_x = (original_shape[2] - 1) / 2.0
+        orig_center_y = (original_shape[1] - 1) / 2.0
+        cropped_center_x = (crop_info["x_vox"][0] + crop_info["x_vox"][1] - 1) / 2.0
+        cropped_center_y = (crop_info["y_vox"][0] + crop_info["y_vox"][1] - 1) / 2.0
+        delta_x_vox = cropped_center_x - orig_center_x
+        delta_y_vox = cropped_center_y - orig_center_y
+        translation_vec = -np.array([
+            delta_x_vox * spacing[0],
+            delta_y_vox * spacing[1],
+            0.0,
+        ], dtype=np.float64)
+    elif translation_mode == "centroid":
+        moving_centroid = _compute_centroid(moving_array)
+        fixed_centroid = _compute_centroid(fixed_array)
+        delta_vox = np.array(
+            [
+                moving_centroid[2] - fixed_centroid[2],
+                moving_centroid[1] - fixed_centroid[1],
+                moving_centroid[0] - fixed_centroid[0],
+            ],
+            dtype=np.float64,
+        )
+        translation_vec = -delta_vox * np.array(
+            [spacing[0], spacing[1], float(fixed_spacing_um[2])],
+            dtype=np.float64,
+        )
+    else:
+        translation_mode = "none"
 
     if histogram_match:
         logger.info(
@@ -213,6 +272,32 @@ def register_confocal_to_anatomy(
     )
     moments.optimize()
     init_affine = moments.get_affine_init().detach()
+
+    if translation_mode != "none" and np.linalg.norm(translation_vec) > 1e-6:
+        logger.info(
+            "Seeding affine translation (mode=%s): Δx=%.3f µm, Δy=%.3f µm, Δz=%.3f µm",
+            translation_mode,
+            translation_vec[0],
+            translation_vec[1],
+            translation_vec[2],
+        )
+        tr = torch.tensor(translation_vec, device=init_affine.device, dtype=init_affine.dtype)
+        if init_affine.shape[-2:] == (dim, dim + 1):
+            init_affine = init_affine.clone()
+            init_affine[:, 0, -1] += tr[0]
+            init_affine[:, 1, -1] += tr[1]
+            if dim > 2:
+                init_affine[:, 2, -1] += tr[2]
+        elif init_affine.shape[-2:] == (dim + 1, dim + 1):
+            init_affine = init_affine.clone()
+            init_affine[:, 0, -1] += tr[0]
+            init_affine[:, 1, -1] += tr[1]
+            init_affine[:, 2, -1] += tr[2]
+        else:
+            logger.warning(
+                "Unexpected affine init shape %s; skipping translation seed.",
+                tuple(init_affine.shape),
+            )
 
     affine = AffineRegistration(
         list(cfg.affine.scales),
@@ -347,12 +432,17 @@ def register_confocal_to_anatomy(
         "mask": {
             "margin_xy": float(mask_margin_xy),
             "margin_z": float(mask_margin_z),
+            "soft_edges": bool(mask_soft_edges),
         },
         "histogram_match": {
             "enabled": bool(histogram_match),
             "levels": int(histogram_levels),
             "match_points": int(histogram_match_points),
             "threshold_at_mean": bool(histogram_threshold_at_mean),
+        },
+        "initial_translation": {
+            "mode": translation_mode,
+            "vector_um": [float(translation_vec[0]), float(translation_vec[1]), float(translation_vec[2])],
         },
         "cropping": {
             "enabled": bool(crop_to_extent),

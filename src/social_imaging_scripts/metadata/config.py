@@ -4,7 +4,7 @@ import os
 import platform
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -350,6 +350,10 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
         default=0.05,
         description="Fraction (<=1) or absolute voxel margin to crop axially before registration.",
     )
+    mask_soft_edges: bool = Field(
+        default=True,
+        description="Use a smooth taper around mask margins instead of a hard cutoff.",
+    )
     histogram_match: bool = Field(
         default=True,
         description="Apply histogram matching between confocal and anatomy reference volumes.",
@@ -365,6 +369,10 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
     histogram_threshold_at_mean: bool = Field(
         default=True,
         description="Threshold histogram matching at the mean intensity (SimpleITK behaviour).",
+    )
+    initial_translation_mode: Literal["none", "crop", "centroid"] = Field(
+        default="centroid",
+        description="Seed affine translation using the crop offsets or centroid difference (none|crop|centroid).",
     )
     crop_to_extent: bool = Field(
         default=True,

@@ -769,10 +769,12 @@ def process_confocal_to_anatomy_registration(
             reference_channel_name=moving_name,
             mask_margin_xy=stage_cfg.mask_margin_xy,
             mask_margin_z=stage_cfg.mask_margin_z,
+            mask_soft_edges=stage_cfg.mask_soft_edges,
             histogram_match=stage_cfg.histogram_match,
             histogram_levels=stage_cfg.histogram_levels,
             histogram_match_points=stage_cfg.histogram_match_points,
             histogram_threshold_at_mean=stage_cfg.histogram_threshold_at_mean,
+            initial_translation_mode=stage_cfg.initial_translation_mode,
             crop_to_extent=stage_cfg.crop_to_extent,
             crop_padding_um=stage_cfg.crop_padding_um,
         )
