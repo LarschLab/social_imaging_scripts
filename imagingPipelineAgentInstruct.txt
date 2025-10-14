@@ -1,24 +1,74 @@
-here is some context on the project we are working on:
+## Project Overview
 
-Project Overview
+- Goal: end-to-end `social_imaging_scripts` pipeline that aligns multi-modal zebrafish data (2p functional, 2p anatomy, confocal/HCR) into a common reference space for downstream analysis.
+- Current emphasis: reliable two-photon preprocessing (plane split, negative value correction, Suite2p motion, ROI extraction) and robust registration stages (functional→anatomy, confocal→anatomy, anatomy→reference).
 
-Building a full social_imaging_scripts pipeline to align multi-modal zebrafish imaging data (2p functional + anatomy + confocal (HCR)) into a common reference space.
-Current focus is on two-photon preprocessing: plane splitting, negative-pixel correction, Suite2p motion correction, and ROI extraction ready for downstream registration/analysis.
-Key Decisions
+## Key Architectural Decisions
 
-Adopted pyproject.toml package layout; notebooks/scripts import modules via social_imaging_scripts.
-Metadata lives as per-animal YAML generated from a single Excel “stacks” tab; animals now just contain an animal_id plus stack entries, with optional two-photon preprocessing settings supplied via discriminated union.
-Added project-level config for raw-data root vs processed-output root, enabling relocation between network storage and local scratch.
-Preprocessing outputs follow the lab’s legacy structure: motion-corrected TIFFs named {animal}_plane{idx}_mcorrected.tif; Suite2p artefacts renamed with the same prefix.
-Suite2p integration reuses the lab’s shared ops template (suite2p_ops_may2025.npy), caps batch size at 400 frames, and merges registered chunks numerically to preserve frame order.
+- **Package layout**: `pyproject.toml` driven; notebooks/scripts import via `social_imaging_scripts`.
+- **Metadata**: single Excel “stacks” sheet → per-animal YAML. Sessions carry minimal keys (animal_id, session entries, optional two-photon preprocessing settings via discriminated union).
+- **Config handling**: all runtime parameters come from `metadata/pipeline_defaults.yaml`. Never rely on hidden defaults in code—add new knobs there (with inline comments) and read them through the Pydantic config models.
+- **Paths**: global `raw_base_dir` vs `output_base_dir` so we can bounce between network storage and local scratch. Always treat network paths (`/mnt/nas_*/...`) as read-only.
+- **Preprocessing outputs**: maintain legacy folder names (`02_reg/...`). Motion-corrected TIFFs use `{animal}_plane{n}_mcorrected.tif`; Suite2p artefacts renamed with same prefix.
+- **Suite2p integration**: reuse lab ops template (`suite2p_ops_may2025.npy`), cap batches at 400 frames, numerically merge outputs to preserve frame order.
+- **Implementation philosophy**: we’re in the early design stage. No need for backwards compatibility—prefer simple, explicit, and maintainable code over elaborate abstraction.
+- **Logging**: favour verbose INFO logs everywhere (cropping, masking, histogram matching, translation seeding, etc.) so future sessions can understand what happened without rerunning.
 
-Current Status & Next Steps
+## Daily Workflow Reminders
 
-Functional stack preprocessing and motion correction verified on L395_f10; merged TIFFs now match legacy results chunk-wise.
-Metadata, preprocessing notebooks, and wiki guide are documented; 
-For WSL deployment, update the project config/metadata to reflect POSIX paths; core code uses pathlib and will work once roots are adjusted.
+- Environment: **always** run commands inside the `fireantsGH` conda env (`source activate fireantsGH >/dev/null 2>&1 && …`).  
+  - When executing inline Python through the CLI, use `python - <<'PY'` blocks inside that activation. This avoids quoting issues and ensures dependencies (SimpleITK, tifffile, FireANTs) are available.  
+  - If you see “module not found” or weird string interpolation problems, re-check that the command began with `source activate fireantsGH >/dev/null 2>&1 &&`.
+- Treat network-mounted data as read-only. Never delete or overwrite anything on `/mnt/nas_…`. All writes go under the project workspace (e.g., `/mnt/f/johannes/pipelineOut`).
+- Prefer `python -m compileall src` over ad-hoc test scripts to verify syntax when modifications touch multiple modules.
 
-important agent restrictions:
-treat all existing data on the network drive a off-limits for change. Never delete anything there. Read only.
+## Preprocessing & Registration Strategy (summary)
 
-we are on a wsl machine and using the environment fireantsGH. always use that for testing.
+1. **Two-photon functional**
+   - Plane split, negative correction, Suite2p motion, ROI extraction.
+   - Outputs verified against legacy data (e.g., L395_f10).
+2. **Two-photon anatomy**
+   - Basic preprocessing + FireANTs alignment to reference brain.
+3. **Functional→anatomy registration**
+   - FFT-based template matching (`functional_to_anatomy_ants.register_planes_pass1`) handles multi-plane translation & uniform scaling. Operates on full FOV; no masking/cropping needed.
+4. **Confocal preprocessing**
+   - Flip horizontal + Z to match 2p orientation.
+   - Record voxel spacing **and pixel counts** in metadata so later stages can compute physical extents.
+5. **Confocal→anatomy registration (FireANTs)**
+   - Optional extent-based cropping (with padding), configurable masks (binary or raised-cosine soft edges), winsorisation, optional histogram matching.
+   - Affine stage can be seeded with translations derived from crop offsets or centroid differences. Greedy stage is optional; use cautiously.
+   - Always log mask parameters, histogram settings, cropping window, and seeded translation.
+
+## How we execute & test
+
+- For notebook experiments (e.g., `confocal_central_crop_test.ipynb`) mirror the pipeline defaults, then tweak parameters there before adopting them globally.
+- When captured output is required, we always run commands like:
+  ```
+  source activate fireantsGH >/dev/null 2>&1 && python - <<'PY'
+  # python code here
+  PY
+  ```
+  The `<<'PY'` literal quoting prevents shell expansion issues with braces or backslashes.
+- To investigate warped volumes quickly, use `tifffile` inside the env, compute correlations/centroids, and log findings.
+
+## Coding Conventions / Preferences
+
+- Default to explicit, straightforward code. No clever abstractions unless they remove repeated boilerplate.
+- New functionality should surface explicit config flags so future tweaks require only adjusting `pipeline_defaults.yaml`.
+- When in doubt, make the code chatty: log the parameters and results at each major stage. We’d rather have slightly noisy logs than silent failure.
+
+## Current Confocal→2p Challenges & Lessons
+
+- We struggled with alignment drifting because heavy cropping + hard masks made MI/CC blind to translation.  
+  - Mitigations so far: extent-aware cropping with optional padding, soft-edged masks, translation seeding (crop offsets or centroids).
+- Greedy warps often degraded otherwise good affine alignments (producing “liquid” artefacts). Running affine-only or dialing down greedy (`optimizer_lr`, smoothing, iterations) yields more stable results.
+- Mutual information gave promising loss values but also aligned the stack poorly when masks were too symmetric. Soft masks or small margins restore reliable correlation at the cost of lower (but meaningful) loss magnitudes.
+- We’re still tuning these knobs. Open questions / TODOs:
+  1. Automated multiple rigid seeds (test 90°/180° rotations) so affine can escape bad basins.
+  2. Better translation seeds (maybe fallback to crop offsets if centroid delta is huge).
+  3. Compare MI vs fusedCC performance once translation is stable; stick with the simpler metric unless MI demonstrably helps.
+  4. Decide whether greedy should stay disabled by default until we have tighter regularisation.
+
+## Environment Headline for Future Sessions
+
+> You are on WSL; **always activate `fireantsGH`** before running Python. Use `source activate fireantsGH >/dev/null 2>&1 && …` for every command. Parameter defaults live in `metadata/pipeline_defaults.yaml`; update them there, with comments, and keep logging verbose so we can audit runs later. We’re still iterating—favour simple, maintainable fixes over clever hacks, and don’t worry about legacy compatibility.

@@ -113,6 +113,16 @@ confocal_to_anatomy_registration:
   qc_subdir: qc  # Subdirectory storing QC figures.
   crop_to_extent: false  # Crop confocal XY extent to approximate anatomy coverage.
   crop_padding_um: 0  # Extra padding (µm) kept around the cropped confocal volume.
+  prematch:  # XY-MIP prematch heuristics to seed FireANTs.
+    enabled: true
+    mip_percentiles: [2.0, 99.5]
+    gaussian_sigma_px: 1.0
+    downsample_max_dim: 512
+    rotation_coarse_step_deg: 22.5
+    rotation_fine_step_deg: 1.5
+    rotation_fine_window_deg: 6.0
+    evaluate_opposite_flip: true
+    min_score: 0.2
   mask_margin_xy: .0  # Fraction or voxels trimmed laterally when masking.
   mask_margin_z: .0  # Fraction or voxels trimmed along Z when masking.
   mask_soft_edges: false  # Blend mask edges with a raised-cosine taper instead of a hard cutoff.

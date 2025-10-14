@@ -30,6 +30,7 @@ from ..preprocessing.two_photon import motion as motion_correction
 from ..registration import align_substack
 from ..registration.confocal_to_anatomy import register_confocal_to_anatomy
 from ..registration.functional_to_anatomy_ants import register_planes_pass1
+from ..registration.prematch import XYMIPPrematchSettings
 from ..registration.fireants_pipeline import (
     AffineSettings,
     FireANTsRegistrationConfig,
@@ -744,6 +745,8 @@ def process_confocal_to_anatomy_registration(
         float(z_spacing),
     ]
 
+    prematch_settings = XYMIPPrematchSettings.from_mapping(stage_cfg.prematch.model_dump())
+
     warped_channels: Dict[str, Path] = {}
     metadata_outputs: Dict[str, Any]
     if mode == StageMode.FORCE or not metadata_file.exists():
@@ -762,6 +765,7 @@ def process_confocal_to_anatomy_registration(
             config=fireants_config,
             voxel_spacing_um=preprocess_outputs.voxel_size_um,
             fixed_spacing_um=fixed_spacing_um,
+            prematch_settings=prematch_settings,
             warped_channel_template=stage_cfg.warped_channel_template,
             metadata_filename=stage_cfg.metadata_filename_template,
             transforms_subdir=stage_cfg.transforms_subdir,

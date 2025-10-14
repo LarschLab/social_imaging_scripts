@@ -283,6 +283,66 @@ class ConfocalPreprocessingConfig(BaseModel):
         return normalise_pathlike(value)
 
 
+class ConfocalPrematchConfig(BaseModel):
+    """XY MIP prematch heuristics prior to confocal→anatomy registration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable XY-MIP prematching to seed rotation/translation before FireANTs.",
+    )
+    mip_percentiles: tuple[float, float] = Field(
+        default=(2.0, 99.5),
+        description="Intensity percentiles used to clip/normalise MIPs before matching.",
+    )
+    gaussian_sigma_px: float = Field(
+        default=1.0,
+        description="Gaussian sigma (pixels) applied to both MIPs before matching.",
+        ge=0.0,
+    )
+    downsample_max_dim: int = Field(
+        default=512,
+        description="Maximum dimension for downsampled MIPs during matching.",
+        ge=64,
+    )
+    rotation_coarse_step_deg: float = Field(
+        default=22.5,
+        description="Coarse rotation step (degrees) explored during the initial sweep.",
+        gt=0.0,
+    )
+    rotation_fine_step_deg: float = Field(
+        default=1.5,
+        description="Fine rotation step (degrees) inside the refinement window.",
+        gt=0.0,
+    )
+    rotation_fine_window_deg: float = Field(
+        default=6.0,
+        description="Half-width (degrees) of the fine rotation search window.",
+        ge=0.0,
+    )
+    evaluate_opposite_flip: bool = Field(
+        default=True,
+        description="Evaluate the 180°-rotated solution to guard against LR symmetry.",
+    )
+    min_score: float = Field(
+        default=0.15,
+        description="Minimum NCC score required before applying the prematch seed.",
+        ge=0.0,
+        le=1.0,
+    )
+
+    @field_validator("mip_percentiles")
+    @classmethod
+    def _validate_percentiles(cls, value: tuple[float, float]):
+        if len(value) != 2:
+            raise ValueError("mip_percentiles must contain exactly two values.")
+        lower, upper = value
+        if not (0.0 <= lower < upper <= 100.0):
+            raise ValueError("mip_percentiles must satisfy 0 <= lower < upper <= 100.")
+        return (float(lower), float(upper))
+
+
 class FireantsRegistrationStageConfig(BaseModel):
     """Configuration for FireANTs anatomy registration stage."""
 
@@ -381,6 +441,10 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
     crop_padding_um: float = Field(
         default=0.0,
         description="Extra padding (µm) preserved around the cropped confocal volume.",
+    )
+    prematch: ConfocalPrematchConfig = Field(
+        default_factory=ConfocalPrematchConfig,
+        description="XY-MIP prematch settings applied before FireANTs.",
     )
     fireants: FireANTsRegistrationConfig = Field(
         ...,

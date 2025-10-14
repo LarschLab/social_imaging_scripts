@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
@@ -19,6 +20,11 @@ from .fireants_pipeline import (
     _import_fireants,
     _winsorize_image,
     _write_qc_figure,
+)
+from .prematch import (
+    XYMIPPrematchResult,
+    XYMIPPrematchSettings,
+    run_xy_mip_prematch,
 )
 
 
@@ -116,6 +122,71 @@ def _compute_extent_crop_slices(
     return (slice(None), slice(y0, y1), slice(x0, x1)), crop_info
 
 
+def _build_prematch_affine(
+    prematch: XYMIPPrematchResult,
+    moving_shape: tuple[int, int, int],
+    spacing: Tuple[float, float, float],
+) -> np.ndarray:
+    """Construct a 4x4 affine matrix from the prematch rotation/translation."""
+
+    theta = math.radians(float(prematch.rotation_deg))
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    rotation = np.eye(3, dtype=np.float64)
+    rotation[0, 0] = cos_t
+    rotation[0, 1] = -sin_t
+    rotation[1, 0] = sin_t
+    rotation[1, 1] = cos_t
+
+    center = np.array(
+        [
+            0.5 * (moving_shape[2] - 1) * spacing[0],
+            0.5 * (moving_shape[1] - 1) * spacing[1],
+            0.5 * (moving_shape[0] - 1) * spacing[2],
+        ],
+        dtype=np.float64,
+    )
+    translation = prematch.translation_um.astype(np.float64, copy=False)
+    total_translation = center - rotation @ center + translation
+
+    affine = np.eye(4, dtype=np.float64)
+    affine[:3, :3] = rotation
+    affine[:3, 3] = total_translation
+    return affine
+
+
+def _apply_prematch_to_affine(
+    affine_tensor: torch.Tensor,
+    prematch_matrix: np.ndarray,
+) -> torch.Tensor:
+    """Left-multiply the existing affine initialisation with the prematch matrix."""
+
+    if prematch_matrix.shape != (4, 4):
+        raise ValueError("prematch_matrix must be 4x4 in homogeneous coordinates")
+
+    arr = affine_tensor.detach().cpu().numpy()
+    squeeze = arr[0] if arr.ndim == 3 else arr
+
+    if squeeze.shape == (3, 4):
+        base = np.eye(4, dtype=np.float64)
+        base[:3, :3] = squeeze[:, :3]
+        base[:3, 3] = squeeze[:, 3]
+        combined = base @ prematch_matrix
+        updated = combined[:3, :]
+        out = torch.from_numpy(updated).to(device=affine_tensor.device, dtype=affine_tensor.dtype)
+        return out.unsqueeze(0)
+
+    if squeeze.shape == (4, 4):
+        combined = squeeze @ prematch_matrix
+        out = torch.from_numpy(combined).to(device=affine_tensor.device, dtype=affine_tensor.dtype)
+        if arr.ndim == 3:
+            return out.unsqueeze(0)
+        return out
+
+    logger.warning("Unexpected affine init shape %s; skipping prematch seed", tuple(squeeze.shape))
+    return affine_tensor
+
+
 def register_confocal_to_anatomy(
     *,
     animal_id: str,
@@ -128,6 +199,7 @@ def register_confocal_to_anatomy(
     config: FireANTsRegistrationConfig,
     voxel_spacing_um: Tuple[float, float, float],
     fixed_spacing_um: Tuple[float, float, float],
+    prematch_settings: Optional[XYMIPPrematchSettings] = None,
     warped_channel_template: str,
     metadata_filename: str,
     transforms_subdir: Path,
@@ -147,6 +219,7 @@ def register_confocal_to_anatomy(
     """Register a confocal channel to two-photon anatomy and warp additional channels."""
 
     cfg = copy.deepcopy(config)
+    prematch_settings = prematch_settings or XYMIPPrematchSettings()
 
     if cfg.device.startswith("cuda") and not torch.cuda.is_available():
         cfg.device = "cpu"
@@ -173,6 +246,7 @@ def register_confocal_to_anatomy(
     moving_array = tifffile.imread(moving_channel_path).astype(np.float32, copy=False)
     fixed_array = tifffile.imread(fixed_stack_path).astype(np.float32, copy=False)
     original_shape = moving_array.shape
+    spacing = tuple(float(s) for s in voxel_spacing_um)
 
     crop_slices = (slice(None), slice(None), slice(None))
     crop_info: dict[str, list[int]] | None = None
@@ -191,7 +265,39 @@ def register_confocal_to_anatomy(
             crop_padding_um,
         )
         moving_array = moving_array[crop_slices]
-    cropped_shape = moving_array.shape
+
+    prematch_result: Optional[XYMIPPrematchResult] = None
+    if prematch_settings.enabled:
+        try:
+            prematch_result = run_xy_mip_prematch(
+                moving_array,
+                fixed_array,
+                spacing,
+                fixed_spacing_um,
+                prematch_settings,
+            )
+            if prematch_result is None:
+                logger.warning("Prematch did not return a result; falling back to FireANTs moments init")
+            elif prematch_result.applied:
+                logger.info(
+                    (
+                        "Prematch seed accepted: θ=%.2f°, score=%.3f, translation=(%.1f, %.1f, %.1f) µm"
+                    ),
+                    prematch_result.rotation_deg,
+                    prematch_result.score,
+                    prematch_result.translation_um[0],
+                    prematch_result.translation_um[1],
+                    prematch_result.translation_um[2],
+                )
+            else:
+                logger.info(
+                    "Prematch score %.3f below threshold %.3f; ignoring prematch seed",
+                    prematch_result.score,
+                    prematch_settings.min_score,
+                )
+        except Exception:
+            logger.exception("Prematch heuristic failed; continuing without seed")
+            prematch_result = None
 
     moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
     fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
@@ -204,7 +310,6 @@ def register_confocal_to_anatomy(
     moving_array *= moving_mask
     fixed_array *= fixed_mask
 
-    spacing = tuple(float(s) for s in voxel_spacing_um)
     moving_image = _to_sitk_image(moving_array, spacing)
     fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
     dim = moving_image.GetDimension()
@@ -272,6 +377,19 @@ def register_confocal_to_anatomy(
     )
     moments.optimize()
     init_affine = moments.get_affine_init().detach()
+
+    prematch_affine_matrix: Optional[np.ndarray] = None
+    if prematch_result is not None and prematch_result.applied:
+        try:
+            prematch_affine_matrix = _build_prematch_affine(
+                prematch_result,
+                moving_array.shape,
+                spacing,
+            )
+            init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
+        except Exception:
+            logger.exception("Failed to apply prematch affine seed; continuing without it")
+            prematch_affine_matrix = None
 
     if translation_mode != "none" and np.linalg.norm(translation_vec) > 1e-6:
         logger.info(
@@ -450,6 +568,12 @@ def register_confocal_to_anatomy(
             "x_vox": (crop_info["x_vox"] if crop_info else None),
             "padding_um": float(crop_padding_um),
         },
+        "prematch": {
+            "enabled": bool(prematch_settings.enabled),
+            "settings": asdict(prematch_settings),
+            "result": prematch_result.to_metadata() if prematch_result else None,
+            "affine_matrix": prematch_affine_matrix.tolist() if prematch_affine_matrix is not None else None,
+        },
         "outputs": {
             "gcamp": str(gcamp_output),
             "warped_channels": {name: str(path) for name, path in warped_channels.items()},
@@ -478,4 +602,5 @@ def register_confocal_to_anatomy(
         "metadata": metadata_path,
         "qc": qc_path,
         "inverse_qc": inverse_summary,
+        "prematch": prematch_result.to_metadata() if prematch_result else None,
     }
