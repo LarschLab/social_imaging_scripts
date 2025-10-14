@@ -35,8 +35,9 @@
    - Flip horizontal + Z to match 2p orientation.
    - Record voxel spacing **and pixel counts** in metadata so later stages can compute physical extents.
 5. **Confocal→anatomy registration (FireANTs)**
+   - XY MIP prematch now enabled by default (`confocal_to_anatomy_registration.prematch`) to sweep coarse/fine rotations via NCC on downsampled MIPs and translate seeds; only applied if score ≥0.2.
    - Optional extent-based cropping (with padding), configurable masks (binary or raised-cosine soft edges), winsorisation, optional histogram matching.
-   - Affine stage can be seeded with translations derived from crop offsets or centroid differences. Greedy stage is optional; use cautiously.
+   - Affine stage can be seeded with prematch-derived rigid transform and additional translations from crop offsets or centroid differences. Greedy stage is optional; use cautiously.
    - Always log mask parameters, histogram settings, cropping window, and seeded translation.
 
 ## How we execute & test
@@ -61,12 +62,13 @@
 
 - We struggled with alignment drifting because heavy cropping + hard masks made MI/CC blind to translation.  
   - Mitigations so far: extent-aware cropping with optional padding, soft-edged masks, translation seeding (crop offsets or centroids).
+- Added XY MIP prematch (rotation/translation seed via NCC) that feeds FireANTs’ affine init; defaults live in `metadata/pipeline_defaults.yaml > confocal_to_anatomy_registration.prematch`. Keep an eye on logged scores (expect ~0.6 for clean pairs like L331_f01/L395_f06). If scores fall below threshold, FireANTs reverts to moments-only.
 - Greedy warps often degraded otherwise good affine alignments (producing “liquid” artefacts). Running affine-only or dialing down greedy (`optimizer_lr`, smoothing, iterations) yields more stable results.
 - Mutual information gave promising loss values but also aligned the stack poorly when masks were too symmetric. Soft masks or small margins restore reliable correlation at the cost of lower (but meaningful) loss magnitudes.
 - We’re still tuning these knobs. Open questions / TODOs:
-  1. Automated multiple rigid seeds (test 90°/180° rotations) so affine can escape bad basins.
-  2. Better translation seeds (maybe fallback to crop offsets if centroid delta is huge).
-  3. Compare MI vs fusedCC performance once translation is stable; stick with the simpler metric unless MI demonstrably helps.
+  1. Validate the prematch heuristic across more animals/rounds; decide if additional rotation angles or adaptive thresholds are needed.
+  2. Better translation fallbacks when prematch is rejected (e.g., crop-offset default or centroid delta guardrails).
+  3. Compare MI vs fusedCC performance once prematch stabilises translation; stick with fusedCC unless MI clearly helps.
   4. Decide whether greedy should stay disabled by default until we have tighter regularisation.
 
 ## Environment Headline for Future Sessions
