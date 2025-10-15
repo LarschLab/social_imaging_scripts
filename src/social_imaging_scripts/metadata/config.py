@@ -442,6 +442,10 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
         default=0.0,
         description="Extra padding (µm) preserved around the cropped confocal volume.",
     )
+    use_legacy_rotation_cropping: bool = Field(
+        default=False,
+        description="Use original hard-crop approach before registration (legacy mode).",
+    )
     prematch: ConfocalPrematchConfig = Field(
         default_factory=ConfocalPrematchConfig,
         description="XY-MIP prematch settings applied before FireANTs.",

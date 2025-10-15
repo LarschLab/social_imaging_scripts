@@ -94,6 +94,152 @@ def _load_manual_prematch_from_log(
         return None
 
 
+def _apply_rotation_to_volume_legacy(volume: np.ndarray, rotation_deg: float, order: int = 1) -> np.ndarray:
+    """Apply scipy rotation to volume (LEGACY approach for comparison).
+    
+    This pre-applies rotation before FireANTs, which breaks the transform chain
+    but was the old behavior for comparison purposes.
+    """
+    from scipy.ndimage import rotate
+    
+    if abs(rotation_deg) < 0.1:
+        return volume
+    
+    # Rotate each Z-slice around its center
+    rotated = np.zeros_like(volume)
+    for z in range(volume.shape[0]):
+        rotated[z] = rotate(
+            volume[z],
+            angle=rotation_deg,
+            reshape=False,
+            order=order,
+            mode='constant',
+            cval=0.0,
+        )
+    
+    return rotated
+
+
+def _build_fov_overlap_mask(
+    moving_shape: tuple[int, int, int],
+    fixed_shape: tuple[int, int, int],
+    moving_spacing: tuple[float, float, float],
+    fixed_spacing: tuple[float, float, float],
+    rotation_deg: float = 0.0,
+    translation_um: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    taper_um: float = 50.0,
+    margin_xy: float = 0.0,
+    margin_z: float = 0.0,
+) -> np.ndarray:
+    """Build mask that restricts registration to anatomy FOV in confocal space.
+    
+    This creates a soft-edged mask that:
+    1. Has weight=1.0 where anatomy FOV overlaps with confocal
+    2. Tapers to 0.0 over taper_um distance at boundaries
+    3. Accounts for rotation and translation from prematch
+    4. Prevents peripheral confocal regions from affecting registration
+    
+    Args:
+        moving_shape: Confocal shape (Z, Y, X) in voxels
+        fixed_shape: Anatomy shape (Z, Y, X) in voxels
+        moving_spacing: Confocal spacing (x, y, z) in micrometers
+        fixed_spacing: Anatomy spacing (x, y, z) in micrometers
+        rotation_deg: Expected rotation from prematch
+        translation_um: Expected translation (x, y, z) from prematch
+        taper_um: Width of soft taper zone at boundaries in micrometers
+        margin_xy: Additional margin to add/subtract in XY (fraction or voxels)
+        margin_z: Additional margin to add/subtract in Z (fraction or voxels)
+    
+    Returns:
+        Mask array with same shape as moving volume, values in [0, 1]
+    """
+    import math
+    
+    mz, my, mx = moving_shape
+    fz, fy, fx = fixed_shape
+    
+    # Fixed FOV extent in physical coordinates (micrometers)
+    fixed_extent_x = fx * fixed_spacing[0]
+    fixed_extent_y = fy * fixed_spacing[1]
+    fixed_extent_z = fz * fixed_spacing[2]
+    
+    # Apply margins to fixed extent
+    margin_x_vox = _margin_to_voxels(margin_xy, fx)
+    margin_y_vox = _margin_to_voxels(margin_xy, fy)
+    margin_z_vox = _margin_to_voxels(margin_z, fz)
+    
+    fixed_extent_x -= 2 * margin_x_vox * fixed_spacing[0]
+    fixed_extent_y -= 2 * margin_y_vox * fixed_spacing[1]
+    fixed_extent_z -= 2 * margin_z_vox * fixed_spacing[2]
+    
+    # Fixed FOV center in its own coordinates
+    fixed_center_x = (fx - 1) / 2.0 * fixed_spacing[0]
+    fixed_center_y = (fy - 1) / 2.0 * fixed_spacing[1]
+    fixed_center_z = (fz - 1) / 2.0 * fixed_spacing[2]
+    
+    # Moving FOV center
+    moving_center_x = (mx - 1) / 2.0 * moving_spacing[0]
+    moving_center_y = (my - 1) / 2.0 * moving_spacing[1]
+    moving_center_z = (mz - 1) / 2.0 * moving_spacing[2]
+    
+    # Create coordinate grids for moving volume (in micrometers)
+    x_coords = np.arange(mx, dtype=np.float32) * moving_spacing[0]
+    y_coords = np.arange(my, dtype=np.float32) * moving_spacing[1]
+    z_coords = np.arange(mz, dtype=np.float32) * moving_spacing[2]
+    
+    # Center coordinates on moving center
+    x_coords -= moving_center_x
+    y_coords -= moving_center_y
+    z_coords -= moving_center_z
+    
+    # Apply FORWARD transformation to see where moving voxels land in fixed frame
+    # Forward: fixed = R(moving) + T
+    theta = math.radians(rotation_deg)  # Forward rotation (not inverse)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    
+    # Build 3D coordinate grids
+    zz, yy, xx = np.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
+    
+    # Rotate XY coordinates (Z unchanged)
+    xx_rot = xx * cos_t - yy * sin_t
+    yy_rot = xx * sin_t + yy * cos_t
+    
+    # Apply forward translation
+    xx_rot += translation_um[0]
+    yy_rot += translation_um[1]
+    zz += translation_um[2]
+    
+    # Now xx_rot, yy_rot, zz are in "anatomy reference frame"
+    # Check if they fall within anatomy FOV extent
+    
+    # Distance from center of anatomy FOV
+    half_x = fixed_extent_x / 2.0
+    half_y = fixed_extent_y / 2.0
+    half_z = fixed_extent_z / 2.0
+    
+    # Compute distance outside boundary for each axis
+    dist_outside_x = np.maximum(0, np.abs(xx_rot) - half_x)
+    dist_outside_y = np.maximum(0, np.abs(yy_rot) - half_y)
+    dist_outside_z = np.maximum(0, np.abs(zz) - half_z)
+    
+    # Euclidean distance to nearest anatomy boundary
+    dist_outside = np.sqrt(dist_outside_x**2 + dist_outside_y**2 + dist_outside_z**2)
+    
+    # Build soft-edged mask using cosine taper
+    mask = np.ones_like(dist_outside)
+    if taper_um > 0:
+        taper_region = (dist_outside > 0) & (dist_outside < taper_um)
+        # Cosine taper: 1.0 at boundary, 0.0 at taper_um
+        taper_vals = 0.5 * (1.0 + np.cos(np.pi * dist_outside[taper_region] / taper_um))
+        mask[taper_region] = taper_vals
+        mask[dist_outside >= taper_um] = 0.0
+    else:
+        mask[dist_outside > 0] = 0.0
+    
+    return mask.astype(np.float32)
+
+
 def _manual_prematch_to_result(
     manual_prematch: Dict[str, float],
     moving_spacing_um: Tuple[float, float, float],
@@ -327,12 +473,15 @@ def register_confocal_to_anatomy(
     crop_padding_um: float,
     output_base_dir: Optional[Path] = None,
     processing_log_config = None,
+    use_legacy_rotation_cropping: bool = False,
 ) -> Dict[str, object]:
     """Register a confocal channel to two-photon anatomy and warp additional channels.
     
     Args:
         output_base_dir: Base output directory for loading manual prematch from processing log
         processing_log_config: ProcessingLogConfig from pipeline config for loading manual prematch
+        use_legacy_rotation_cropping: If True, use old approach (pre-rotate with scipy, then crop).
+                                       If False (default), seed prematch into FireANTs without pre-rotation.
         ... (other existing parameters)
     """
 
@@ -366,27 +515,13 @@ def register_confocal_to_anatomy(
     original_shape = moving_array.shape
     spacing = tuple(float(s) for s in voxel_spacing_um)
 
-    crop_slices = (slice(None), slice(None), slice(None))
-    crop_info: dict[str, list[int]] | None = None
-    if crop_to_extent:
-        crop_slices, crop_info = _compute_extent_crop_slices(
-            moving_array.shape,
-            voxel_spacing_um,
-            fixed_array.shape,
-            fixed_spacing_um,
-            crop_padding_um,
-        )
-        logger.info(
-            "Confocal cropping enabled; y:%s x:%s padding %.2f µm",
-            crop_info["y_vox"] if crop_info else None,
-            crop_info["x_vox"] if crop_info else None,
-            crop_padding_um,
-        )
-        moving_array = moving_array[crop_slices]
-
-    # Check for manual prematch from processing log first
+    # ============================================================================
+    # STEP 1: Calculate prematch on FULL (uncropped) images
+    # ============================================================================
     prematch_result: Optional[XYMIPPrematchResult] = None
     manual_prematch_data = None
+    
+    # Check for manual prematch from processing log first
     if output_base_dir is not None and processing_log_config is not None:
         manual_prematch_data = _load_manual_prematch_from_log(
             animal_id,
@@ -434,36 +569,127 @@ def register_confocal_to_anatomy(
             logger.exception("Prematch heuristic failed; continuing without seed")
             prematch_result = None
 
-    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
-    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
-    if np.any(moving_mask != 1.0) or np.any(fixed_mask != 1.0):
+    # ============================================================================
+    # STEP 2: Legacy cropping (for comparison) OR modern approach
+    # ============================================================================
+    crop_slices = (slice(None), slice(None), slice(None))
+    crop_info: dict[str, list[int]] | None = None
+    
+    if use_legacy_rotation_cropping and crop_to_extent:
+        # LEGACY PATH: Hard crop to anatomy extent (original working behavior)
+        # This was the approach before today's refactoring
+        crop_slices, crop_info = _compute_extent_crop_slices(
+            moving_array.shape,
+            voxel_spacing_um,
+            fixed_array.shape,
+            fixed_spacing_um,
+            crop_padding_um,
+        )
         logger.info(
-            "Applying central masks (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
+            "[LEGACY MODE] Cropping confocal: y:%s x:%s padding %.2f µm",
+            crop_info["y_vox"] if crop_info else None,
+            crop_info["x_vox"] if crop_info else None,
+            crop_padding_um,
+        )
+        moving_array = moving_array[crop_slices]
+        logger.info("[LEGACY MODE] Using original hard-crop approach (no pre-rotation)")
+    
+    # Modern approach: No cropping
+    # FOV masking code below (currently disabled)
+    if False and crop_to_extent and prematch_result is not None and prematch_result.applied:
+        # Use FOV-aware mask instead of hard cropping
+        logger.info("=" * 80)
+        logger.info("FOV OVERLAP MASKING (rotation-aware)")
+        logger.info("=" * 80)
+        logger.info("  Moving (confocal) shape: %s", moving_array.shape)
+        logger.info("  Moving spacing (µm): %.3f × %.3f × %.3f", spacing[0], spacing[1], spacing[2])
+        logger.info("  Fixed (anatomy) shape: %s", fixed_array.shape)
+        logger.info("  Fixed spacing (µm): %.3f × %.3f × %.3f", 
+                    fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2])
+        logger.info("  Prematch rotation: %.2f°", prematch_result.rotation_deg)
+        logger.info("  Prematch translation: (%.1f, %.1f) µm", 
+                    prematch_result.translation_um[0], prematch_result.translation_um[1])
+        logger.info("  Taper width: 50.0 µm")
+        logger.info("  Margin XY: %.3f, Margin Z: %.3f", mask_margin_xy, mask_margin_z)
+        
+        fov_mask = _build_fov_overlap_mask(
+            moving_array.shape,
+            fixed_array.shape,
+            spacing,
+            fixed_spacing_um,
+            rotation_deg=prematch_result.rotation_deg,
+            translation_um=tuple(prematch_result.translation_um),
+            taper_um=50.0,  # 50 µm soft edge
+            margin_xy=mask_margin_xy,
+            margin_z=mask_margin_z,
+        )
+        
+        # Report mask statistics
+        mask_zero = np.sum(fov_mask == 0.0)
+        mask_one = np.sum(fov_mask == 1.0)
+        mask_taper = np.sum((fov_mask > 0.0) & (fov_mask < 1.0))
+        mask_total = fov_mask.size
+        logger.info("  Mask statistics:")
+        logger.info("    - Fully masked (0.0): %d voxels (%.1f%%)", 
+                    mask_zero, 100.0 * mask_zero / mask_total)
+        logger.info("    - Fully included (1.0): %d voxels (%.1f%%)", 
+                    mask_one, 100.0 * mask_one / mask_total)
+        logger.info("    - Tapered (0.0-1.0): %d voxels (%.1f%%)", 
+                    mask_taper, 100.0 * mask_taper / mask_total)
+        logger.info("  Applying FOV overlap mask to moving volume")
+        logger.info("=" * 80)
+        
+        moving_array = moving_array * fov_mask
+        fov_mask_applied = True
+    elif False and crop_to_extent:
+        # No prematch available, use simple central crop (DISABLED - too aggressive)
+        logger.warning("crop_to_extent=True but no prematch available; using simple central mask")
+        simple_mask = _build_central_mask(
+            moving_array.shape, 
+            mask_margin_xy * 2,  # More aggressive without prematch
+            mask_margin_z * 2, 
+            mask_soft_edges
+        )
+        moving_array = moving_array * simple_mask
+        fov_mask_applied = True
+    else:
+        fov_mask_applied = False
+
+    # ============================================================================
+    # STEP 3: Apply central masks to both volumes
+    # ============================================================================
+    # Only apply central mask to moving if FOV mask wasn't already applied
+    if not fov_mask_applied:
+        moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+        if np.any(moving_mask != 1.0):
+            logger.info(
+                "Applying central mask to moving volume (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
+                mask_margin_xy,
+                mask_margin_z,
+            )
+            moving_array *= moving_mask
+    else:
+        logger.info("Skipping additional central mask for moving volume (FOV mask already applied)")
+        moving_mask = np.ones_like(moving_array)
+    
+    # Always apply central mask to fixed volume
+    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+    if np.any(fixed_mask != 1.0):
+        logger.info(
+            "Applying central mask to fixed volume (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
             mask_margin_xy,
             mask_margin_z,
         )
-    moving_array *= moving_mask
     fixed_array *= fixed_mask
 
     moving_image = _to_sitk_image(moving_array, spacing)
     fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
     dim = moving_image.GetDimension()
 
+    # No more "crop" mode since we use FOV masking instead of hard cropping
     translation_mode = (initial_translation_mode or "none").lower()
     translation_vec = np.zeros(3, dtype=np.float64)
-    if translation_mode == "crop" and crop_info is not None:
-        orig_center_x = (original_shape[2] - 1) / 2.0
-        orig_center_y = (original_shape[1] - 1) / 2.0
-        cropped_center_x = (crop_info["x_vox"][0] + crop_info["x_vox"][1] - 1) / 2.0
-        cropped_center_y = (crop_info["y_vox"][0] + crop_info["y_vox"][1] - 1) / 2.0
-        delta_x_vox = cropped_center_x - orig_center_x
-        delta_y_vox = cropped_center_y - orig_center_y
-        translation_vec = -np.array([
-            delta_x_vox * spacing[0],
-            delta_y_vox * spacing[1],
-            0.0,
-        ], dtype=np.float64)
-    elif translation_mode == "centroid":
+    if translation_mode == "centroid":
         moving_centroid = _compute_centroid(moving_array)
         fixed_centroid = _compute_centroid(fixed_array)
         delta_vox = np.array(
@@ -513,14 +739,21 @@ def register_confocal_to_anatomy(
     moments.optimize()
     init_affine = moments.get_affine_init().detach()
 
+    # ============================================================================
+    # STEP 5: Apply prematch to FireANTs initialization
+    # Both legacy and modern modes seed the FULL prematch (rotation + translation)
+    # ============================================================================
     prematch_affine_matrix: Optional[np.ndarray] = None
     if prematch_result is not None and prematch_result.applied:
         try:
-            prematch_affine_matrix = _build_prematch_affine(
-                prematch_result,
-                moving_array.shape,
-                spacing,
+            logger.info(
+                "Seeding FireANTs with full prematch (rotation + translation): "
+                "θ=%.2f°, Δx=%.3f µm, Δy=%.3f µm",
+                prematch_result.rotation_deg,
+                prematch_result.translation_um[0],
+                prematch_result.translation_um[1],
             )
+            prematch_affine_matrix = _build_prematch_affine(prematch_result, moving_array.shape, spacing)
             init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
         except Exception:
             logger.exception("Failed to apply prematch affine seed; continuing without it")
@@ -630,7 +863,12 @@ def register_confocal_to_anatomy(
 
     def _warp_additional_channel(name: str, channel_path: Path) -> Path:
         arr = tifffile.imread(channel_path).astype(np.float32, copy=False)
-        arr = arr[crop_slices]
+        
+        # Legacy mode: apply same cropping
+        if use_legacy_rotation_cropping and crop_info is not None:
+            arr = arr[crop_slices]
+        
+        # Check shape matches reference
         if arr.shape != moving_mask.shape:
             raise ValueError(
                 f"Additional channel {name} shape {arr.shape} does not match reference {moving_mask.shape}"
@@ -697,17 +935,16 @@ def register_confocal_to_anatomy(
             "mode": translation_mode,
             "vector_um": [float(translation_vec[0]), float(translation_vec[1]), float(translation_vec[2])],
         },
-        "cropping": {
+        "fov_masking": {
             "enabled": bool(crop_to_extent),
-            "y_vox": (crop_info["y_vox"] if crop_info else None),
-            "x_vox": (crop_info["x_vox"] if crop_info else None),
-            "padding_um": float(crop_padding_um),
+            "note": "FOV overlap mask applied instead of hard cropping to preserve dimensions",
         },
         "prematch": {
             "enabled": bool(prematch_settings.enabled),
             "settings": asdict(prematch_settings),
             "result": prematch_result.to_metadata() if prematch_result else None,
             "affine_matrix": prematch_affine_matrix.tolist() if prematch_affine_matrix is not None else None,
+            "note": "Full prematch (rotation + translation) seeded into FireANTs; rotation not pre-applied",
         },
         "outputs": {
             "gcamp": str(gcamp_output),

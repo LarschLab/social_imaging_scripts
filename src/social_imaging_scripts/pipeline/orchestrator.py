@@ -783,6 +783,7 @@ def process_confocal_to_anatomy_registration(
             crop_padding_um=stage_cfg.crop_padding_um,
             output_base_dir=Path(cfg.output_base_dir),
             processing_log_config=cfg.processing_log,
+            use_legacy_rotation_cropping=getattr(stage_cfg, 'use_legacy_rotation_cropping', False),
         )
         warped_channels = metadata_outputs.get("warped_channels", {})
     else:

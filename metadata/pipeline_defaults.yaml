@@ -113,6 +113,7 @@ confocal_to_anatomy_registration:
   qc_subdir: qc  # Subdirectory storing QC figures.
   crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
   crop_padding_um: 0  # Extra padding (µm) kept around the cropped confocal volume.
+  use_legacy_rotation_cropping: false  # Use original hard-crop approach (legacy mode) vs simplified mask-only (modern).
   prematch:  # XY-MIP prematch heuristics to seed FireANTs.
     enabled: false
     mip_percentiles: [2.0, 99.5]
