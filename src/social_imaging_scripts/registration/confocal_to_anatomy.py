@@ -8,7 +8,7 @@ import json
 import math
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import SimpleITK as sitk
@@ -27,8 +27,118 @@ from .prematch import (
     run_xy_mip_prematch,
 )
 
+if TYPE_CHECKING:
+    from ..pipeline.processing_log import (
+        build_processing_log_path,
+        load_processing_log,
+    )
+
 
 logger = logging.getLogger(__name__)
+
+
+def _load_manual_prematch_from_log(
+    animal_id: str,
+    session_id: str,
+    output_base_dir: Path,
+    processing_log_config,
+) -> Optional[Dict[str, float]]:
+    """Load manual prematch parameters from processing log if available.
+    
+    Args:
+        animal_id: Animal identifier
+        session_id: Confocal session identifier
+        output_base_dir: Base output directory (e.g., /mnt/f/johannes/pipelineOut)
+        processing_log_config: ProcessingLogConfig from pipeline config
+    
+    Returns:
+        Dictionary with translation_x_px, translation_y_px, rotation_deg if found, else None
+    """
+    try:
+        # Import here to avoid circular dependency
+        from ..pipeline.processing_log import (
+            build_processing_log_path,
+            load_processing_log,
+        )
+        
+        log_path = build_processing_log_path(
+            processing_log_config,
+            animal_id,
+            base_dir=output_base_dir,
+        )
+        
+        if not log_path.exists():
+            return None
+        
+        log = load_processing_log(log_path)
+        stage = log.stages.get("confocal_to_anatomy_registration")
+        
+        if not stage:
+            return None
+        
+        manual_prematch = stage.parameters.get("manual_prematch", {})
+        session_data = manual_prematch.get(session_id)
+        
+        if session_data:
+            logger.info(
+                "Loaded manual prematch from processing log: x=%.1f px, y=%.1f px, rot=%.1f°",
+                session_data.get("translation_x_px", 0.0),
+                session_data.get("translation_y_px", 0.0),
+                session_data.get("rotation_deg", 0.0),
+            )
+        
+        return session_data
+    
+    except Exception as e:
+        logger.warning("Could not load manual prematch from processing log: %s", e)
+        return None
+
+
+def _manual_prematch_to_result(
+    manual_prematch: Dict[str, float],
+    moving_spacing_um: Tuple[float, float, float],
+) -> XYMIPPrematchResult:
+    """Convert manual prematch pixel values to XYMIPPrematchResult.
+    
+    Args:
+        manual_prematch: Dict with translation_x_px, translation_y_px, rotation_deg
+        moving_spacing_um: Voxel spacing (x, y, z) in micrometers for the moving (confocal) stack
+    
+    Returns:
+        XYMIPPrematchResult with translation in micrometers
+    """
+    x_px = float(manual_prematch.get("translation_x_px", 0.0))
+    y_px = float(manual_prematch.get("translation_y_px", 0.0))
+    rotation_deg = float(manual_prematch.get("rotation_deg", 0.0))
+    
+    # Convert pixel translations to micrometers
+    # Note: manual GUI saves shifts in anatomy pixel space, but we need to convert to moving voxel space
+    # The translation_vox is in (x, y, z) order, matching moving stack coordinates
+    translation_vox = np.array([x_px, y_px, 0.0], dtype=np.float64)
+    
+    # Convert to physical units using moving stack spacing
+    translation_um = np.array([
+        translation_vox[0] * moving_spacing_um[0],
+        translation_vox[1] * moving_spacing_um[1],
+        0.0,
+    ], dtype=np.float64)
+    
+    # Create a result that looks like it came from automated prematch
+    result = XYMIPPrematchResult(
+        rotation_deg=rotation_deg,
+        translation_vox=translation_vox,
+        translation_um=translation_um,
+        score=1.0,  # Manual prematch is assumed perfect
+        delta_pixels=np.array([y_px, x_px], dtype=np.float64),
+        matched_centre_pixels=np.array([0.0, 0.0], dtype=np.float64),
+        peak_index=(0, 0),
+        downsample_scale=1.0,
+        resample_factors=(1.0, 1.0),
+        angle_records=[{"angle_deg": rotation_deg, "score": 1.0}],
+        applied=True,
+    )
+    
+    return result
 
 
 def _to_sitk_image(array: np.ndarray, spacing: Tuple[float, float, float]) -> sitk.Image:
@@ -215,8 +325,16 @@ def register_confocal_to_anatomy(
     initial_translation_mode: str,
     crop_to_extent: bool,
     crop_padding_um: float,
+    output_base_dir: Optional[Path] = None,
+    processing_log_config = None,
 ) -> Dict[str, object]:
-    """Register a confocal channel to two-photon anatomy and warp additional channels."""
+    """Register a confocal channel to two-photon anatomy and warp additional channels.
+    
+    Args:
+        output_base_dir: Base output directory for loading manual prematch from processing log
+        processing_log_config: ProcessingLogConfig from pipeline config for loading manual prematch
+        ... (other existing parameters)
+    """
 
     cfg = copy.deepcopy(config)
     prematch_settings = prematch_settings or XYMIPPrematchSettings()
@@ -266,8 +384,25 @@ def register_confocal_to_anatomy(
         )
         moving_array = moving_array[crop_slices]
 
+    # Check for manual prematch from processing log first
     prematch_result: Optional[XYMIPPrematchResult] = None
-    if prematch_settings.enabled:
+    manual_prematch_data = None
+    if output_base_dir is not None and processing_log_config is not None:
+        manual_prematch_data = _load_manual_prematch_from_log(
+            animal_id,
+            confocal_session_id,
+            output_base_dir,
+            processing_log_config,
+        )
+        if manual_prematch_data:
+            logger.info("Using manual prematch from processing log (overrides automated prematch)")
+            prematch_result = _manual_prematch_to_result(
+                manual_prematch_data,
+                spacing,
+            )
+    
+    # Fall back to automated prematch if no manual prematch found
+    if prematch_result is None and prematch_settings.enabled:
         try:
             prematch_result = run_xy_mip_prematch(
                 moving_array,
@@ -281,7 +416,7 @@ def register_confocal_to_anatomy(
             elif prematch_result.applied:
                 logger.info(
                     (
-                        "Prematch seed accepted: θ=%.2f°, score=%.3f, translation=(%.1f, %.1f, %.1f) µm"
+                        "Automated prematch seed accepted: θ=%.2f°, score=%.3f, translation=(%.1f, %.1f, %.1f) µm"
                     ),
                     prematch_result.rotation_deg,
                     prematch_result.score,

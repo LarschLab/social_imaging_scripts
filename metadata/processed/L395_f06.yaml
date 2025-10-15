@@ -1,0 +1,26 @@
+animal_id: L395_f06
+pipeline_version:
+last_updated: '2025-10-15T20:38:26.017146Z'
+stages:
+  confocal_to_anatomy_registration:
+    status: success
+    run_id:
+    started_at:
+    completed_at:
+    parameters:
+      manual_prematch:
+        L395_f06_confocal_round1_2025-07-03:
+          translation_x_px: 0.0
+          translation_y_px: -28.0
+          rotation_deg: 54.0
+          created_at: '2025-10-15T20:37:30.349570+00:00'
+          method: manual_gui
+        L395_f06_confocal_roundn_2025-07-03:
+          translation_x_px: 21.0
+          translation_y_px: 0.0
+          rotation_deg: 59.0
+          created_at: '2025-10-15T20:38:26.017126+00:00'
+          method: manual_gui
+    inputs: {}
+    outputs: {}
+    notes:

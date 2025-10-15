@@ -1,0 +1,26 @@
+animal_id: L331_f01
+pipeline_version:
+last_updated: '2025-10-15T20:36:11.729198Z'
+stages:
+  confocal_to_anatomy_registration:
+    status: success
+    run_id:
+    started_at:
+    completed_at:
+    parameters:
+      manual_prematch:
+        L331_f01_confocal_round1_2025-05-20:
+          translation_x_px: -23.0
+          translation_y_px: -51.0
+          rotation_deg: 0.0
+          created_at: '2025-10-15T20:23:39.611021+00:00'
+          method: manual_gui
+        L331_f01_confocal_roundn_2025-05-20:
+          translation_x_px: -7.999999999999886
+          translation_y_px: 8.0
+          rotation_deg: 0.0
+          created_at: '2025-10-15T20:36:11.729183+00:00'
+          method: manual_gui
+    inputs: {}
+    outputs: {}
+    notes:
