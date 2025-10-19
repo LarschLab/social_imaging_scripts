@@ -61,7 +61,7 @@ sessions:
     date: '2025-05-20'
     condition: fixed
     experimenter: Matilde
-    include_in_analysis: true
+    include_in_analysis: false
     image_quality: unknown
     notes: 'Markers: sst11, pth2'
     session_type: anatomy_stack

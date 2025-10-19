@@ -781,6 +781,7 @@ def process_confocal_to_anatomy_registration(
             initial_translation_mode=stage_cfg.initial_translation_mode,
             crop_to_extent=stage_cfg.crop_to_extent,
             crop_padding_um=stage_cfg.crop_padding_um,
+            blur_fixed_z_sigma=stage_cfg.blur_fixed_z_sigma,
             output_base_dir=Path(cfg.output_base_dir),
             processing_log_config=cfg.processing_log,
         )

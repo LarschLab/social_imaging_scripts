@@ -552,9 +552,20 @@ def _write_qc_figure(
     middle_plane: Optional[int],
     figsize: tuple[int, int],
 ) -> None:
-    z_max = reference.shape[0]
-    index = middle_plane if middle_plane is not None else z_max // 2
-    index = int(np.clip(index, 0, z_max - 1))
+    # Calculate middle plane index for each volume independently
+    ref_z = reference.shape[0]
+    moving_z = moving.shape[0]
+    warped_z = warped.shape[0]
+    
+    # Use the middle plane if specified, otherwise use 50% through each volume
+    if middle_plane is not None:
+        ref_index = int(np.clip(middle_plane, 0, ref_z - 1))
+        moving_index = int(np.clip(middle_plane, 0, moving_z - 1))
+        warped_index = int(np.clip(middle_plane, 0, warped_z - 1))
+    else:
+        ref_index = ref_z // 2
+        moving_index = moving_z // 2
+        warped_index = warped_z // 2
 
     def _norm(slice_2d: np.ndarray) -> np.ndarray:
         lo, hi = np.percentile(slice_2d, percentiles)
@@ -564,12 +575,12 @@ def _write_qc_figure(
         return out
 
     fig, axes = plt.subplots(1, 3, figsize=figsize)
-    axes[0].imshow(_norm(reference[index]), cmap="gray")
-    axes[0].set_title("Reference")
-    axes[1].imshow(_norm(moving[index]), cmap="gray")
-    axes[1].set_title("Moving (pre)")
-    axes[2].imshow(_norm(warped[index]), cmap="gray")
-    axes[2].set_title("Warpped (post)")
+    axes[0].imshow(_norm(reference[ref_index]), cmap="gray")
+    axes[0].set_title(f"Reference (z={ref_index}/{ref_z})")
+    axes[1].imshow(_norm(moving[moving_index]), cmap="gray")
+    axes[1].set_title(f"Moving (z={moving_index}/{moving_z})")
+    axes[2].imshow(_norm(warped[warped_index]), cmap="gray")
+    axes[2].set_title(f"Warped (z={warped_index}/{warped_z})")
     for ax in axes:
         ax.axis("off")
     fig.tight_layout()

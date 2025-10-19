@@ -325,6 +325,7 @@ def register_confocal_to_anatomy(
     initial_translation_mode: str,
     crop_to_extent: bool,
     crop_padding_um: float,
+    blur_fixed_z_sigma: float = 0.0,
     output_base_dir: Optional[Path] = None,
     processing_log_config = None,
 ) -> Dict[str, object]:
@@ -445,6 +446,12 @@ def register_confocal_to_anatomy(
     moving_array *= moving_mask
     fixed_array *= fixed_mask
 
+    # Apply Z-blur to fixed image (2P anatomy) to match confocal PSF
+    if blur_fixed_z_sigma > 0:
+        from scipy.ndimage import gaussian_filter1d
+        logger.info("Blurring fixed (2P anatomy) in Z with sigma=%.2f voxels to match confocal PSF", blur_fixed_z_sigma)
+        fixed_array = gaussian_filter1d(fixed_array, sigma=blur_fixed_z_sigma, axis=0)
+
     moving_image = _to_sitk_image(moving_array, spacing)
     fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
     dim = moving_image.GetDimension()
@@ -505,14 +512,10 @@ def register_confocal_to_anatomy(
     moving_batch = BatchedImages(moving_fa)
     fixed_batch = BatchedImages(fixed_fa)
 
-    moments = MomentsRegistration(
-        scale=cfg.moments_scale,
-        fixed_images=fixed_batch,
-        moving_images=moving_batch,
-    )
-    moments.optimize()
-    init_affine = moments.get_affine_init().detach()
-
+    # Initialize with identity affine (no moments registration for confocal->anatomy)
+    # Manual prematch always provides the initial alignment
+    init_affine = torch.eye(3, 4, device=cfg.device, dtype=torch.float32).unsqueeze(0)
+    
     prematch_affine_matrix: Optional[np.ndarray] = None
     if prematch_result is not None and prematch_result.applied:
         try:
@@ -522,9 +525,17 @@ def register_confocal_to_anatomy(
                 spacing,
             )
             init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
+            logger.info(
+                "Initialized affine from manual prematch (rotation=%.1f°, translation=[%.1f, %.1f] px)",
+                prematch_result.rotation_deg,
+                prematch_result.translation_um[0] / spacing[0],
+                prematch_result.translation_um[1] / spacing[1],
+            )
         except Exception:
             logger.exception("Failed to apply prematch affine seed; continuing without it")
             prematch_affine_matrix = None
+    else:
+        logger.warning("No manual prematch available - starting from identity transform")
 
     if translation_mode != "none" and np.linalg.norm(translation_vec) > 1e-6:
         logger.info(

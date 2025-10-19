@@ -442,6 +442,10 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
         default=0.0,
         description="Extra padding (µm) preserved around the cropped confocal volume.",
     )
+    blur_fixed_z_sigma: float = Field(
+        default=0.0,
+        description="Gaussian blur sigma (in voxels) applied to fixed (2P anatomy) in Z to match confocal PSF. Set to 0 to disable.",
+    )
     prematch: ConfocalPrematchConfig = Field(
         default_factory=ConfocalPrematchConfig,
         description="XY-MIP prematch settings applied before FireANTs.",
