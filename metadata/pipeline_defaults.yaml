@@ -113,7 +113,7 @@ confocal_to_anatomy_registration:
   qc_subdir: qc  # Subdirectory storing QC figures.
   crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
   crop_padding_um: 0  # Extra padding (µm) kept around the cropped confocal volume.
-  blur_fixed_z_sigma: 8.0  # Gaussian blur sigma (voxels) applied to 2P anatomy in Z to match confocal PSF (0=disabled).
+  blur_fixed_z_sigma: 4.0  # Gaussian blur sigma (voxels) applied to 2P anatomy in Z to match confocal PSF (0=disabled).
   prematch:  # XY-MIP prematch heuristics to seed FireANTs.
     enabled: false
     mip_percentiles: [2.0, 99.5]

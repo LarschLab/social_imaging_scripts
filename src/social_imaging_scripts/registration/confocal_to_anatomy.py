@@ -96,13 +96,14 @@ def _load_manual_prematch_from_log(
 
 def _manual_prematch_to_result(
     manual_prematch: Dict[str, float],
-    moving_spacing_um: Tuple[float, float, float],
+    fixed_spacing_um: Tuple[float, float, float],
 ) -> XYMIPPrematchResult:
     """Convert manual prematch pixel values to XYMIPPrematchResult.
     
     Args:
         manual_prematch: Dict with translation_x_px, translation_y_px, rotation_deg
-        moving_spacing_um: Voxel spacing (x, y, z) in micrometers for the moving (confocal) stack
+        fixed_spacing_um: Voxel spacing (x, y, z) in micrometers for the fixed (anatomy) stack
+            The GUI operates in anatomy pixel space since confocal is rescaled to match.
     
     Returns:
         XYMIPPrematchResult with translation in micrometers
@@ -112,21 +113,21 @@ def _manual_prematch_to_result(
     rotation_deg = float(manual_prematch.get("rotation_deg", 0.0))
     
     # Convert pixel translations to micrometers
-    # Note: manual GUI saves shifts in anatomy pixel space, but we need to convert to moving voxel space
-    # The translation_vox is in (x, y, z) order, matching moving stack coordinates
-    translation_vox = np.array([x_px, y_px, 0.0], dtype=np.float64)
+    # The GUI saves shifts in ANATOMY (fixed) pixel space since confocal is rescaled to match
+    # We convert these to physical units using anatomy spacing
+    translation_vox_anatomy = np.array([x_px, y_px, 0.0], dtype=np.float64)
     
-    # Convert to physical units using moving stack spacing
+    # Convert to physical units using anatomy (fixed) stack spacing
     translation_um = np.array([
-        translation_vox[0] * moving_spacing_um[0],
-        translation_vox[1] * moving_spacing_um[1],
+        translation_vox_anatomy[0] * fixed_spacing_um[0],
+        translation_vox_anatomy[1] * fixed_spacing_um[1],
         0.0,
     ], dtype=np.float64)
     
     # Create a result that looks like it came from automated prematch
     result = XYMIPPrematchResult(
         rotation_deg=rotation_deg,
-        translation_vox=translation_vox,
+        translation_vox=translation_vox_anatomy,  # These are in anatomy voxel space
         translation_um=translation_um,
         score=1.0,  # Manual prematch is assumed perfect
         delta_pixels=np.array([y_px, x_px], dtype=np.float64),
@@ -233,13 +234,19 @@ def _compute_extent_crop_slices(
 
 
 def _build_prematch_affine(
-    prematch: XYMIPPrematchResult,
-    moving_shape: tuple[int, int, int],
+    prematch: PreMatch,
+    moving_shape: Tuple[int, int, int],
     spacing: Tuple[float, float, float],
 ) -> np.ndarray:
     """Construct a 4x4 affine matrix from the prematch rotation/translation."""
 
-    theta = math.radians(float(prematch.rotation_deg))
+    # IMPORTANT: There's a coordinate system difference between GUI and FireANTs.
+    # The +90° offset is needed for the rotation to look correct, but this means
+    # the translation vector also needs special handling.
+    # 
+    # The GUI shows rotation angle θ, but we need to apply θ+90° for correct orientation.
+    # This might be due to axis flipping or CCW vs CW convention differences.
+    theta = math.radians(float(prematch.rotation_deg) + 90.0)  # +90° offset needed
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
     rotation = np.eye(3, dtype=np.float64)
@@ -256,8 +263,21 @@ def _build_prematch_affine(
         ],
         dtype=np.float64,
     )
-    translation = prematch.translation_um.astype(np.float64, copy=False)
+    
+    # Translation from GUI: trying [x, -y] based on QC plot observation
+    # (top-left shift suggests we need opposite signs from [-x, y])
+    translation_gui = prematch.translation_um.astype(np.float64, copy=False)
+    translation = np.array([translation_gui[0], -translation_gui[1], 0.0], dtype=np.float64)
+    
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Prematch translation transform: GUI [%.2f, %.2f] -> Physical [%.2f, %.2f]",
+                translation_gui[0], translation_gui[1], translation[0], translation[1])
+    
     total_translation = center - rotation @ center + translation
+    
+    logger.info("Total translation after rotation around center: [%.2f, %.2f, %.2f]",
+                total_translation[0], total_translation[1], total_translation[2])
 
     affine = np.eye(4, dtype=np.float64)
     affine[:3, :3] = rotation
@@ -366,6 +386,14 @@ def register_confocal_to_anatomy(
     fixed_array = tifffile.imread(fixed_stack_path).astype(np.float32, copy=False)
     original_shape = moving_array.shape
     spacing = tuple(float(s) for s in voxel_spacing_um)
+    
+    logger.info(
+        "Loaded volumes: confocal %s (spacing: %.2f, %.2f, %.2f µm), anatomy %s (spacing: %.2f, %.2f, %.2f µm)",
+        moving_array.shape,
+        spacing[0], spacing[1], spacing[2],
+        fixed_array.shape,
+        fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2],
+    )
 
     crop_slices = (slice(None), slice(None), slice(None))
     crop_info: dict[str, list[int]] | None = None
@@ -384,6 +412,7 @@ def register_confocal_to_anatomy(
             crop_padding_um,
         )
         moving_array = moving_array[crop_slices]
+        logger.info("After cropping: confocal shape %s", moving_array.shape)
 
     # Check for manual prematch from processing log first
     prematch_result: Optional[XYMIPPrematchResult] = None
@@ -399,7 +428,7 @@ def register_confocal_to_anatomy(
             logger.info("Using manual prematch from processing log (overrides automated prematch)")
             prematch_result = _manual_prematch_to_result(
                 manual_prematch_data,
-                spacing,
+                fixed_spacing_um,  # GUI operates in anatomy pixel space
             )
     
     # Fall back to automated prematch if no manual prematch found
@@ -512,30 +541,54 @@ def register_confocal_to_anatomy(
     moving_batch = BatchedImages(moving_fa)
     fixed_batch = BatchedImages(fixed_fa)
 
-    # Initialize with identity affine (no moments registration for confocal->anatomy)
-    # Manual prematch always provides the initial alignment
+    # Initialize with manual prematch if available, otherwise use moments
+    prematch_affine_matrix: Optional[np.ndarray] = None
     init_affine = torch.eye(3, 4, device=cfg.device, dtype=torch.float32).unsqueeze(0)
     
-    prematch_affine_matrix: Optional[np.ndarray] = None
     if prematch_result is not None and prematch_result.applied:
-        try:
-            prematch_affine_matrix = _build_prematch_affine(
-                prematch_result,
-                moving_array.shape,
-                spacing,
-            )
-            init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
-            logger.info(
-                "Initialized affine from manual prematch (rotation=%.1f°, translation=[%.1f, %.1f] px)",
-                prematch_result.rotation_deg,
-                prematch_result.translation_um[0] / spacing[0],
-                prematch_result.translation_um[1] / spacing[1],
-            )
-        except Exception:
-            logger.exception("Failed to apply prematch affine seed; continuing without it")
-            prematch_affine_matrix = None
+        # Build prematch affine (XY rotation + XY translation, Z=0)
+        prematch_affine_matrix = _build_prematch_affine(
+            prematch_result,
+            moving_array.shape,
+            spacing,
+        )
+        # Apply prematch to identity - this gives us the XY alignment from the GUI
+        init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
+        logger.info(
+            "Applied manual prematch (rotation=%.1f°, translation=[%.1f, %.1f] px)",
+            prematch_result.rotation_deg,
+            prematch_result.translation_um[0] / spacing[0],
+            prematch_result.translation_um[1] / spacing[1],
+        )
+        
+        # Add geometric Z-centering to align volume centers in Z
+        # This is important for zoomed confocal stacks that only cover a thin slice
+        fixed_shape = fixed_fa.array.shape
+        moving_shape = moving_fa.array.shape
+        
+        # Arrays are (Z, Y, X) but spacing is (X, Y, Z), so use index [2] for Z
+        fixed_z_center = 0.5 * (fixed_shape[-3] - 1) * fixed_spacing_um[2]
+        moving_z_center = 0.5 * (moving_shape[-3] - 1) * spacing[2]
+        z_offset = fixed_z_center - moving_z_center
+        init_affine[0, 2, 3] += z_offset
+        logger.info(
+            "Geometric Z-centering: fixed_center=%.1f µm (%d slices), moving_center=%.1f µm (%d slices), offset=%.1f µm",
+            fixed_z_center,
+            fixed_shape[-3],
+            moving_z_center,
+            moving_shape[-3],
+            z_offset,
+        )
     else:
-        logger.warning("No manual prematch available - starting from identity transform")
+        # No prematch - fall back to standard moments initialization
+        logger.warning("No manual prematch available - using full moments initialization")
+        moments = MomentsRegistration(
+            scale=cfg.moments_scale,
+            fixed_images=fixed_batch,
+            moving_images=moving_batch,
+        )
+        moments.optimize()
+        init_affine = moments.get_affine_init().detach()
 
     if translation_mode != "none" and np.linalg.norm(translation_vec) > 1e-6:
         logger.info(
@@ -562,6 +615,169 @@ def register_confocal_to_anatomy(
                 "Unexpected affine init shape %s; skipping translation seed.",
                 tuple(init_affine.shape),
             )
+
+    # Generate initialization QC plot (prematch + Z-centering applied)
+    try:
+        import matplotlib.pyplot as plt
+        from scipy.ndimage import affine_transform
+        
+        # Convert torch affine to numpy and extract the 3x4 matrix
+        init_affine_np = init_affine[0].cpu().numpy()  # (3, 4) [x, y, z] in physical coords
+        
+        logger.info("Init affine matrix for QC:\n%s", init_affine_np)
+        
+        # FireANTs affine works in physical coordinates (micrometers)
+        # We need to convert to voxel coordinates for scipy
+        # Transform: voxel_fixed = M_vox @ voxel_moving + t_vox
+        # Where: M_vox = S_fixed^-1 @ M_phys @ S_moving
+        #        t_vox = S_fixed^-1 @ t_phys
+        
+        # Build spacing scaling matrices (diagonal)
+        S_moving = np.diag([spacing[0], spacing[1], spacing[2]])  # (X, Y, Z) spacing
+        S_fixed = np.diag([fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]])
+        S_fixed_inv = np.diag([1.0/fixed_spacing_um[0], 1.0/fixed_spacing_um[1], 1.0/fixed_spacing_um[2]])
+        
+        # Extract physical space transform
+        M_phys = init_affine_np[:, :3]  # (3, 3)
+        t_phys = init_affine_np[:, 3]   # (3,)
+        
+        # Convert to voxel space (still in XYZ ordering)
+        M_vox_xyz = S_fixed_inv @ M_phys @ S_moving
+        t_vox_xyz = S_fixed_inv @ t_phys
+        
+        logger.info("Voxel space transform (XYZ): M_vox=\n%s\nt_vox=%s", M_vox_xyz, t_vox_xyz)
+        
+        # Scipy's affine_transform uses arrays in ZYX order
+        # For a point p_in in input coords, output point p_out:
+        # p_in = M_inv @ p_out + offset
+        # We have: p_out = M @ p_in + t (in XYZ coords)
+        # So: p_in = M^-1 @ (p_out - t) = M^-1 @ p_out - M^-1 @ t
+        
+        # First, convert coordinates from XYZ to ZYX ordering
+        # For arrays: (z, y, x) indices correspond to (coords[2], coords[1], coords[0]) in XYZ space
+        # So we need to reorder: [z, y, x] -> [x, y, z] before applying M, then [x, y, z] -> [z, y, x]
+        
+        # Permutation from ZYX array indices to XYZ: P_to_xyz
+        # Permutation from XYZ back to ZYX: P_from_xyz  
+        # Combined: M_zyx = P_from_xyz @ M_xyz @ P_to_xyz = P_from_xyz @ M_xyz @ P_from_xyz^T
+        
+        # P matrix: reorders [z,y,x] -> [x,y,z], which is indices [0,1,2] -> [2,1,0]
+        # As a matrix that acts on coordinates: swap first and last
+        P_zyx_to_xyz = np.array([[0, 0, 1],   # x = old z
+                                  [0, 1, 0],   # y = old y  
+                                  [1, 0, 0]],  # z = old x
+                                 dtype=np.float32)
+        
+        # Transform in ZYX coordinates
+        M_vox_zyx = P_zyx_to_xyz.T @ M_vox_xyz @ P_zyx_to_xyz
+        t_vox_zyx = P_zyx_to_xyz.T @ t_vox_xyz
+        
+        # Scipy uses the INVERSE transform (maps output coords to input coords)
+        M_inv = np.linalg.inv(M_vox_zyx)
+        t_inv = -M_inv @ t_vox_zyx
+        
+        logger.info("Scipy inverse transform (ZYX): M_inv=\n%s\nt_inv=%s", M_inv, t_inv)
+        
+        # Apply transform to moving array
+        moving_init_np = affine_transform(
+            moving_array,
+            M_inv,
+            offset=t_inv,
+            output_shape=fixed_array.shape,
+            order=1,  # linear interpolation
+            mode='constant',
+            cval=0.0
+        )
+        
+        # Debug: check transformed data
+        logger.info(
+            "Transformed confocal: shape=%s, min=%.2f, max=%.2f, mean=%.2f, non-zero voxels=%d/%d",
+            moving_init_np.shape,
+            moving_init_np.min(),
+            moving_init_np.max(),
+            moving_init_np.mean(),
+            np.count_nonzero(moving_init_np),
+            moving_init_np.size
+        )
+        
+        # Convert fixed to numpy for plotting
+        fixed_np = fixed_array  # Already numpy
+        
+        # Create orthogonal view overlay
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(f"Initialization QC: {animal_id} {confocal_session_id}\n(Prematch + Z-centering applied, before optimization)", fontsize=14)
+        
+        # Get middle slices - use anatomy center for overlays, confocal center for confocal-only panels
+        z_mid = fixed_np.shape[0] // 2
+        y_mid = fixed_np.shape[1] // 2
+        x_mid = fixed_np.shape[2] // 2
+        
+        # Find where confocal data actually is (for better visualization in confocal-only panels)
+        nonzero_mask = moving_init_np > 0
+        if np.any(nonzero_mask):
+            nz_coords = np.nonzero(nonzero_mask)
+            conf_z_mid = int((nz_coords[0].min() + nz_coords[0].max()) / 2)
+            conf_y_mid = int((nz_coords[1].min() + nz_coords[1].max()) / 2)
+            conf_x_mid = int((nz_coords[2].min() + nz_coords[2].max()) / 2)
+        else:
+            conf_z_mid, conf_y_mid, conf_x_mid = z_mid, y_mid, x_mid
+        
+        # Normalize for display
+        def normalize(arr):
+            arr = arr.copy()
+            # Skip normalization if array is all zeros or has no range
+            if arr.max() - arr.min() < 1e-6:
+                return np.zeros_like(arr)
+            p1, p99 = np.percentile(arr, [1, 99])
+            if p99 - p1 < 1e-6:
+                # If percentile range is tiny, use min/max
+                p1, p99 = arr.min(), arr.max()
+            arr = np.clip(arr, p1, p99)
+            arr = (arr - p1) / (p99 - p1 + 1e-8)
+            return arr
+        
+        # XY plane (Z slice)
+        axes[0, 0].imshow(normalize(fixed_np[z_mid]), cmap='gray', alpha=0.7)
+        axes[0, 0].imshow(normalize(moving_init_np[z_mid]), cmap='hot', alpha=0.3)
+        axes[0, 0].set_title(f'XY plane (Z={z_mid}/{fixed_np.shape[0]})')
+        axes[0, 0].axis('off')
+        
+        axes[1, 0].imshow(normalize(fixed_np[z_mid]), cmap='gray')
+        axes[1, 0].set_title('Anatomy only (XY)')
+        axes[1, 0].axis('off')
+        
+        # XZ plane (Y slice)
+        axes[0, 1].imshow(normalize(fixed_np[:, y_mid, :]), cmap='gray', alpha=0.7, aspect='auto')
+        axes[0, 1].imshow(normalize(moving_init_np[:, y_mid, :]), cmap='hot', alpha=0.3, aspect='auto')
+        axes[0, 1].set_title(f'XZ plane (Y={y_mid}/{fixed_np.shape[1]})')
+        axes[0, 1].axis('off')
+        
+        axes[1, 1].imshow(normalize(moving_init_np[:, conf_y_mid, :]), cmap='hot', aspect='auto')
+        axes[1, 1].set_title(f'Confocal only (XZ, Y={conf_y_mid})')
+        axes[1, 1].axis('off')
+        
+        # YZ plane (X slice)
+        axes[0, 2].imshow(normalize(fixed_np[:, :, x_mid]), cmap='gray', alpha=0.7, aspect='auto')
+        axes[0, 2].imshow(normalize(moving_init_np[:, :, x_mid]), cmap='hot', alpha=0.3, aspect='auto')
+        axes[0, 2].set_title(f'YZ plane (X={x_mid}/{fixed_np.shape[2]})')
+        axes[0, 2].axis('off')
+        
+        axes[1, 2].imshow(normalize(moving_init_np[:, :, conf_x_mid]), cmap='hot', aspect='auto')
+        axes[1, 2].set_title(f'Confocal only (YZ, X={conf_x_mid})')
+        axes[1, 2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save QC plot
+        qc_dir = output_root / qc_subdir
+        qc_dir.mkdir(exist_ok=True, parents=True)
+        init_qc_path = qc_dir / f"{animal_id}_{confocal_session_id}_init_qc.png"
+        plt.savefig(init_qc_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved initialization QC plot to {init_qc_path}")
+        
+    except Exception as e:
+        logger.warning(f"Failed to generate initialization QC plot: {e}")
 
     affine = AffineRegistration(
         list(cfg.affine.scales),
