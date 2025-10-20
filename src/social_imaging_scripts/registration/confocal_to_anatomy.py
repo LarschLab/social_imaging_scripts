@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections import defaultdict
 import logging
 import json
 import math
@@ -35,6 +36,46 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+def _affine_tensor_from_3x4(matrix: torch.Tensor) -> torch.Tensor:
+    eye = torch.eye(4, dtype=matrix.dtype, device=matrix.device).unsqueeze(0).repeat(matrix.shape[0], 1, 1)
+    eye[:, :3, :3] = matrix[:, :, :3]
+    eye[:, :3, 3] = matrix[:, :, 3]
+    return eye
+
+
+def _convert_phys_to_torch_affine(affine_phys: torch.Tensor, batch) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a physical-space affine (3x4) into fireANTs torch space."""
+
+    T_phys = _affine_tensor_from_3x4(affine_phys)
+    torch2phy = batch.get_torch2phy().to(device=affine_phys.device, dtype=affine_phys.dtype)
+    phy2torch = batch.get_phy2torch().to(device=affine_phys.device, dtype=affine_phys.dtype)
+    T_torch = torch.matmul(phy2torch, torch.matmul(T_phys, torch2phy))
+    rotation = T_torch[:, :3, :3]
+    translation = T_torch[:, :3, 3]
+    return rotation, translation
+
+
+def _convert_torch_to_phys_affine(affine_torch: torch.Tensor, batch) -> torch.Tensor:
+    """Convert a torch-space affine (3x4) back into physical space."""
+
+    T_torch = _affine_tensor_from_3x4(affine_torch)
+    torch2phy = batch.get_torch2phy().to(device=affine_torch.device, dtype=affine_torch.dtype)
+    phy2torch = batch.get_phy2torch().to(device=affine_torch.device, dtype=affine_torch.dtype)
+    T_phys = torch.matmul(torch2phy, torch.matmul(T_torch, phy2torch))
+    out = torch.empty_like(affine_torch)
+    out[:, :, :3] = T_phys[:, :3, :3]
+    out[:, :, 3] = T_phys[:, :3, 3]
+    return out
+
+
+def _write_affine_transform(path: Path, matrix: np.ndarray) -> None:
+    """Persist a 3x4 affine matrix (x,y,z basis) as a SimpleITK transform."""
+
+    tx = sitk.AffineTransform(3)
+    tx.SetMatrix(matrix[:3, :3].reshape(-1).tolist())
+    tx.SetTranslation(matrix[:3, 3].tolist())
+    sitk.WriteTransform(tx, str(path))
 
 
 def _load_manual_prematch_from_log(
@@ -282,6 +323,17 @@ def _build_prematch_affine(
         ]
     ) @ T_to_origin)
 
+    if hasattr(prematch, "translation_um"):
+        translation_um = np.asarray(getattr(prematch, "translation_um"), dtype=np.float64)
+        if translation_um.shape[0] >= 2:
+            delta = np.array([translation_um[0], translation_um[1], 0.0], dtype=np.float64)
+            affine[:3, 3] += delta
+            logger.info(
+                "Applied prematch translation: Δx=%.2f µm, Δy=%.2f µm",
+                delta[0],
+                delta[1],
+            )
+
     logger.info(
         "Prematch (rotation only): gui_angle=%.2f°, applied_angle=%.2f°, "
         "conf_center=(%.2f, %.2f, %.2f) µm, anat_center=(%.2f, %.2f, %.2f) µm, "
@@ -383,6 +435,7 @@ def register_confocal_to_anatomy(
         FAImage,
         BatchedImages,
         MomentsRegistration,
+        RigidRegistration,
         AffineRegistration,
         GreedyRegistration,
     ) = _import_fireants()
@@ -429,6 +482,33 @@ def register_confocal_to_anatomy(
         moving_array = moving_array[crop_slices]
         logger.info("After cropping: confocal shape %s", moving_array.shape)
 
+    support_mask = (moving_array > 0.0).astype(np.float32)
+    if not np.any(support_mask):
+        logger.warning("Confocal support mask is empty after cropping; defaulting to full volume")
+        support_mask.fill(1.0)
+    else:
+        from scipy.ndimage import binary_dilation  # type: ignore
+
+        support_mask = binary_dilation(support_mask > 0.0, iterations=1).astype(np.float32)
+
+    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+    moving_mask *= support_mask
+    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+    if np.any(moving_mask != 1.0) or np.any(fixed_mask != 1.0):
+        logger.info(
+            "Applying central/support masks (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
+            mask_margin_xy,
+            mask_margin_z,
+        )
+    support_mask_for_qc = moving_mask.copy()
+    covered_voxels = int(np.count_nonzero(moving_mask))
+    total_voxels = int(moving_mask.size)
+    logger.info(
+        "FireANTs support mask covers %d/%d voxels (%.1f%%)",
+        covered_voxels,
+        total_voxels,
+        100.0 * covered_voxels / max(total_voxels, 1),
+    )
     # Check for manual prematch from processing log first
     prematch_result: Optional[XYMIPPrematchResult] = None
     manual_prematch_data = None
@@ -479,14 +559,6 @@ def register_confocal_to_anatomy(
             logger.exception("Prematch heuristic failed; continuing without seed")
             prematch_result = None
 
-    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
-    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
-    if np.any(moving_mask != 1.0) or np.any(fixed_mask != 1.0):
-        logger.info(
-            "Applying central masks (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
-            mask_margin_xy,
-            mask_margin_z,
-        )
     moving_array *= moving_mask
     fixed_array *= fixed_mask
 
@@ -560,45 +632,56 @@ def register_confocal_to_anatomy(
     prematch_affine_matrix: Optional[np.ndarray] = None
     init_affine = torch.eye(3, 4, device=cfg.device, dtype=torch.float32).unsqueeze(0)
     
-    if prematch_result is not None and prematch_result.applied:
-        # Build prematch affine (XY rotation + XY translation, Z=0)
-        prematch_affine_matrix = _build_prematch_affine(
-            prematch_result,
-            moving_array.shape,
-            spacing,
-            fixed_array.shape,
-            fixed_spacing_um,
-        )
-        # Apply prematch to identity - this gives us the XY alignment from the GUI
-        init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
-        logger.info(
-            "Applied manual prematch (rotation=%.1f°, translation=[%.1f, %.1f] px)",
-            prematch_result.rotation_deg,
-            prematch_result.translation_um[0] / spacing[0],
-            prematch_result.translation_um[1] / spacing[1],
-        )
-        
-        # Rotational seed already centers the confocal volume; skip additional Z-offset.
-    else:
-        # No prematch - fall back to standard moments initialization
-        logger.warning("No manual prematch available - using full moments initialization")
-        moments = MomentsRegistration(
-            scale=cfg.moments_scale,
-            fixed_images=fixed_batch,
-            moving_images=moving_batch,
-        )
-        moments.optimize()
-        init_affine = moments.get_affine_init().detach()
+    center_conf = np.array([
+        0.5 * (moving_array.shape[2] - 1) * spacing[0],
+        0.5 * (moving_array.shape[1] - 1) * spacing[1],
+        0.5 * (moving_array.shape[0] - 1) * spacing[2],
+    ], dtype=np.float64)
+    center_anat = np.array([
+        0.5 * (fixed_array.shape[2] - 1) * fixed_spacing_um[0],
+        0.5 * (fixed_array.shape[1] - 1) * fixed_spacing_um[1],
+        0.5 * (fixed_array.shape[0] - 1) * fixed_spacing_um[2],
+    ], dtype=np.float64)
+    # FireANTs expects a physical-space affine that maps FIXED (anatomy) -> MOVING (confocal)
+    # For an identity rotation, that means y = x + t with t = center_moving - center_fixed
+    translation_um = center_conf - center_anat
+    logger.info(
+        "Synthetic centre-align seed: conf_center=%s µm, anat_center=%s µm, translation=%s µm",
+        np.round(center_conf, 2),
+        np.round(center_anat, 2),
+        np.round(translation_um, 2),
+    )
+    translation_vec_np = translation_um
+    # Hard-coded 45° clockwise rotation around shared centre (about Z)
+    theta = -np.deg2rad(45.0)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    R = np.array(
+        [
+            [cos_t, -sin_t, 0.0],
+            [sin_t,  cos_t, 0.0],
+            [0.0,    0.0,   1.0],
+        ],
+        dtype=np.float64,
+    )
 
-    if translation_mode != "none" and np.linalg.norm(translation_vec) > 1e-6:
+    # To remain centred in XY after rotation, pass t = c_moving - R * c_fixed
+    t_rot = center_conf - (R @ center_anat)
+
+    translation_vec = torch.from_numpy(t_rot.astype(np.float32)).to(init_affine)
+    init_affine[:, :, :3] = torch.from_numpy(R.astype(np.float32)).to(init_affine)
+    init_affine[:, :, 3] = translation_vec
+    prematch_affine_matrix = np.eye(4, dtype=np.float64)
+    prematch_affine_matrix[:3, 3] = translation_um
+
+    if translation_mode != "none" and np.linalg.norm(translation_vec_np) > 1e-6:
         logger.info(
             "Seeding affine translation (mode=%s): Δx=%.3f µm, Δy=%.3f µm, Δz=%.3f µm",
             translation_mode,
-            translation_vec[0],
-            translation_vec[1],
-            translation_vec[2],
+            translation_vec_np[0],
+            translation_vec_np[1],
+            translation_vec_np[2],
         )
-        tr = torch.tensor(translation_vec, device=init_affine.device, dtype=init_affine.dtype)
+        tr = torch.tensor(translation_vec_np, device=init_affine.device, dtype=init_affine.dtype)
         if init_affine.shape[-2:] == (dim, dim + 1):
             init_affine = init_affine.clone()
             init_affine[:, 0, -1] += tr[0]
@@ -663,6 +746,15 @@ def register_confocal_to_anatomy(
             mode='constant',
             cval=0.0
         )
+        mask_init_np = affine_transform(
+            support_mask_for_qc,
+            M_inv,
+            offset=t_inv,
+            output_shape=fixed_array.shape,
+            order=0,
+            mode='constant',
+            cval=0.0,
+        )
         
         # Debug: check transformed data
         logger.info(
@@ -688,7 +780,7 @@ def register_confocal_to_anatomy(
         x_mid = fixed_np.shape[2] // 2
         
         # Find where confocal data actually is (for better visualization in confocal-only panels)
-        nonzero_mask = moving_init_np > 0
+        nonzero_mask = mask_init_np > 0.5
         if np.any(nonzero_mask):
             nz_coords = np.nonzero(nonzero_mask)
             conf_z_mid = int((nz_coords[0].min() + nz_coords[0].max()) / 2)
@@ -711,9 +803,13 @@ def register_confocal_to_anatomy(
             arr = (arr - p1) / (p99 - p1 + 1e-8)
             return arr
         
+        mask_cmap = plt.cm.get_cmap("winter")
+
         # XY plane (Z slice)
         axes[0, 0].imshow(normalize(fixed_np[z_mid]), cmap='gray', alpha=0.7)
         axes[0, 0].imshow(normalize(moving_init_np[z_mid]), cmap='hot', alpha=0.3)
+        axes[0, 0].imshow(mask_init_np[z_mid], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0)
+        axes[0, 0].contour(mask_init_np[z_mid], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
         axes[0, 0].set_title(f'XY plane (Z={z_mid}/{fixed_np.shape[0]})')
         axes[0, 0].axis('off')
         
@@ -724,20 +820,28 @@ def register_confocal_to_anatomy(
         # XZ plane (Y slice)
         axes[0, 1].imshow(normalize(fixed_np[:, y_mid, :]), cmap='gray', alpha=0.7, aspect='auto')
         axes[0, 1].imshow(normalize(moving_init_np[:, y_mid, :]), cmap='hot', alpha=0.3, aspect='auto')
+        axes[0, 1].imshow(mask_init_np[:, y_mid, :], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
+        axes[0, 1].contour(mask_init_np[:, y_mid, :], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
         axes[0, 1].set_title(f'XZ plane (Y={y_mid}/{fixed_np.shape[1]})')
         axes[0, 1].axis('off')
         
         axes[1, 1].imshow(normalize(moving_init_np[:, conf_y_mid, :]), cmap='hot', aspect='auto')
+        axes[1, 1].imshow(mask_init_np[:, conf_y_mid, :], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
+        axes[1, 1].contour(mask_init_np[:, conf_y_mid, :], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
         axes[1, 1].set_title(f'Confocal only (XZ, Y={conf_y_mid})')
         axes[1, 1].axis('off')
         
         # YZ plane (X slice)
         axes[0, 2].imshow(normalize(fixed_np[:, :, x_mid]), cmap='gray', alpha=0.7, aspect='auto')
         axes[0, 2].imshow(normalize(moving_init_np[:, :, x_mid]), cmap='hot', alpha=0.3, aspect='auto')
+        axes[0, 2].imshow(mask_init_np[:, :, x_mid], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
+        axes[0, 2].contour(mask_init_np[:, :, x_mid], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
         axes[0, 2].set_title(f'YZ plane (X={x_mid}/{fixed_np.shape[2]})')
         axes[0, 2].axis('off')
         
         axes[1, 2].imshow(normalize(moving_init_np[:, :, conf_x_mid]), cmap='hot', aspect='auto')
+        axes[1, 2].imshow(mask_init_np[:, :, conf_x_mid], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
+        axes[1, 2].contour(mask_init_np[:, :, conf_x_mid], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
         axes[1, 2].set_title(f'Confocal only (YZ, X={conf_x_mid})')
         axes[1, 2].axis('off')
         
@@ -754,7 +858,11 @@ def register_confocal_to_anatomy(
     except Exception as e:
         logger.warning(f"Failed to generate initialization QC plot: {e}")
 
-    affine = AffineRegistration(
+    # Pass physical-space translation directly; fireANTs expects physical units
+    init_translation_tensor = torch.from_numpy(t_rot.astype(np.float32)).to(init_affine)
+    init_moment_tensor = torch.from_numpy(R.astype(np.float32)).to(init_affine).unsqueeze(0)
+
+    rigid = RigidRegistration(
         list(cfg.affine.scales),
         list(cfg.affine.iterations),
         fixed_batch,
@@ -765,11 +873,26 @@ def register_confocal_to_anatomy(
         tolerance=cfg.affine.tolerance,
         max_tolerance_iters=cfg.affine.max_tolerance_iters,
         loss_type=cfg.affine.loss_type,
-        init_rigid=init_affine,
+        init_translation=init_translation_tensor,
+        init_moment=init_moment_tensor,
+        scaling=False,
         **cfg.affine.extra_args,
     )
-    affine.optimize()
-    final_tensor = affine.evaluate(fixed_batch, moving_batch)
+    init_rigid_mat = _convert_torch_to_phys_affine(
+        rigid.get_rigid_matrix(homogenous=False), moving_batch
+    ).detach().cpu().numpy()
+    logger.info("Rigid init matrix (before locking rotation, xyz basis):\n%s", init_rigid_mat[0])
+    rigid.rotation.requires_grad_(False)
+    rigid.transl.requires_grad_(False)
+    rigid.optimizer.param_groups = []
+    rigid.optimizer.state = defaultdict(dict)
+    logger.info("Rigid optimisation skipped; prematch seed is frozen.")
+    final_rigid_mat = _convert_torch_to_phys_affine(
+        rigid.get_rigid_matrix(homogenous=False), moving_batch
+    ).detach().cpu().numpy()
+    logger.info("Rigid final matrix (xyz basis):\n%s", final_rigid_mat[0])
+    final_tensor = rigid.evaluate(fixed_batch, moving_batch)
+    affine = rigid  # Alias for downstream code that still references `affine`
 
     greedy = None
     if cfg.greedy.enabled:
@@ -787,7 +910,7 @@ def register_confocal_to_anatomy(
             deformation_type=cfg.greedy.deformation_type,
             optimizer_params=cfg.greedy.optimizer_params,
             loss_params=cfg.greedy.loss_params,
-            init_affine=affine.get_affine_matrix().detach(),
+            init_affine=rigid.get_rigid_matrix(homogenous=False).detach(),
             **cfg.greedy.extra_args,
         )
         greedy.optimize()
@@ -797,7 +920,7 @@ def register_confocal_to_anatomy(
     transforms_dir.mkdir(exist_ok=True)
 
     affine_transform_path = transforms_dir / f"{animal_id}_{confocal_session_id}_affine.mat"
-    affine.save_as_ants_transforms(str(affine_transform_path))
+    _write_affine_transform(affine_transform_path, final_rigid_mat[0])
 
     greedy_transform_path = None
     greedy_inverse_path = None
@@ -899,6 +1022,7 @@ def register_confocal_to_anatomy(
             "mode": translation_mode,
             "vector_um": [float(translation_vec[0]), float(translation_vec[1]), float(translation_vec[2])],
         },
+        "final_affine_matrix": final_rigid_mat[0].tolist(),
         "cropping": {
             "enabled": bool(crop_to_extent),
             "y_vox": (crop_info["y_vox"] if crop_info else None),

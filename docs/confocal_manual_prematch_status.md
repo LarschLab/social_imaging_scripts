@@ -54,3 +54,29 @@ Over the past debugging session we ran a series of experiments:
 4. **Document coordinate conventions**: Clean up this doc once the fix lands and keep the link updated in `imagingPipelineAgentInstruct.txt`.
 
 For quick reference, see `test_gui_vs_qc.py` in the repo, which now exercises `_build_prematch_affine` end-to-end.
+
+---
+
+## 2025‑10‑20 Update: Centering Seed Verified (axes clarified)
+
+What we did to get the confocal to land at the centre of the anatomy in all three views (XY/XZ/YZ):
+
+- Compute both centres in physical (LPS) units from image headers (sizes × spacing):
+  - Confocal centre and anatomy centre built from voxel counts and spacings; see `src/social_imaging_scripts/registration/confocal_to_anatomy.py:647`.
+- Build a pure translation seed in physical units with identity rotation:
+  - We pass `init_translation = centre_moving − centre_fixed` (µm) to FireANTs; we do not permute axes or convert units ourselves. See `src/social_imaging_scripts/registration/confocal_to_anatomy.py:859`.
+  - Rotation is disabled for this diagnostic (`init_moment=None`); see `src/social_imaging_scripts/registration/confocal_to_anatomy.py:860`.
+- Freeze optimisation to verify the seed exactly (no solver drift):
+  - We skip optimisation and evaluate directly; log confirms “Rigid optimisation skipped; prematch seed is frozen.” (`src/social_imaging_scripts/registration/confocal_to_anatomy.py:872`).
+
+Key lessons about axes/units (FireANTs vs. GUI):
+
+- FireANTs initialisers (rigid/affine) take translations in physical units, not voxel indices and not pre‑normalised torch coordinates. Its internal `torch2phy/phy2torch` handles conversion; external pre‑conversion caused off‑by‑plane rotations and translations out of FOV.
+- A translation that centres volumes must be `centre_moving − centre_fixed` because the rigid mapping is y = R x + t with x in fixed space and y in moving space.
+- For this translation‑only seed, no axis permutation is required. Earlier attempts to “swap to [z,y,x]” or transpose the 3×3 produced shears and flips in the YZ view.
+
+Next steps (now that centring is correct):
+
+- Reintroduce rotation seeding from the GUI while keeping translation as above. With `around_center=True`, FireANTs internally adjusts the learnable translation by t′ = t − c + A c; we therefore keep t = `centre_moving − centre_fixed` and set `init_moment` to the GUI rotation about Z. Validate on L395_f11 and a second animal.
+- Restore mask soft edges and greedy only after the rigid seed + affine behave as expected.
+- Update unit tests to assert that the synthetic centre‑only seed maps the moving centre exactly onto the fixed centre within 1 voxel in all three axes.

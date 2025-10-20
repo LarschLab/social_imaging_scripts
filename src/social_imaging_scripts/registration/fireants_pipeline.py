@@ -160,6 +160,7 @@ def _import_fireants():
         from fireants.io.image import Image as FAImage  # type: ignore
         from fireants.io.image import BatchedImages  # type: ignore
         from fireants.registration.affine import AffineRegistration  # type: ignore
+        from fireants.registration.rigid import RigidRegistration  # type: ignore
         from fireants.registration.greedy import GreedyRegistration  # type: ignore
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
@@ -176,6 +177,7 @@ def _import_fireants():
         FAImage,
         BatchedImages,
         MomentsRegistration,
+        RigidRegistration,
         AffineRegistration,
         GreedyRegistration,
     )

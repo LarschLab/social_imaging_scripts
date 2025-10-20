@@ -150,10 +150,10 @@ confocal_to_anatomy_registration:
       cc_kernel_size: 51
       tolerance: 1e-8
       max_tolerance_iters: 20
-      loss_type: fusedmi
+      loss_type: fusedcc
       extra_args: {}
     greedy:
-      enabled: true
+      enabled: false
       scales: [12, 8, 4, 2, 1]
       iterations: [200, 200, 200, 100, 50]
       optimizer: Adam
