@@ -8,9 +8,9 @@ x_shift_px = 12.0  # GUI x_shift in anatomy pixels
 y_shift_px = 4.0   # GUI y_shift in anatomy pixels
 rotation_deg = 46.0  # GUI rotation
 
-# Spacing (both confocal and anatomy have same XY spacing after rescaling in GUI)
+# Spacing (use matching XY spacing to keep the toy example simple)
 anatomy_spacing = (1.0, 1.0, 2.0)  # µm (x, y, z)
-confocal_spacing = (0.328, 0.328, 3.0)  # µm (x, y, z)
+confocal_spacing = anatomy_spacing
 
 # Convert GUI pixels to microns using ANATOMY spacing (since GUI operates in anatomy pixel space)
 x_shift_um = x_shift_px * anatomy_spacing[0]
@@ -146,129 +146,104 @@ if len(coords_test[0]) > 0:
     print()
 
 # ============================================================================
-# NOW DO IT THE WAY THE CODE ACTUALLY DOES IT
+# PIPELINE AFFINE CHECK
 # ============================================================================
-print("="*80)
-print("QC PLOT TRANSFORMATION (current code approach)")
-print("="*80)
+print("=" * 80)
+print("PIPELINE AFFINE (matrix comparison)")
+print("=" * 80)
 
-theta_qc = math.radians(rotation_deg + 90.0)  # Current code adds +90°
-cos_t = math.cos(theta_qc)
-sin_t = math.sin(theta_qc)
-rotation_matrix = np.array([
-    [cos_t, -sin_t, 0],
-    [sin_t, cos_t, 0],
-    [0, 0, 1]
-], dtype=np.float64)
+from social_imaging_scripts.registration.confocal_to_anatomy import _build_prematch_affine
+from social_imaging_scripts.registration.prematch import XYMIPPrematchResult
 
-# Center point (using moving/confocal shape for rotation center)
-# In reality this would be the confocal stack center
-center = np.array([
-    0.5 * (img_size - 1) * anatomy_spacing[0],  # x in µm
-    0.5 * (img_size - 1) * anatomy_spacing[1],  # y in µm
-    0.0
-], dtype=np.float64)
-
-# Translation from GUI - current code approach
-translation = np.array([y_shift_um, -x_shift_um, 0.0], dtype=np.float64)
-
-# Total translation for rotation around center
-total_translation = center - rotation_matrix @ center + translation
-
-print(f"Rotation matrix (θ={rotation_deg + 90.0}°):")
-print(rotation_matrix[:2, :2])
-print(f"Center: {center}")
-print(f"Translation: {translation}")
-print(f"Total translation: {total_translation}")
-print()
-
-# Build 4x4 affine for scipy
-affine_4x4 = np.eye(4, dtype=np.float64)
-affine_4x4[:3, :3] = rotation_matrix
-affine_4x4[:3, 3] = total_translation
-
-print("Physical space affine (4x4):")
-print(affine_4x4)
-print()
-
-# Convert to voxel space (for 2D test, spacing is just (x, y))
-S_moving = np.diag([anatomy_spacing[0], anatomy_spacing[1], 1.0])
-S_fixed = np.diag([anatomy_spacing[0], anatomy_spacing[1], 1.0])
-S_moving_inv = np.linalg.inv(S_moving)
-S_fixed_inv = np.linalg.inv(S_fixed)
-
-M_phys = affine_4x4[:3, :3]
-t_phys = affine_4x4[:3, 3]
-
-M_vox_xyz = S_fixed_inv @ M_phys @ S_moving
-t_vox_xyz = S_fixed_inv @ t_phys
-
-print("Voxel space transform (XYZ):")
-print(f"M_vox_xyz:\n{M_vox_xyz}")
-print(f"t_vox_xyz: {t_vox_xyz}")
-print()
-
-# For 2D, we just need the 2x2 rotation and 2D translation
-M_vox_2d = M_vox_xyz[:2, :2]
-t_vox_2d = t_vox_xyz[:2]
-
-# Scipy affine_transform uses INVERSE
-M_inv = np.linalg.inv(M_vox_2d)
-t_inv = -M_inv @ t_vox_2d
-
-print("Scipy inverse transform (2D):")
-print(f"M_inv:\n{M_inv}")
-print(f"t_inv: {t_inv}")
-print()
-
-# Apply with scipy affine_transform
-# Reset test image
-test_img = np.zeros((img_size, img_size), dtype=np.float32)
-test_img[30:35, 40:45] = 1.0
-
-img_qc = affine_transform(
-    test_img,
-    M_inv,
-    offset=t_inv,
-    output_shape=(img_size, img_size),
-    order=1,
-    mode='constant',
-    cval=0
+prematch = XYMIPPrematchResult(
+    rotation_deg=rotation_deg,
+    translation_vox=np.array([x_shift_px, y_shift_px, 0.0]),
+    translation_um=np.array([x_shift_um, y_shift_um, 0.0]),
+    score=1.0,
+    delta_pixels=np.zeros(2),
+    matched_centre_pixels=np.zeros(2),
+    peak_index=(0, 0),
+    downsample_scale=1.0,
+    resample_factors=(1.0, 1.0),
+    angle_records=[],
+    applied=True,
 )
 
-# Find where the marker ended up
-coords_qc = np.where(img_qc > 0.5)
-if len(coords_qc[0]) > 0:
-    qc_center_y = coords_qc[0].mean()
-    qc_center_x = coords_qc[1].mean()
-    print(f"QC result: marker at row={qc_center_y:.1f}, col={qc_center_x:.1f}")
-    print(f"  -> Shift from original: dy={qc_center_y - 32.5:.1f}, dx={qc_center_x - 42.5:.1f}")
-else:
-    print("QC result: marker not found")
+fireants_affine = _build_prematch_affine(
+    prematch,
+    moving_shape=(1, img_size, img_size),
+    moving_spacing=confocal_spacing,
+    fixed_shape=(1, img_size, img_size),
+    fixed_spacing=anatomy_spacing,
+)
+
+A_pipeline = fireants_affine[:2, :2]
+t_pipeline = fireants_affine[:2, 3]
+
+expected_rotation = np.array(
+    [
+        [math.cos(math.radians(rotation_deg)), -math.sin(math.radians(rotation_deg))],
+        [math.sin(math.radians(rotation_deg)), math.cos(math.radians(rotation_deg))],
+    ],
+    dtype=np.float64,
+)
+print("Pipeline rotation:\n", A_pipeline)
+print("Expected rotation:\n", expected_rotation)
+print("Pipeline translation (µm):", t_pipeline)
+
+def _simulate_gui_mapping(points_phys):
+    scale = confocal_spacing[0] / anatomy_spacing[0]
+    rescaled_w = int(round(img_size * scale))
+    rescaled_h = int(round(img_size * scale))
+    canvas_w = max(rescaled_w, img_size)
+    canvas_h = max(rescaled_h, img_size)
+    pad_x_conf = (canvas_w - rescaled_w) // 2
+    pad_y_conf = (canvas_h - rescaled_h) // 2
+    pad_x_anat = (canvas_w - img_size) // 2
+    pad_y_anat = (canvas_h - img_size) // 2
+
+    outputs = []
+    for x_phys, y_phys in points_phys:
+        col = x_phys / confocal_spacing[0]
+        row = y_phys / confocal_spacing[1]
+        col_scaled = col * scale + pad_x_conf
+        row_scaled = row * scale + pad_y_conf
+        c_x = (canvas_w - 1) / 2
+        c_y = (canvas_h - 1) / 2
+        theta = math.radians(rotation_deg)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        col_shift = col_scaled - c_x
+        row_shift = row_scaled - c_y
+        col_rot = cos_t * col_shift - sin_t * row_shift + c_x
+        row_rot = sin_t * col_shift + cos_t * row_shift + c_y
+        col_trans = col_rot + x_shift_px
+        row_trans = row_rot + y_shift_px
+        col_final = col_trans - pad_x_anat
+        row_final = row_trans - pad_y_anat
+        outputs.append([col_final * anatomy_spacing[0], row_final * anatomy_spacing[1]])
+    return np.array(outputs)
+
+center = np.array([(img_size - 1) / 2 * confocal_spacing[0], (img_size - 1) / 2 * confocal_spacing[1]])
+dx_point = center + np.array([confocal_spacing[0], 0.0])
+dy_point = center + np.array([0.0, confocal_spacing[1]])
+test_points = np.stack([center, dx_point, dy_point])
+
+pipeline_outputs = (A_pipeline @ test_points.T + t_pipeline[:, None]).T
+gui_outputs = _simulate_gui_mapping(test_points)
+
+print("Pipeline mapped points:\n", pipeline_outputs)
+print("GUI mapped points:\n", gui_outputs)
+
+rot_error = np.max(np.abs(A_pipeline - expected_rotation))
+point_error = np.max(np.abs(pipeline_outputs - gui_outputs))
 
 print()
-
-# ============================================================================
-# PART 3: Comparison
-# ============================================================================
-print("="*80)
+print("=" * 80)
 print("COMPARISON")
-print("="*80)
-
-if len(coords_gui[0]) > 0 and len(coords_qc[0]) > 0:
-    diff_y = qc_center_y - gui_center_y
-    diff_x = qc_center_x - gui_center_x
-    print(f"Difference (QC - GUI):")
-    print(f"  dy = {diff_y:.1f} px")
-    print(f"  dx = {diff_x:.1f} px")
-    print()
-    
-    if abs(diff_y) < 1.0 and abs(diff_x) < 1.0:
-        print("✓ MATCH! The transformations are equivalent.")
-    else:
-        print("✗ MISMATCH! The transformations differ significantly.")
-        print()
-        print("This means the QC plot is NOT showing what you saw in the GUI.")
-        print("The bug is in how we're constructing the transformation matrix.")
+print("=" * 80)
+print(f"Max rotation diff: {rot_error:.3e}")
+print(f"Max point diff (µm): {point_error:.3e}")
+if rot_error < 1e-6 and point_error < 1e-6:
+    print("✓ MATCH! Pipeline affine reproduces GUI transform exactly.")
 else:
-    print("Cannot compare - marker not found in one or both results")
+    print("✗ MISMATCH! Transform still diverges.")

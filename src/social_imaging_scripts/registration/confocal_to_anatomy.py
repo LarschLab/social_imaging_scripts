@@ -236,7 +236,9 @@ def _compute_extent_crop_slices(
 def _build_prematch_affine(
     prematch: PreMatch,
     moving_shape: Tuple[int, int, int],
-    spacing: Tuple[float, float, float],
+    moving_spacing: Tuple[float, float, float],
+    fixed_shape: Tuple[int, int, int],
+    fixed_spacing: Tuple[float, float, float],
 ) -> np.ndarray:
     """Construct a 4x4 affine matrix from the prematch rotation/translation."""
 
@@ -257,31 +259,82 @@ def _build_prematch_affine(
 
     center = np.array(
         [
-            0.5 * (moving_shape[2] - 1) * spacing[0],
-            0.5 * (moving_shape[1] - 1) * spacing[1],
-            0.5 * (moving_shape[0] - 1) * spacing[2],
+            0.5 * (moving_shape[2] - 1) * moving_spacing[0],
+            0.5 * (moving_shape[1] - 1) * moving_spacing[1],
+            0.5 * (moving_shape[0] - 1) * moving_spacing[2],
         ],
         dtype=np.float64,
     )
-    
-    # Translation from GUI: trying [x, -y] based on QC plot observation
-    # (top-left shift suggests we need opposite signs from [-x, y])
-    translation_gui = prematch.translation_um.astype(np.float64, copy=False)
-    translation = np.array([translation_gui[0], -translation_gui[1], 0.0], dtype=np.float64)
-    
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info("Prematch translation transform: GUI [%.2f, %.2f] -> Physical [%.2f, %.2f]",
-                translation_gui[0], translation_gui[1], translation[0], translation[1])
-    
-    total_translation = center - rotation @ center + translation
-    
-    logger.info("Total translation after rotation around center: [%.2f, %.2f, %.2f]",
-                total_translation[0], total_translation[1], total_translation[2])
+
+    # Translation from GUI (anatomy pixels) – derive post-rotation translation explicitly
+    translation_um = prematch.translation_um.astype(np.float64, copy=False)
+    translation_px = np.array(
+        [
+            translation_um[0] / max(fixed_spacing[0], 1e-8),
+            translation_um[1] / max(fixed_spacing[1], 1e-8),
+        ],
+        dtype=np.float64,
+    )
+
+    scale_x = moving_spacing[0] / max(fixed_spacing[0], 1e-8)
+    scale_y = moving_spacing[1] / max(fixed_spacing[1], 1e-8)
+    rescaled_width = max(1, int(round(moving_shape[2] * scale_x)))
+    rescaled_height = max(1, int(round(moving_shape[1] * scale_y)))
+    canvas_width = max(rescaled_width, fixed_shape[2])
+    canvas_height = max(rescaled_height, fixed_shape[1])
+
+    pad_x_conf = max(0, (canvas_width - rescaled_width) // 2)
+    pad_y_conf = max(0, (canvas_height - rescaled_height) // 2)
+    pad_x_anat = max(0, (canvas_width - fixed_shape[2]) // 2)
+    pad_y_anat = max(0, (canvas_height - fixed_shape[1]) // 2)
+
+    c_x = (canvas_width - 1) / 2.0
+    c_y = (canvas_height - 1) / 2.0
+
+    def _map_point(col_px: float, row_px: float) -> tuple[float, float]:
+        col_scaled = col_px * scale_x + pad_x_conf
+        row_scaled = row_px * scale_y + pad_y_conf
+        col_shift = col_scaled - c_x
+        row_shift = row_scaled - c_y
+        col_rot = cos_t * col_shift - sin_t * row_shift + c_x
+        row_rot = sin_t * col_shift + cos_t * row_shift + c_y
+        col_trans = col_rot + translation_px[0]
+        row_trans = row_rot + translation_px[1]
+        col_final = col_trans - pad_x_anat
+        row_final = row_trans - pad_y_anat
+        return float(col_final), float(row_final)
+
+    basis_inputs = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    ).T
+    mapped = np.array(
+        [
+            _map_point(0.0, 0.0),
+            _map_point(1.0, 0.0),
+            _map_point(0.0, 1.0),
+        ],
+        dtype=np.float64,
+    )
+    transform_pixels = np.vstack([mapped.T, np.ones(3, dtype=np.float64)]) @ np.linalg.inv(basis_inputs)
+
+    transform_xy = (
+        np.diag([fixed_spacing[0], fixed_spacing[1], 1.0])
+        @ transform_pixels
+        @ np.diag([1.0 / max(moving_spacing[0], 1e-8), 1.0 / max(moving_spacing[1], 1e-8), 1.0])
+    )
 
     affine = np.eye(4, dtype=np.float64)
-    affine[:3, :3] = rotation
-    affine[:3, 3] = total_translation
+    affine[0, 0] = transform_xy[0, 0]
+    affine[0, 1] = transform_xy[0, 1]
+    affine[1, 0] = transform_xy[1, 0]
+    affine[1, 1] = transform_xy[1, 1]
+    affine[0, 3] = transform_xy[0, 2]
+    affine[1, 3] = transform_xy[1, 2]
     return affine
 
 
@@ -551,6 +604,8 @@ def register_confocal_to_anatomy(
             prematch_result,
             moving_array.shape,
             spacing,
+            fixed_array.shape,
+            fixed_spacing_um,
         )
         # Apply prematch to identity - this gives us the XY alignment from the GUI
         init_affine = _apply_prematch_to_affine(init_affine, prematch_affine_matrix)
