@@ -22,21 +22,22 @@ Over the past debugging session we ran a series of experiments:
 ## Current Implementation (2025‑10‑20)
 
 - `_build_prematch_affine` now:
-  - Still **adds +90°** to the GUI rotation (we have not removed this hack yet).
-  - Computes translation by following the GUI pipeline: rescale, pad, rotate about the canvas centre, apply the stored translation, remove anatomy padding, then convert the resulting pixel transform to physical space. This replaced the previous `[x, -y]` shortcut.
-- The QC image path in `register_confocal_to_anatomy` uses the same affine that is sent to FireANTs (no axis swaps, only a clean matrix inverse), so QC overlays match the FireANTs seed exactly.
+  - Still **adds +90°** to the GUI rotation (legacy hack; see open questions below).
+  - Translates so that the confocal centre coincides with the anatomy centre, then applies the rotation about that shared centre (implemented as `T_anat @ R @ T_conf⁻¹`). No GUI X/Y translation is currently applied.
+- The QC resample uses the same 4×4 affine (converted via a homogeneous voxel transform), so the overlay now shows the rotated confocal centred inside the anatomy volume—matching exactly what FireANTs receives.
 
 ## What Works
 
-- Rotation in the current QC screenshots matches the GUI (the “diamond” overlay has the same orientation as the manual prematch).
-- Translation now comes directly from the GUI transform instead of the empirical `[x, -y]` sign flip, so the centre mapping log is consistent with the GUI to first order.
-- QC plots and FireANTs now see the *same* affine, making QC a reliable diagnostic again.
+- QC overlays finally mirror the manual prematch seed: the confocal block is centred in X/Y/Z and rotated as seen in the GUI.
+- FireANTs seeds from the same affine used to draw the QC plot, so debugging the seed is now straightforward.
+- Verbose logging reports the GUI angle, applied angle, confocal/anatomy centres, and the mapped centre as a sanity check.
 
-## What Still Fails
+## What Still Fails / Open Questions
 
-- The **+90° rotation bias** remains: we are still implicitly assuming a 90° mismatch between the GUI and FireANTs coordinate frames. The latest QC overlay shows rotation visually correct; however, this is due to the GUI value + our +90° offset. We need to confirm the actual coordinate conventions and remove this hack entirely.
-- Translation is still off by a few microns in real datasets (see L395_f11). The derived translation is closer but still differs slightly from what the user expected.
-- SITK/SciPy conversions can still be confusing. Small mistakes (swapping axes or using the wrong inverse) reintroduce 90°/180° flips. We need a cleaner utility to map FireANTs affines to array transforms.
+1. **Rotation bias** – We still rely on the empirical `+90°` offset. We need to trace the GUI vs FireANTs coordinate conventions so that we can remove the hack and trust the GUI angle verbatim.
+2. **Optional GUI translations** – At the moment we ignore the GUI’s XY translation sliders. Once rotation is finalised we can reintroduce the GUI translation path (or formally decide to leave it at zero and document the behaviour).
+3. **Unit tests** – Codify the synthetic checks (centres/basis points) so regressions are caught automatically.
+4. **Documentation refresh** – Update this note once the rotation bias is gone and the translation story is final; keep the link in `imagingPipelineAgentInstruct.txt` current.
 
 ## Lessons Learned
 
