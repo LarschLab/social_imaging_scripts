@@ -242,13 +242,7 @@ def _build_prematch_affine(
 ) -> np.ndarray:
     """Construct a 4x4 affine matrix from the prematch rotation/translation."""
 
-    # IMPORTANT: There's a coordinate system difference between GUI and FireANTs.
-    # The +90° offset is needed for the rotation to look correct, but this means
-    # the translation vector also needs special handling.
-    # 
-    # The GUI shows rotation angle θ, but we need to apply θ+90° for correct orientation.
-    # This might be due to axis flipping or CCW vs CW convention differences.
-    theta = math.radians(float(prematch.rotation_deg) + 90.0)  # +90° offset needed
+    theta = math.radians(float(prematch.rotation_deg) + 90.0)
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
     rotation = np.eye(3, dtype=np.float64)
@@ -257,7 +251,7 @@ def _build_prematch_affine(
     rotation[1, 0] = sin_t
     rotation[1, 1] = cos_t
 
-    center = np.array(
+    center_conf = np.array(
         [
             0.5 * (moving_shape[2] - 1) * moving_spacing[0],
             0.5 * (moving_shape[1] - 1) * moving_spacing[1],
@@ -266,75 +260,43 @@ def _build_prematch_affine(
         dtype=np.float64,
     )
 
-    # Translation from GUI (anatomy pixels) – derive post-rotation translation explicitly
-    translation_um = prematch.translation_um.astype(np.float64, copy=False)
-    translation_px = np.array(
+    center_anat = np.array(
         [
-            translation_um[0] / max(fixed_spacing[0], 1e-8),
-            translation_um[1] / max(fixed_spacing[1], 1e-8),
+            0.5 * (fixed_shape[2] - 1) * fixed_spacing[0],
+            0.5 * (fixed_shape[1] - 1) * fixed_spacing[1],
+            0.5 * (fixed_shape[0] - 1) * fixed_spacing[2],
         ],
         dtype=np.float64,
     )
 
-    scale_x = moving_spacing[0] / max(fixed_spacing[0], 1e-8)
-    scale_y = moving_spacing[1] / max(fixed_spacing[1], 1e-8)
-    rescaled_width = max(1, int(round(moving_shape[2] * scale_x)))
-    rescaled_height = max(1, int(round(moving_shape[1] * scale_y)))
-    canvas_width = max(rescaled_width, fixed_shape[2])
-    canvas_height = max(rescaled_height, fixed_shape[1])
+    T_to_origin = np.eye(4, dtype=np.float64)
+    T_to_origin[:3, 3] = -center_conf
 
-    pad_x_conf = max(0, (canvas_width - rescaled_width) // 2)
-    pad_y_conf = max(0, (canvas_height - rescaled_height) // 2)
-    pad_x_anat = max(0, (canvas_width - fixed_shape[2]) // 2)
-    pad_y_anat = max(0, (canvas_height - fixed_shape[1]) // 2)
+    T_back = np.eye(4, dtype=np.float64)
+    T_back[:3, 3] = center_anat
 
-    c_x = (canvas_width - 1) / 2.0
-    c_y = (canvas_height - 1) / 2.0
-
-    def _map_point(col_px: float, row_px: float) -> tuple[float, float]:
-        col_scaled = col_px * scale_x + pad_x_conf
-        row_scaled = row_px * scale_y + pad_y_conf
-        col_shift = col_scaled - c_x
-        row_shift = row_scaled - c_y
-        col_rot = cos_t * col_shift - sin_t * row_shift + c_x
-        row_rot = sin_t * col_shift + cos_t * row_shift + c_y
-        col_trans = col_rot + translation_px[0]
-        row_trans = row_rot + translation_px[1]
-        col_final = col_trans - pad_x_anat
-        row_final = row_trans - pad_y_anat
-        return float(col_final), float(row_final)
-
-    basis_inputs = np.array(
+    affine = T_back @ (np.block(
         [
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-        ],
-        dtype=np.float64,
-    ).T
-    mapped = np.array(
-        [
-            _map_point(0.0, 0.0),
-            _map_point(1.0, 0.0),
-            _map_point(0.0, 1.0),
-        ],
-        dtype=np.float64,
-    )
-    transform_pixels = np.vstack([mapped.T, np.ones(3, dtype=np.float64)]) @ np.linalg.inv(basis_inputs)
+            [rotation, np.zeros((3, 1), dtype=np.float64)],
+            [np.zeros((1, 3), dtype=np.float64), np.array([[1.0]], dtype=np.float64)],
+        ]
+    ) @ T_to_origin)
 
-    transform_xy = (
-        np.diag([fixed_spacing[0], fixed_spacing[1], 1.0])
-        @ transform_pixels
-        @ np.diag([1.0 / max(moving_spacing[0], 1e-8), 1.0 / max(moving_spacing[1], 1e-8), 1.0])
+    logger.info(
+        "Prematch (rotation only): gui_angle=%.2f°, applied_angle=%.2f°, "
+        "conf_center=(%.2f, %.2f, %.2f) µm, anat_center=(%.2f, %.2f, %.2f) µm, "
+        "mapped_center=(%.2f, %.2f, %.2f) µm",
+        float(prematch.rotation_deg),
+        math.degrees(theta),
+        center_conf[0],
+        center_conf[1],
+        center_conf[2],
+        center_anat[0],
+        center_anat[1],
+        center_anat[2],
+        *( (affine[:3, :3] @ center_conf) + affine[:3, 3] ),
     )
 
-    affine = np.eye(4, dtype=np.float64)
-    affine[0, 0] = transform_xy[0, 0]
-    affine[0, 1] = transform_xy[0, 1]
-    affine[1, 0] = transform_xy[1, 0]
-    affine[1, 1] = transform_xy[1, 1]
-    affine[0, 3] = transform_xy[0, 2]
-    affine[1, 3] = transform_xy[1, 2]
     return affine
 
 
@@ -616,24 +578,7 @@ def register_confocal_to_anatomy(
             prematch_result.translation_um[1] / spacing[1],
         )
         
-        # Add geometric Z-centering to align volume centers in Z
-        # This is important for zoomed confocal stacks that only cover a thin slice
-        fixed_shape = fixed_fa.array.shape
-        moving_shape = moving_fa.array.shape
-        
-        # Arrays are (Z, Y, X) but spacing is (X, Y, Z), so use index [2] for Z
-        fixed_z_center = 0.5 * (fixed_shape[-3] - 1) * fixed_spacing_um[2]
-        moving_z_center = 0.5 * (moving_shape[-3] - 1) * spacing[2]
-        z_offset = fixed_z_center - moving_z_center
-        init_affine[0, 2, 3] += z_offset
-        logger.info(
-            "Geometric Z-centering: fixed_center=%.1f µm (%d slices), moving_center=%.1f µm (%d slices), offset=%.1f µm",
-            fixed_z_center,
-            fixed_shape[-3],
-            moving_z_center,
-            moving_shape[-3],
-            z_offset,
-        )
+        # Rotational seed already centers the confocal volume; skip additional Z-offset.
     else:
         # No prematch - fall back to standard moments initialization
         logger.warning("No manual prematch available - using full moments initialization")
@@ -681,56 +626,31 @@ def register_confocal_to_anatomy(
         
         logger.info("Init affine matrix for QC:\n%s", init_affine_np)
         
-        # FireANTs affine works in physical coordinates (micrometers)
-        # We need to convert to voxel coordinates for scipy
-        # Transform: voxel_fixed = M_vox @ voxel_moving + t_vox
-        # Where: M_vox = S_fixed^-1 @ M_phys @ S_moving
-        #        t_vox = S_fixed^-1 @ t_phys
-        
-        # Build spacing scaling matrices (diagonal)
-        S_moving = np.diag([spacing[0], spacing[1], spacing[2]])  # (X, Y, Z) spacing
-        S_fixed = np.diag([fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]])
-        S_fixed_inv = np.diag([1.0/fixed_spacing_um[0], 1.0/fixed_spacing_um[1], 1.0/fixed_spacing_um[2]])
-        
-        # Extract physical space transform
-        M_phys = init_affine_np[:, :3]  # (3, 3)
-        t_phys = init_affine_np[:, 3]   # (3,)
-        
-        # Convert to voxel space (still in XYZ ordering)
-        M_vox_xyz = S_fixed_inv @ M_phys @ S_moving
-        t_vox_xyz = S_fixed_inv @ t_phys
-        
-        logger.info("Voxel space transform (XYZ): M_vox=\n%s\nt_vox=%s", M_vox_xyz, t_vox_xyz)
-        
-        # Scipy's affine_transform uses arrays in ZYX order
-        # For a point p_in in input coords, output point p_out:
-        # p_in = M_inv @ p_out + offset
-        # We have: p_out = M @ p_in + t (in XYZ coords)
-        # So: p_in = M^-1 @ (p_out - t) = M^-1 @ p_out - M^-1 @ t
-        
-        # First, convert coordinates from XYZ to ZYX ordering
-        # For arrays: (z, y, x) indices correspond to (coords[2], coords[1], coords[0]) in XYZ space
-        # So we need to reorder: [z, y, x] -> [x, y, z] before applying M, then [x, y, z] -> [z, y, x]
-        
-        # Permutation from ZYX array indices to XYZ: P_to_xyz
-        # Permutation from XYZ back to ZYX: P_from_xyz  
-        # Combined: M_zyx = P_from_xyz @ M_xyz @ P_to_xyz = P_from_xyz @ M_xyz @ P_from_xyz^T
-        
-        # P matrix: reorders [z,y,x] -> [x,y,z], which is indices [0,1,2] -> [2,1,0]
-        # As a matrix that acts on coordinates: swap first and last
-        P_zyx_to_xyz = np.array([[0, 0, 1],   # x = old z
-                                  [0, 1, 0],   # y = old y  
-                                  [1, 0, 0]],  # z = old x
-                                 dtype=np.float32)
-        
-        # Transform in ZYX coordinates
-        M_vox_zyx = P_zyx_to_xyz.T @ M_vox_xyz @ P_zyx_to_xyz
-        t_vox_zyx = P_zyx_to_xyz.T @ t_vox_xyz
-        
-        # Scipy uses the INVERSE transform (maps output coords to input coords)
-        M_inv = np.linalg.inv(M_vox_zyx)
-        t_inv = -M_inv @ t_vox_zyx
-        
+        # Build homogeneous affine in physical space
+        A_phys = np.eye(4, dtype=np.float64)
+        A_phys[:3, :3] = init_affine_np[:, :3]
+        A_phys[:3, 3] = init_affine_np[:, 3]
+
+        # Mapping from moving voxel (z, y, x) -> physical XYZ
+        to_xyz = np.array([
+            [0.0, 0.0, spacing[0], 0.0],
+            [0.0, spacing[1], 0.0, 0.0],
+            [spacing[2], 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+        # Mapping from physical XYZ -> fixed voxel (z, y, x)
+        from_xyz = np.array([
+            [0.0, 0.0, 1.0 / fixed_spacing_um[2], 0.0],
+            [0.0, 1.0 / fixed_spacing_um[1], 0.0, 0.0],
+            [1.0 / fixed_spacing_um[0], 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+        full_transform = from_xyz @ A_phys @ to_xyz
+        full_inverse = np.linalg.inv(full_transform)
+        M_inv = full_inverse[:3, :3]
+        t_inv = full_inverse[:3, 3]
         logger.info("Scipy inverse transform (ZYX): M_inv=\n%s\nt_inv=%s", M_inv, t_inv)
         
         # Apply transform to moving array

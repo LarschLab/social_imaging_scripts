@@ -66,13 +66,13 @@
 - Greedy warps often degraded otherwise good affine alignments (producing “liquid” artefacts). Running affine-only or dialing down greedy (`optimizer_lr`, smoothing, iterations) yields more stable results.
 - Mutual information gave promising loss values but also aligned the stack poorly when masks were too symmetric. Soft masks or small margins restore reliable correlation at the cost of lower (but meaningful) loss magnitudes.
 - **Manual prematch GUI** (`manual_confocal_prematch.ipynb`): For cases where automated XY MIP prematch fails. Shows anatomy (magenta) vs confocal (green) overlay with rotation/translation sliders. Saves to processing log under `manual_prematch[session_id]`.
-  - ⚠️ **KNOWN ISSUE**: Coordinate system mismatch between GUI and code application. Rotation needs +90° offset (empirically determined), but this breaks translation formula. See `PREMATCH_COORDINATE_ISSUE.md` for full details. Current workaround: use when automated fails, expect ~10° rotation error and 10-30 µm translation offset that FireANTs may refine.
+  - ⚠️ **KNOWN ISSUE**: Coordinate system mismatch between GUI and code application. We still add an empirical +90° rotation; translation now follows the GUI pipeline but remains slightly biased in real data. See `docs/confocal_manual_prematch_status.md` for the current status, lessons learned, and next steps.
 - We're still tuning these knobs. Open questions / TODOs:
   1. Validate the prematch heuristic across more animals/rounds; decide if additional rotation angles or adaptive thresholds are needed.
-  2. Better translation fallbacks when prematch is rejected (e.g., crop-offset default or centroid delta guardrails).
-  3. Compare MI vs fusedCC performance once prematch stabilises translation; stick with fusedCC unless MI clearly helps.
-  4. Decide whether greedy should stay disabled by default until we have tighter regularisation.
-  5. **URGENT**: Resolve manual prematch coordinate system mismatch (see `PREMATCH_COORDINATE_ISSUE.md`)—currently blocks reliable manual intervention workflow.
+  2. Remove the empirical +90° rotation by nailing down the GUI↔FireANTs axis conventions (tracked in `docs/confocal_manual_prematch_status.md`).
+  3. Better translation fallbacks when prematch is rejected (e.g., crop-offset default or centroid delta guardrails).
+  4. Compare MI vs fusedCC performance once prematch stabilises translation; stick with fusedCC unless MI clearly helps.
+  5. Decide whether greedy should stay disabled by default until we have tighter regularisation.
 
 ## Environment Headline for Future Sessions
 
