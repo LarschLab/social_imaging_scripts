@@ -713,21 +713,34 @@ def register_confocal_to_anatomy(
             float(fixed_spacing_um[1]),
             float(fixed_spacing_um[2]),
         )
-        fixed_mask = _resample_array_to_fixed(
-            moving_mask,
-            moving_spacing_xyz,
-            fixed_spacing_xyz,
-            fixed_array.shape,
-            translation_um=(
-                center_seed_translation_um[0],
-                center_seed_translation_um[1],
-                center_seed_translation_um[2],
-            ),
-        )
+        
+        # Conditionally apply mask to fixed volume based on config
+        if mask_cfg.apply_to_fixed:
+            fixed_mask = _resample_array_to_fixed(
+                moving_mask,
+                moving_spacing_xyz,
+                fixed_spacing_xyz,
+                fixed_array.shape,
+                translation_um=(
+                    center_seed_translation_um[0],
+                    center_seed_translation_um[1],
+                    center_seed_translation_um[2],
+                ),
+            )
+            logger.info(
+                "Using moving support mask on BOTH moving and fixed volumes (apply_to_fixed=true)"
+            )
+        else:
+            # Create an all-ones mask for the fixed volume (no masking)
+            fixed_mask = np.ones_like(fixed_array, dtype=np.float32)
+            logger.info(
+                "Using moving support mask on MOVING ONLY (apply_to_fixed=false) - fixed volume unmasked"
+            )
+        
         support_mask_for_qc = moving_mask.copy()
         coverage = 100.0 * float(np.count_nonzero(moving_mask > 0.05)) / max(moving_mask.size, 1)
         logger.info(
-            "Using moving support mask (percentile=%.1f, dilate_xy=%d, dilate_z=%d, soft_edge=%d) covering %.1f%% of voxels",
+            "Moving support mask parameters: percentile=%.1f, dilate_xy=%d, dilate_z=%d, soft_edge=%d, covering %.1f%% of moving voxels",
             mask_cfg.threshold_percentile,
             mask_cfg.dilate_xy_vox,
             mask_cfg.dilate_z_vox,

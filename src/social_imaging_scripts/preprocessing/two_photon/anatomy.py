@@ -22,6 +22,7 @@ def run(
     raw_dir: Path,
     output_root: Path,
     settings: TwoPhotonPreprocessing | None = None,
+    plane_spacing: float | None = None,
     stack_filename: str = "{animal_id}_anatomy_stack.tif",
     metadata_filename: str = "{animal_id}_anatomy_metadata.json",
 ) -> Dict[str, Path]:
@@ -71,6 +72,7 @@ def run(
         "blocks": settings.blocks if settings else None,
         "output_stack": str(stack_path),
         "pixel_size_xy_um": [float(pixel_size_xy[0]), float(pixel_size_xy[1])],
+        "plane_spacing_um": float(plane_spacing) if plane_spacing is not None else None,
     }
     metadata_path = output_root / metadata_filename.format(
         animal_id=animal_id, session_id=session_id

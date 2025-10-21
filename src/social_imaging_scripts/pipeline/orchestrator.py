@@ -495,6 +495,7 @@ def process_anatomy_session(
                     ),
                     output_root=preprocess_root,
                     settings=session.session_data.preprocessing_two_photon,
+                    plane_spacing=getattr(session.session_data, "plane_spacing", None),
                     stack_filename=anatomy_cfg.stack_filename_template,
                     metadata_filename=anatomy_cfg.metadata_filename_template,
                 )
@@ -831,11 +832,20 @@ def process_confocal_to_anatomy_registration(
         session_id=anatomy_session.session_id,
     )
     fixed_pixel_size = (1.0, 1.0)
+    z_spacing_from_metadata = None
     try:
         fixed_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
+        # Also try to load z spacing from preprocessed metadata
+        if anatomy_metadata_path.exists():
+            metadata = json.loads(anatomy_metadata_path.read_text(encoding="utf-8"))
+            z_spacing_from_metadata = metadata.get("plane_spacing_um")
     except Exception:
         pass
-    z_spacing = getattr(anatomy_session.session_data, "plane_spacing", None)
+    
+    # Prefer z_spacing from preprocessed metadata, then session YAML
+    z_spacing = z_spacing_from_metadata
+    if z_spacing is None:
+        z_spacing = getattr(anatomy_session.session_data, "plane_spacing", None)
     if z_spacing is None:
         z_spacing = getattr(anatomy_session.session_data, "z_step_um", None)
     if z_spacing is None:

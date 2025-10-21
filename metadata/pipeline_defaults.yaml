@@ -122,10 +122,11 @@ confocal_to_anatomy_registration:
   center_align_seed: true  # Align stack centres before registration.
   moving_support_mask:
     enabled: true
-    threshold_percentile: 60.0
-    dilate_xy_vox: 3
-    dilate_z_vox: 1
-    soft_edge_vox: 5
+    threshold_percentile: 60.0  # Percentile threshold for mask (50-70 recommended for small FOV)
+    dilate_xy_vox: 3  # XY dilation (3-5 recommended for small FOV)
+    dilate_z_vox: 1  # Z dilation (1-2 recommended)
+    soft_edge_vox: 5  # Soft edge width (5-8 recommended)
+    apply_to_fixed: false  # Apply mask to fixed volume. Set false for small FOV confocal stacks to avoid hiding necessary anatomy.
   prematch:  # XY-MIP prematch heuristics to seed FireANTs.
     enabled: false
     mip_percentiles: [2.0, 99.5]

@@ -426,6 +426,10 @@ class MovingSupportMaskConfig(BaseModel):
         default=5,
         description="Soft edge width (voxels) applied to the support mask to avoid hard boundaries.",
     )
+    apply_to_fixed: bool = Field(
+        default=True,
+        description="Apply the resampled moving mask to the fixed volume. When false, only the moving volume is masked (useful for small FOV confocal stacks where masking the fixed volume hides necessary anatomy).",
+    )
 
 
 class ConfocalToAnatomyRegistrationConfig(BaseModel):
