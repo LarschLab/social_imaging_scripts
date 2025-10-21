@@ -87,6 +87,7 @@ def _resample_array_to_fixed(
     fixed_spacing: Tuple[float, float, float],
     fixed_shape: Tuple[int, int, int],
     default_value: float = 0.0,
+    translation_um: Optional[Tuple[float, float, float]] = None,
 ) -> np.ndarray:
     image = sitk.GetImageFromArray(array.astype(np.float32))
     image.SetSpacing(moving_spacing)
@@ -96,6 +97,11 @@ def _resample_array_to_fixed(
     resampler.SetOutputOrigin((0.0, 0.0, 0.0))
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(float(default_value))
+    if translation_um is not None:
+        # TranslationTransform expects (x, y, z) in physical units, mapping output (fixed) → input (moving)
+        tx = sitk.TranslationTransform(3)
+        tx.SetOffset((float(translation_um[0]), float(translation_um[1]), float(translation_um[2])))
+        resampler.SetTransform(tx)
     resampled = resampler.Execute(image)
     return sitk.GetArrayFromImage(resampled).astype(np.float32)
 
@@ -712,6 +718,11 @@ def register_confocal_to_anatomy(
             moving_spacing_xyz,
             fixed_spacing_xyz,
             fixed_array.shape,
+            translation_um=(
+                center_seed_translation_um[0],
+                center_seed_translation_um[1],
+                center_seed_translation_um[2],
+            ),
         )
         support_mask_for_qc = moving_mask.copy()
         coverage = 100.0 * float(np.count_nonzero(moving_mask > 0.05)) / max(moving_mask.size, 1)
@@ -809,20 +820,16 @@ def register_confocal_to_anatomy(
     if seed_qc_path is not None:
         seed_qc_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            from scipy.ndimage import shift as nd_shift  # type: ignore
-
-            spacing_z = float(spacing[2])
-            spacing_y = float(spacing[1])
-            spacing_x = float(spacing[0])
-            shift_z = -translation_vec[2] / max(spacing_z, 1e-6)
-            shift_y = -translation_vec[1] / max(spacing_y, 1e-6)
-            shift_x = -translation_vec[0] / max(spacing_x, 1e-6)
-            moving_seed = nd_shift(moving_array, shift=(shift_z, shift_y, shift_x), order=1, mode="constant", cval=0.0)
             moving_seed_fixed = _resample_array_to_fixed(
-                moving_seed,
+                moving_array,
                 (spacing[0], spacing[1], spacing[2]),
                 (fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]),
                 fixed_array.shape,
+                translation_um=(
+                    translation_vec[0],
+                    translation_vec[1],
+                    translation_vec[2],
+                ),
             )
             moving_original_fixed = _resample_array_to_fixed(
                 moving_array,
