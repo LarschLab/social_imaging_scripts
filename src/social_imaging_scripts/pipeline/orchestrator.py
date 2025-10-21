@@ -593,6 +593,72 @@ def process_anatomy_session(
         result.message = "; ".join(notes)
     return result
 
+def _load_gui_preprocess_for_session(
+    *, cfg: ProjectConfig, animal_id: str, session_id: str
+) -> Optional[dict]:
+    """Load GUI-driven preprocessing settings for a confocal session.
+
+    Returns a mapping with keys:
+      - rotation_deg: float
+      - translation_px: tuple[float, float]
+      - flip_horizontal: bool
+      - flip_z: bool
+      - source: str ("gui_log" | "recycled_manual_prematch")
+    or None if no information is available.
+    """
+    try:
+        from .processing_log import build_processing_log_path, load_processing_log
+
+        base_dir = cfg.output_base_dir or Path.cwd()
+        log_path = build_processing_log_path(cfg.processing_log, animal_id, base_dir=Path(base_dir))
+        if not log_path.exists():
+            return None
+        log = load_processing_log(log_path)
+        # 1) Prefer confocal_preprocessing stage parameters
+        stage_key = f"confocal_preprocessing:{session_id}"
+        stage = log.stages.get(stage_key)
+        if stage and isinstance(stage.parameters, dict):
+            gt = stage.parameters.get("gui_transform") or {}
+            if gt:
+                rot = gt.get("rotation_deg")
+                tx = gt.get("translation_px") or gt.get("translation_xy_px")
+                fx = bool(gt.get("flip_horizontal", True))
+                fz = bool(gt.get("flip_z", True))
+                chan = gt.get("display_channel")
+                if rot is not None:
+                    return {
+                        "rotation_deg": float(rot),
+                        "translation_px": (float(tx[0]), float(tx[1])) if isinstance(tx, (list, tuple)) and len(tx) >= 2 else (0.0, 0.0),
+                        "flip_horizontal": fx,
+                        "flip_z": fz,
+                        "display_channel": chan,
+                        "source": "gui_log",
+                    }
+        # 2) Recycle existing manual prematch from confocal_to_anatomy_registration
+        stage = log.stages.get("confocal_to_anatomy_registration")
+        if stage and isinstance(stage.parameters, dict):
+            mp = stage.parameters.get("manual_prematch") or {}
+            rec = mp.get(session_id)
+            if rec:
+                rot = rec.get("rotation_deg")
+                tx = (float(rec.get("translation_x_px", 0.0)), float(rec.get("translation_y_px", 0.0)))
+                fx = bool(rec.get("flip_horizontal", True))
+                fz = bool(rec.get("flip_z", True))
+                chan = rec.get("display_channel")
+                if rot is not None:
+                    return {
+                        "rotation_deg": float(rot),
+                        "translation_px": tx,
+                        "flip_horizontal": fx,
+                        "flip_z": fz,
+                        "display_channel": chan,
+                        "source": "recycled_manual_prematch",
+                    }
+    except Exception:
+        logger.exception("Failed to load GUI preprocessing settings")
+    return None
+
+
 def process_confocal_session(
     *,
     animal: AnimalMetadata,
@@ -626,6 +692,32 @@ def process_confocal_session(
         result.status = "failed"
         result.message = f"failed to resolve confocal raw path: {exc}"
         return result, None
+    # Load GUI transform (or recycle manual prematch) if required
+    gui = _load_gui_preprocess_for_session(cfg=cfg, animal_id=animal.animal_id, session_id=session.session_id)
+    if stage_cfg.require_gui_transform and gui is None:
+        result.status = "failed"
+        result.message = (
+            "missing GUI preprocessing settings; run manual_confocal_prematch.ipynb or supply GUI transform"
+        )
+        return result, None
+
+    rotation_deg = None
+    flip_horizontal = stage_cfg.flip_horizontal
+    flip_z = stage_cfg.flip_z
+    gui_translation_px = None
+    gui_source = None
+    if gui is not None:
+        rotation_deg = float(gui.get("rotation_deg")) if gui.get("rotation_deg") is not None else None
+        flip_horizontal = bool(gui.get("flip_horizontal", flip_horizontal))
+        flip_z = bool(gui.get("flip_z", flip_z))
+        if gui.get("translation_px") is not None:
+            tx = gui.get("translation_px")
+            try:
+                gui_translation_px = (float(tx[0]), float(tx[1]))
+            except Exception:
+                gui_translation_px = None
+        gui_source = str(gui.get("source")) if gui.get("source") else None
+
     try:
         outputs = confocal_preproc.run(
             animal=animal,
@@ -633,8 +725,16 @@ def process_confocal_session(
             cfg_root=output_root,
             channel_template=stage_cfg.channel_filename_template,
             metadata_filename=stage_cfg.metadata_filename_template,
-            flip_horizontal=stage_cfg.flip_horizontal,
-            flip_z=stage_cfg.flip_z,
+            flip_horizontal=flip_horizontal,
+            flip_z=flip_z,
+            rotation_deg=rotation_deg if stage_cfg.apply_gui_rotation else None,
+            rotation_offset_deg=float(getattr(stage_cfg, "gui_rotation_offset_deg", 0.0)),
+            rotation_offset_signed=bool(getattr(stage_cfg, "gui_rotation_offset_signed", False)),
+            apply_rotation=bool(stage_cfg.apply_gui_rotation),
+            apply_flips=bool(stage_cfg.apply_gui_flips),
+            gui_translation_px=gui_translation_px,
+            gui_source=gui_source,
+            gui_display_channel=gui.get("display_channel") if gui is not None else None,
             reprocess=mode == StageMode.FORCE,
             raw_path_override=raw_path,
         )
@@ -653,6 +753,7 @@ def process_confocal_session(
         if outputs.reused
         else "confocal preprocessing ran"
     )
+    # Enrich processing log parameters handled in run_pipeline
     return result, outputs
 
 
@@ -781,6 +882,8 @@ def process_confocal_to_anatomy_registration(
             initial_translation_mode=stage_cfg.initial_translation_mode,
             crop_to_extent=stage_cfg.crop_to_extent,
             crop_padding_um=stage_cfg.crop_padding_um,
+            center_align_seed=stage_cfg.center_align_seed,
+            moving_support_mask_cfg=stage_cfg.moving_support_mask,
             blur_fixed_z_sigma=stage_cfg.blur_fixed_z_sigma,
             output_base_dir=Path(cfg.output_base_dir),
             processing_log_config=cfg.processing_log,
@@ -1337,9 +1440,41 @@ def run_pipeline(
                 if animal_log is not None and log_path is not None:
                     parameters = {
                         "confocal_preprocess_mode": confocal_preproc_cfg.mode.value,
-                        "flip_horizontal": confocal_preproc_cfg.flip_horizontal,
-                        "flip_z": confocal_preproc_cfg.flip_z,
+                        "flip_horizontal": bool(confocal_outputs.flip_horizontal) if confocal_outputs is not None else bool(confocal_preproc_cfg.flip_horizontal),
+                        "flip_z": bool(confocal_outputs.flip_z) if confocal_outputs is not None else bool(confocal_preproc_cfg.flip_z),
+                        "require_gui_transform": bool(confocal_preproc_cfg.require_gui_transform),
+                        "apply_gui_rotation": bool(confocal_preproc_cfg.apply_gui_rotation),
+                        "apply_gui_flips": bool(confocal_preproc_cfg.apply_gui_flips),
+                        "gui_rotation_offset_deg": float(getattr(confocal_preproc_cfg, "gui_rotation_offset_deg", 0.0)),
+                        "gui_rotation_offset_signed": bool(getattr(confocal_preproc_cfg, "gui_rotation_offset_signed", False)),
                     }
+                    # Add GUI transform summary from preprocessing metadata
+                    try:
+                        if confocal_outputs is not None and confocal_outputs.metadata_path.exists():
+                            meta = json.loads(confocal_outputs.metadata_path.read_text(encoding="utf-8"))
+                            gt = {}
+                            if meta.get("gui_rotation_deg_raw") is not None:
+                                gt["rotation_deg_raw"] = float(meta.get("gui_rotation_deg_raw"))
+                            if meta.get("gui_rotation_offset_deg") is not None:
+                                gt["rotation_offset_deg"] = float(meta.get("gui_rotation_offset_deg"))
+                            if meta.get("gui_rotation_deg_applied") is not None:
+                                gt["rotation_applied_deg"] = float(meta.get("gui_rotation_deg_applied"))
+                            if meta.get("gui_translation_px") is not None:
+                                gt["translation_px"] = meta.get("gui_translation_px")
+                            if meta.get("gui_source") is not None:
+                                gt["source"] = meta.get("gui_source")
+                            if meta.get("flip_horizontal") is not None:
+                                gt["flip_horizontal"] = bool(meta.get("flip_horizontal"))
+                            if meta.get("flip_z") is not None:
+                                gt["flip_z"] = bool(meta.get("flip_z"))
+                            if meta.get("gui_display_channel") is not None:
+                                gt["display_channel"] = meta.get("gui_display_channel")
+                            if gui and gui.get("display_channel"):
+                                gt.setdefault("display_channel", gui.get("display_channel"))
+                            if gt:
+                                parameters["gui_transform"] = gt
+                    except Exception:
+                        pass
                     if confocal_outputs is not None:
                         parameters["voxel_size_um"] = [
                             float(confocal_outputs.voxel_size_um[0]),

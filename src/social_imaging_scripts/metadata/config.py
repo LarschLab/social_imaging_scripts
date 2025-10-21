@@ -276,6 +276,39 @@ class ConfocalPreprocessingConfig(BaseModel):
         ...,
         description="Reverse confocal stack order along the axial (Z) dimension.",
     )
+    # GUI-driven preprocessing controls
+    require_gui_transform: bool = Field(
+        default=True,
+        description=(
+            "Require GUI-provided preprocessing settings (rotation/translation/flips). "
+            "If true and settings are missing, confocal preprocessing fails."
+        ),
+    )
+    apply_gui_rotation: bool = Field(
+        default=True,
+        description=(
+            "Apply the GUI rotation (degrees about Z) during preprocessing."
+        ),
+    )
+    apply_gui_flips: bool = Field(
+        default=True,
+        description=(
+            "Apply the GUI axis flips during preprocessing (horizontal/X and Z)."
+        ),
+    )
+    gui_rotation_offset_deg: float = Field(
+        default=90.0,
+        description=(
+            "Constant offset (degrees) added to GUI rotation before applying in preprocessing."
+        ),
+    )
+    gui_rotation_offset_signed: bool = Field(
+        default=True,
+        description=(
+            "When true, apply the rotation offset with the sign of the GUI angle. "
+            "E.g. raw -127° with 90° offset becomes -127-90 = -217° (≡ 143°)."
+        ),
+    )
 
     @field_validator("root_subdir", mode="before")
     @classmethod
@@ -368,6 +401,33 @@ class FireantsRegistrationStageConfig(BaseModel):
         return normalise_pathlike(value)
 
 
+class MovingSupportMaskConfig(BaseModel):
+    """Settings for deriving a support mask from the moving confocal stack."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable building a support mask from the moving confocal volume.",
+    )
+    threshold_percentile: float = Field(
+        default=60.0,
+        description="Percentile of the moving MIP used to threshold the support mask.",
+    )
+    dilate_xy_vox: int = Field(
+        default=3,
+        description="Number of voxels to dilate the support mask in XY.",
+    )
+    dilate_z_vox: int = Field(
+        default=1,
+        description="Number of voxels to dilate the support mask along Z.",
+    )
+    soft_edge_vox: int = Field(
+        default=5,
+        description="Soft edge width (voxels) applied to the support mask to avoid hard boundaries.",
+    )
+
+
 class ConfocalToAnatomyRegistrationConfig(BaseModel):
     """Configuration for registering confocal stacks to two-photon anatomy."""
 
@@ -445,6 +505,14 @@ class ConfocalToAnatomyRegistrationConfig(BaseModel):
     blur_fixed_z_sigma: float = Field(
         default=0.0,
         description="Gaussian blur sigma (in voxels) applied to fixed (2P anatomy) in Z to match confocal PSF. Set to 0 to disable.",
+    )
+    center_align_seed: bool = Field(
+        default=True,
+        description="Initialise registration by aligning centres via translation seed.",
+    )
+    moving_support_mask: MovingSupportMaskConfig = Field(
+        default_factory=MovingSupportMaskConfig,
+        description="Parameters controlling the moving-derived support mask.",
     )
     prematch: ConfocalPrematchConfig = Field(
         default_factory=ConfocalPrematchConfig,

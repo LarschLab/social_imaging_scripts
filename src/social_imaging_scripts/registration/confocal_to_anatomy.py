@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-from collections import defaultdict
 import logging
 import json
 import math
@@ -37,6 +36,142 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _build_support_mask_from_moving(
+    volume: np.ndarray,
+    percentile: float,
+    dilate_xy: int,
+    dilate_z: int,
+    soft_edge: int,
+) -> np.ndarray:
+    """Construct a soft support mask for a moving volume from its 3D MIP."""
+
+    mip = np.max(volume, axis=0)
+    positive = mip[mip > 0]
+    if positive.size == 0:
+        return np.ones_like(volume, dtype=np.float32)
+
+    threshold = np.percentile(positive, np.clip(percentile, 0.0, 100.0))
+    mask_xy = mip >= threshold
+
+    if dilate_xy > 0:
+        from scipy.ndimage import binary_dilation  # type: ignore
+
+        structure_xy = np.ones((2 * dilate_xy + 1, 2 * dilate_xy + 1), dtype=bool)
+        mask_xy = binary_dilation(mask_xy, structure=structure_xy)
+
+    mask = np.broadcast_to(mask_xy[None, :, :], volume.shape).copy()
+
+    if dilate_z > 0:
+        from scipy.ndimage import binary_dilation  # type: ignore
+
+        structure_z = np.ones((2 * dilate_z + 1, 1, 1), dtype=bool)
+        mask = binary_dilation(mask, structure=structure_z)
+
+    mask = mask.astype(np.float32)
+
+    if soft_edge > 0:
+        from scipy.ndimage import distance_transform_edt  # type: ignore
+
+        mask_bool = mask > 0
+        dist = distance_transform_edt(~mask_bool)
+        taper = np.clip(1.0 - dist / float(soft_edge), 0.0, 1.0)
+        mask = np.maximum(mask, taper.astype(np.float32))
+
+    return mask.astype(np.float32)
+
+
+def _resample_array_to_fixed(
+    array: np.ndarray,
+    moving_spacing: Tuple[float, float, float],
+    fixed_spacing: Tuple[float, float, float],
+    fixed_shape: Tuple[int, int, int],
+    default_value: float = 0.0,
+) -> np.ndarray:
+    image = sitk.GetImageFromArray(array.astype(np.float32))
+    image.SetSpacing(moving_spacing)
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize((int(fixed_shape[2]), int(fixed_shape[1]), int(fixed_shape[0])))
+    resampler.SetOutputSpacing(fixed_spacing)
+    resampler.SetOutputOrigin((0.0, 0.0, 0.0))
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(float(default_value))
+    resampled = resampler.Execute(image)
+    return sitk.GetArrayFromImage(resampled).astype(np.float32)
+
+
+def _write_seed_qc(
+    fixed: np.ndarray,
+    moving_seed: np.ndarray,
+    moving_original: np.ndarray,
+    output_path: Path,
+) -> None:
+    """Write QC overlays showing XY, YZ, XZ for seed and raw.
+
+    All inputs are expected on the fixed grid (Z, Y, X).
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        def _norm(img: np.ndarray) -> np.ndarray:
+            img = img.astype(np.float32)
+            if not np.any(img):
+                return np.zeros_like(img, dtype=np.float32)
+            vmin, vmax = np.percentile(img, [1, 99])
+            if vmax <= vmin:
+                return np.zeros_like(img, dtype=np.float32)
+            out = (img - vmin) / (vmax - vmin)
+            return np.clip(out, 0.0, 1.0)
+
+        zmid = fixed.shape[0] // 2
+        ymid = fixed.shape[1] // 2
+        xmid = fixed.shape[2] // 2
+
+        # XY views
+        fixed_xy = _norm(fixed[zmid])
+        seed_xy = _norm(moving_seed[zmid])
+        raw_xy = _norm(moving_original[zmid])
+
+        # YZ views
+        fixed_yz = _norm(fixed[:, :, xmid])
+        seed_yz = _norm(moving_seed[:, :, xmid])
+        raw_yz = _norm(moving_original[:, :, xmid])
+
+        # XZ views
+        fixed_xz = _norm(fixed[:, ymid, :])
+        seed_xz = _norm(moving_seed[:, ymid, :])
+        raw_xz = _norm(moving_original[:, ymid, :])
+
+        def _overlay(fg: np.ndarray, bg: np.ndarray) -> np.ndarray:
+            h, w = bg.shape
+            ov = np.zeros((h, w, 3), dtype=np.float32)
+            ov[..., 0] = bg * 0.8
+            ov[..., 1] = fg
+            ov[..., 2] = bg * 0.8
+            return np.clip(ov, 0.0, 1.0)
+
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        # Row 1: XY
+        axes[0, 0].imshow(fixed_xy, cmap="magma")
+        axes[0, 0].set_title("Fixed XY")
+        axes[0, 1].imshow(raw_xy, cmap="viridis")
+        axes[0, 1].set_title("Moving XY (raw)")
+        axes[0, 2].imshow(_overlay(seed_xy, fixed_xy))
+        axes[0, 2].set_title("Seed overlay XY")
+        # Row 2: YZ and XZ overlays
+        axes[1, 0].imshow(_overlay(seed_yz, fixed_yz))
+        axes[1, 0].set_title("Seed overlay YZ")
+        axes[1, 1].imshow(_overlay(seed_xz, fixed_xz))
+        axes[1, 1].set_title("Seed overlay XZ")
+        axes[1, 2].axis("off")
+        for ax in axes.ravel():
+            ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+    except Exception:  # pragma: no cover - QC convenience only
+        logger.warning("Failed to write seed QC overlay", exc_info=True)
+
 def _affine_tensor_from_3x4(matrix: torch.Tensor) -> torch.Tensor:
     eye = torch.eye(4, dtype=matrix.dtype, device=matrix.device).unsqueeze(0).repeat(matrix.shape[0], 1, 1)
     eye[:, :3, :3] = matrix[:, :, :3]
@@ -44,25 +179,33 @@ def _affine_tensor_from_3x4(matrix: torch.Tensor) -> torch.Tensor:
     return eye
 
 
-def _convert_phys_to_torch_affine(affine_phys: torch.Tensor, batch) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert a physical-space affine (3x4) into fireANTs torch space."""
+def _convert_phys_to_torch_affine(
+    affine_phys: torch.Tensor,
+    fixed_batch,
+    moving_batch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a physical-space affine into fireANTs torch coordinates."""
 
     T_phys = _affine_tensor_from_3x4(affine_phys)
-    torch2phy = batch.get_torch2phy().to(device=affine_phys.device, dtype=affine_phys.dtype)
-    phy2torch = batch.get_phy2torch().to(device=affine_phys.device, dtype=affine_phys.dtype)
-    T_torch = torch.matmul(phy2torch, torch.matmul(T_phys, torch2phy))
+    fixed_t2p = fixed_batch.get_torch2phy().to(device=affine_phys.device, dtype=affine_phys.dtype)
+    moving_p2t = moving_batch.get_phy2torch().to(device=affine_phys.device, dtype=affine_phys.dtype)
+    T_torch = moving_p2t @ (T_phys @ fixed_t2p)
     rotation = T_torch[:, :3, :3]
     translation = T_torch[:, :3, 3]
     return rotation, translation
 
 
-def _convert_torch_to_phys_affine(affine_torch: torch.Tensor, batch) -> torch.Tensor:
-    """Convert a torch-space affine (3x4) back into physical space."""
+def _convert_torch_to_phys_affine(
+    affine_torch: torch.Tensor,
+    fixed_batch,
+    moving_batch,
+) -> torch.Tensor:
+    """Convert a torch-space affine (fixed→moving) back to physical space."""
 
     T_torch = _affine_tensor_from_3x4(affine_torch)
-    torch2phy = batch.get_torch2phy().to(device=affine_torch.device, dtype=affine_torch.dtype)
-    phy2torch = batch.get_phy2torch().to(device=affine_torch.device, dtype=affine_torch.dtype)
-    T_phys = torch.matmul(torch2phy, torch.matmul(T_torch, phy2torch))
+    moving_t2p = moving_batch.get_torch2phy().to(device=affine_torch.device, dtype=affine_torch.dtype)
+    fixed_p2t = fixed_batch.get_phy2torch().to(device=affine_torch.device, dtype=affine_torch.dtype)
+    T_phys = moving_t2p @ (T_torch @ fixed_p2t)
     out = torch.empty_like(affine_torch)
     out[:, :, :3] = T_phys[:, :3, :3]
     out[:, :, 3] = T_phys[:, :3, 3]
@@ -412,9 +555,12 @@ def register_confocal_to_anatomy(
     initial_translation_mode: str,
     crop_to_extent: bool,
     crop_padding_um: float,
+    center_align_seed: bool,
+    moving_support_mask_cfg,
     blur_fixed_z_sigma: float = 0.0,
     output_base_dir: Optional[Path] = None,
     processing_log_config = None,
+    disable_prematch: bool = True,
 ) -> Dict[str, object]:
     """Register a confocal channel to two-photon anatomy and warp additional channels.
     
@@ -482,98 +628,27 @@ def register_confocal_to_anatomy(
         moving_array = moving_array[crop_slices]
         logger.info("After cropping: confocal shape %s", moving_array.shape)
 
-    support_mask = (moving_array > 0.0).astype(np.float32)
-    if not np.any(support_mask):
-        logger.warning("Confocal support mask is empty after cropping; defaulting to full volume")
-        support_mask.fill(1.0)
-    else:
-        from scipy.ndimage import binary_dilation  # type: ignore
-
-        support_mask = binary_dilation(support_mask > 0.0, iterations=1).astype(np.float32)
-
-    moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
-    moving_mask *= support_mask
-    fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
-    if np.any(moving_mask != 1.0) or np.any(fixed_mask != 1.0):
+    center_seed_translation_um = np.zeros(3, dtype=np.float64)
+    if center_align_seed:
+        center_conf = np.array([
+            0.5 * (moving_array.shape[2] - 1) * spacing[0],
+            0.5 * (moving_array.shape[1] - 1) * spacing[1],
+            0.5 * (moving_array.shape[0] - 1) * spacing[2],
+        ], dtype=np.float64)
+        center_anat = np.array([
+            0.5 * (fixed_array.shape[2] - 1) * fixed_spacing_um[0],
+            0.5 * (fixed_array.shape[1] - 1) * fixed_spacing_um[1],
+            0.5 * (fixed_array.shape[0] - 1) * fixed_spacing_um[2],
+        ], dtype=np.float64)
+        center_seed_translation_um = center_conf - center_anat
         logger.info(
-            "Applying central/support masks (mask_margin_xy=%.3f, mask_margin_z=%.3f)",
-            mask_margin_xy,
-            mask_margin_z,
+            "Center alignment translation seed (µm): Δx=%.2f, Δy=%.2f, Δz=%.2f",
+            center_seed_translation_um[0],
+            center_seed_translation_um[1],
+            center_seed_translation_um[2],
         )
-    support_mask_for_qc = moving_mask.copy()
-    covered_voxels = int(np.count_nonzero(moving_mask))
-    total_voxels = int(moving_mask.size)
-    logger.info(
-        "FireANTs support mask covers %d/%d voxels (%.1f%%)",
-        covered_voxels,
-        total_voxels,
-        100.0 * covered_voxels / max(total_voxels, 1),
-    )
-    # Check for manual prematch from processing log first
-    prematch_result: Optional[XYMIPPrematchResult] = None
-    manual_prematch_data = None
-    if output_base_dir is not None and processing_log_config is not None:
-        manual_prematch_data = _load_manual_prematch_from_log(
-            animal_id,
-            confocal_session_id,
-            output_base_dir,
-            processing_log_config,
-        )
-        if manual_prematch_data:
-            logger.info("Using manual prematch from processing log (overrides automated prematch)")
-            prematch_result = _manual_prematch_to_result(
-                manual_prematch_data,
-                fixed_spacing_um,  # GUI operates in anatomy pixel space
-            )
-    
-    # Fall back to automated prematch if no manual prematch found
-    if prematch_result is None and prematch_settings.enabled:
-        try:
-            prematch_result = run_xy_mip_prematch(
-                moving_array,
-                fixed_array,
-                spacing,
-                fixed_spacing_um,
-                prematch_settings,
-            )
-            if prematch_result is None:
-                logger.warning("Prematch did not return a result; falling back to FireANTs moments init")
-            elif prematch_result.applied:
-                logger.info(
-                    (
-                        "Automated prematch seed accepted: θ=%.2f°, score=%.3f, translation=(%.1f, %.1f, %.1f) µm"
-                    ),
-                    prematch_result.rotation_deg,
-                    prematch_result.score,
-                    prematch_result.translation_um[0],
-                    prematch_result.translation_um[1],
-                    prematch_result.translation_um[2],
-                )
-            else:
-                logger.info(
-                    "Prematch score %.3f below threshold %.3f; ignoring prematch seed",
-                    prematch_result.score,
-                    prematch_settings.min_score,
-                )
-        except Exception:
-            logger.exception("Prematch heuristic failed; continuing without seed")
-            prematch_result = None
-
-    moving_array *= moving_mask
-    fixed_array *= fixed_mask
-
-    # Apply Z-blur to fixed image (2P anatomy) to match confocal PSF
-    if blur_fixed_z_sigma > 0:
-        from scipy.ndimage import gaussian_filter1d
-        logger.info("Blurring fixed (2P anatomy) in Z with sigma=%.2f voxels to match confocal PSF", blur_fixed_z_sigma)
-        fixed_array = gaussian_filter1d(fixed_array, sigma=blur_fixed_z_sigma, axis=0)
-
-    moving_image = _to_sitk_image(moving_array, spacing)
-    fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
-    dim = moving_image.GetDimension()
-
     translation_mode = (initial_translation_mode or "none").lower()
-    translation_vec = np.zeros(3, dtype=np.float64)
+    translation_vec = center_seed_translation_um.copy()
     if translation_mode == "crop" and crop_info is not None:
         orig_center_x = (original_shape[2] - 1) / 2.0
         orig_center_y = (original_shape[1] - 1) / 2.0
@@ -581,7 +656,7 @@ def register_confocal_to_anatomy(
         cropped_center_y = (crop_info["y_vox"][0] + crop_info["y_vox"][1] - 1) / 2.0
         delta_x_vox = cropped_center_x - orig_center_x
         delta_y_vox = cropped_center_y - orig_center_y
-        translation_vec = -np.array([
+        translation_vec += -np.array([
             delta_x_vox * spacing[0],
             delta_y_vox * spacing[1],
             0.0,
@@ -597,12 +672,190 @@ def register_confocal_to_anatomy(
             ],
             dtype=np.float64,
         )
-        translation_vec = -delta_vox * np.array(
+        translation_vec += -delta_vox * np.array(
             [spacing[0], spacing[1], float(fixed_spacing_um[2])],
             dtype=np.float64,
         )
     else:
         translation_mode = "none"
+
+    translation_vec_np = translation_vec.copy()
+    logger.info(
+        "Final translation seed (µm): Δx=%.3f, Δy=%.3f, Δz=%.3f (mode=%s)",
+        translation_vec_np[0],
+        translation_vec_np[1],
+        translation_vec_np[2],
+        translation_mode,
+    )
+
+    mask_cfg = moving_support_mask_cfg
+    moving_mask = None
+    fixed_mask = None
+    support_mask_for_qc = None
+    if mask_cfg.enabled:
+        moving_mask = _build_support_mask_from_moving(
+            moving_array,
+            mask_cfg.threshold_percentile,
+            mask_cfg.dilate_xy_vox,
+            mask_cfg.dilate_z_vox,
+            mask_cfg.soft_edge_vox,
+        )
+        moving_mask = np.clip(moving_mask, 0.0, 1.0)
+        moving_spacing_xyz = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        fixed_spacing_xyz = (
+            float(fixed_spacing_um[0]),
+            float(fixed_spacing_um[1]),
+            float(fixed_spacing_um[2]),
+        )
+        fixed_mask = _resample_array_to_fixed(
+            moving_mask,
+            moving_spacing_xyz,
+            fixed_spacing_xyz,
+            fixed_array.shape,
+        )
+        support_mask_for_qc = moving_mask.copy()
+        coverage = 100.0 * float(np.count_nonzero(moving_mask > 0.05)) / max(moving_mask.size, 1)
+        logger.info(
+            "Using moving support mask (percentile=%.1f, dilate_xy=%d, dilate_z=%d, soft_edge=%d) covering %.1f%% of voxels",
+            mask_cfg.threshold_percentile,
+            mask_cfg.dilate_xy_vox,
+            mask_cfg.dilate_z_vox,
+            mask_cfg.soft_edge_vox,
+            coverage,
+        )
+    else:
+        support_mask = (moving_array > 0.0).astype(np.float32)
+        if not np.any(support_mask):
+            logger.warning("Confocal support mask is empty after cropping; defaulting to full volume")
+            support_mask.fill(1.0)
+        else:
+            from scipy.ndimage import binary_dilation  # type: ignore
+
+            support_mask = binary_dilation(support_mask > 0.0, iterations=1).astype(np.float32)
+
+        moving_mask = _build_central_mask(moving_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+        moving_mask *= support_mask
+        fixed_mask = _build_central_mask(fixed_array.shape, mask_margin_xy, mask_margin_z, mask_soft_edges)
+        support_mask_for_qc = moving_mask.copy()
+        covered_voxels = int(np.count_nonzero(moving_mask))
+        total_voxels = int(moving_mask.size)
+        logger.info(
+            "Applying central/support masks (mask_margin_xy=%.3f, mask_margin_z=%.3f) covering %.1f%%",
+            mask_margin_xy,
+            mask_margin_z,
+            100.0 * covered_voxels / max(total_voxels, 1),
+        )
+    # Prematch is intentionally disabled in this workflow. We record this decision and skip
+    # both manual and automated prematch seeding. Registration will recover translation itself.
+    prematch_result: Optional[XYMIPPrematchResult] = None
+    if disable_prematch:
+        logger.info("Prematch disabled: using unseeded FireANTs initialisation (no GUI translation applied)")
+    else:
+        # Check for manual prematch from processing log first
+        manual_prematch_data = None
+        if output_base_dir is not None and processing_log_config is not None:
+            manual_prematch_data = _load_manual_prematch_from_log(
+                animal_id,
+                confocal_session_id,
+                output_base_dir,
+                processing_log_config,
+            )
+            if manual_prematch_data:
+                logger.info("Using manual prematch from processing log (overrides automated prematch)")
+                prematch_result = _manual_prematch_to_result(
+                    manual_prematch_data,
+                    fixed_spacing_um,  # GUI operates in anatomy pixel space
+                )
+        # Fall back to automated prematch if no manual prematch found
+        if prematch_result is None and prematch_settings.enabled:
+            try:
+                prematch_result = run_xy_mip_prematch(
+                    moving_array,
+                    fixed_array,
+                    spacing,
+                    fixed_spacing_um,
+                    prematch_settings,
+                )
+                if prematch_result is None:
+                    logger.warning("Prematch did not return a result; falling back to FireANTs moments init")
+                elif prematch_result.applied:
+                    logger.info(
+                        (
+                            "Automated prematch seed accepted: θ=%.2f°, score=%.3f, translation=(%.1f, %.1f, %.1f) µm"
+                        ),
+                        prematch_result.rotation_deg,
+                        prematch_result.score,
+                        prematch_result.translation_um[0],
+                        prematch_result.translation_um[1],
+                        prematch_result.translation_um[2],
+                    )
+                else:
+                    logger.info(
+                        "Prematch score %.3f below threshold %.3f; ignoring prematch seed",
+                        prematch_result.score,
+                        prematch_settings.min_score,
+                    )
+            except Exception:
+                logger.exception("Prematch heuristic failed; continuing without seed")
+                prematch_result = None
+
+    moving_array *= moving_mask
+    fixed_array *= fixed_mask
+
+    seed_qc_path = None
+    if output_root is not None:
+        seed_qc_path = output_root / qc_subdir / f"{animal_id}_{confocal_session_id}_seed_overlay.png"
+
+    if seed_qc_path is not None:
+        seed_qc_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            from scipy.ndimage import shift as nd_shift  # type: ignore
+
+            spacing_z = float(spacing[2])
+            spacing_y = float(spacing[1])
+            spacing_x = float(spacing[0])
+            shift_z = -translation_vec[2] / max(spacing_z, 1e-6)
+            shift_y = -translation_vec[1] / max(spacing_y, 1e-6)
+            shift_x = -translation_vec[0] / max(spacing_x, 1e-6)
+            moving_seed = nd_shift(moving_array, shift=(shift_z, shift_y, shift_x), order=1, mode="constant", cval=0.0)
+            moving_seed_fixed = _resample_array_to_fixed(
+                moving_seed,
+                (spacing[0], spacing[1], spacing[2]),
+                (fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]),
+                fixed_array.shape,
+            )
+            moving_original_fixed = _resample_array_to_fixed(
+                moving_array,
+                (spacing[0], spacing[1], spacing[2]),
+                (fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]),
+                fixed_array.shape,
+            )
+            _write_seed_qc(
+                fixed_array,
+                moving_seed_fixed,
+                moving_original_fixed,
+                seed_qc_path,
+            )
+        except Exception:
+            logger.warning("Failed to compute seed QC preview", exc_info=True)
+
+    # Apply Z-blur to fixed image (2P anatomy) to match confocal PSF
+    if blur_fixed_z_sigma > 0:
+        from scipy.ndimage import gaussian_filter1d
+        logger.info("Blurring fixed (2P anatomy) in Z with sigma=%.2f voxels to match confocal PSF", blur_fixed_z_sigma)
+        fixed_array = gaussian_filter1d(fixed_array, sigma=blur_fixed_z_sigma, axis=0)
+
+    moving_image = _to_sitk_image(moving_array, spacing)
+    fixed_image = _to_sitk_image(fixed_array, fixed_spacing_um)
+    try:
+        logger.info(
+            "Headers: moving origin=%s spacing=%s direction=%s | fixed origin=%s spacing=%s direction=%s",
+            tuple(moving_image.GetOrigin()), tuple(moving_image.GetSpacing()), tuple(moving_image.GetDirection()),
+            tuple(fixed_image.GetOrigin()), tuple(fixed_image.GetSpacing()), tuple(fixed_image.GetDirection()),
+        )
+    except Exception:
+        pass
+    dim = moving_image.GetDimension()
 
     if histogram_match:
         logger.info(
@@ -628,240 +881,26 @@ def register_confocal_to_anatomy(
     moving_batch = BatchedImages(moving_fa)
     fixed_batch = BatchedImages(fixed_fa)
 
-    # Initialize with manual prematch if available, otherwise use moments
+    init_moment_tensor = None
+    init_translation_tensor = None
+    if np.linalg.norm(translation_vec) > 1e-6:
+        seed_affine = torch.zeros(1, 3, 4, device=cfg.device, dtype=torch.float32)
+        seed_affine[0, :, :3] = torch.eye(3, dtype=torch.float32, device=cfg.device)
+        seed_affine[0, :, 3] = torch.tensor(translation_vec, dtype=torch.float32, device=cfg.device)
+        init_moment_tensor, init_translation_tensor = _convert_phys_to_torch_affine(
+            seed_affine,
+            fixed_batch,
+            moving_batch,
+        )
+
+    # Rigid registration (no prematch seeding)
     prematch_affine_matrix: Optional[np.ndarray] = None
-    init_affine = torch.eye(3, 4, device=cfg.device, dtype=torch.float32).unsqueeze(0)
-    
-    center_conf = np.array([
-        0.5 * (moving_array.shape[2] - 1) * spacing[0],
-        0.5 * (moving_array.shape[1] - 1) * spacing[1],
-        0.5 * (moving_array.shape[0] - 1) * spacing[2],
-    ], dtype=np.float64)
-    center_anat = np.array([
-        0.5 * (fixed_array.shape[2] - 1) * fixed_spacing_um[0],
-        0.5 * (fixed_array.shape[1] - 1) * fixed_spacing_um[1],
-        0.5 * (fixed_array.shape[0] - 1) * fixed_spacing_um[2],
-    ], dtype=np.float64)
-    # FireANTs expects a physical-space affine that maps FIXED (anatomy) -> MOVING (confocal)
-    # For an identity rotation, that means y = x + t with t = center_moving - center_fixed
-    translation_um = center_conf - center_anat
-    logger.info(
-        "Synthetic centre-align seed: conf_center=%s µm, anat_center=%s µm, translation=%s µm",
-        np.round(center_conf, 2),
-        np.round(center_anat, 2),
-        np.round(translation_um, 2),
-    )
-    translation_vec_np = translation_um
-    # Hard-coded 45° clockwise rotation around shared centre (about Z)
-    theta = -np.deg2rad(45.0)
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
-    R = np.array(
-        [
-            [cos_t, -sin_t, 0.0],
-            [sin_t,  cos_t, 0.0],
-            [0.0,    0.0,   1.0],
-        ],
-        dtype=np.float64,
-    )
 
-    # To remain centred in XY after rotation, pass t = c_moving - R * c_fixed
-    t_rot = center_conf - (R @ center_anat)
+    # Do not seed translation; rely on registration to find it
 
-    translation_vec = torch.from_numpy(t_rot.astype(np.float32)).to(init_affine)
-    init_affine[:, :, :3] = torch.from_numpy(R.astype(np.float32)).to(init_affine)
-    init_affine[:, :, 3] = translation_vec
-    prematch_affine_matrix = np.eye(4, dtype=np.float64)
-    prematch_affine_matrix[:3, 3] = translation_um
+    # Initialization QC overlay removed; rely on stage QC after registration
 
-    if translation_mode != "none" and np.linalg.norm(translation_vec_np) > 1e-6:
-        logger.info(
-            "Seeding affine translation (mode=%s): Δx=%.3f µm, Δy=%.3f µm, Δz=%.3f µm",
-            translation_mode,
-            translation_vec_np[0],
-            translation_vec_np[1],
-            translation_vec_np[2],
-        )
-        tr = torch.tensor(translation_vec_np, device=init_affine.device, dtype=init_affine.dtype)
-        if init_affine.shape[-2:] == (dim, dim + 1):
-            init_affine = init_affine.clone()
-            init_affine[:, 0, -1] += tr[0]
-            init_affine[:, 1, -1] += tr[1]
-            if dim > 2:
-                init_affine[:, 2, -1] += tr[2]
-        elif init_affine.shape[-2:] == (dim + 1, dim + 1):
-            init_affine = init_affine.clone()
-            init_affine[:, 0, -1] += tr[0]
-            init_affine[:, 1, -1] += tr[1]
-            init_affine[:, 2, -1] += tr[2]
-        else:
-            logger.warning(
-                "Unexpected affine init shape %s; skipping translation seed.",
-                tuple(init_affine.shape),
-            )
-
-    # Generate initialization QC plot (prematch + Z-centering applied)
-    try:
-        import matplotlib.pyplot as plt
-        from scipy.ndimage import affine_transform
-        
-        # Convert torch affine to numpy and extract the 3x4 matrix
-        init_affine_np = init_affine[0].cpu().numpy()  # (3, 4) [x, y, z] in physical coords
-        
-        logger.info("Init affine matrix for QC:\n%s", init_affine_np)
-        
-        # Build homogeneous affine in physical space
-        A_phys = np.eye(4, dtype=np.float64)
-        A_phys[:3, :3] = init_affine_np[:, :3]
-        A_phys[:3, 3] = init_affine_np[:, 3]
-
-        # Mapping from moving voxel (z, y, x) -> physical XYZ
-        to_xyz = np.array([
-            [0.0, 0.0, spacing[0], 0.0],
-            [0.0, spacing[1], 0.0, 0.0],
-            [spacing[2], 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-
-        # Mapping from physical XYZ -> fixed voxel (z, y, x)
-        from_xyz = np.array([
-            [0.0, 0.0, 1.0 / fixed_spacing_um[2], 0.0],
-            [0.0, 1.0 / fixed_spacing_um[1], 0.0, 0.0],
-            [1.0 / fixed_spacing_um[0], 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-
-        full_transform = from_xyz @ A_phys @ to_xyz
-        full_inverse = np.linalg.inv(full_transform)
-        M_inv = full_inverse[:3, :3]
-        t_inv = full_inverse[:3, 3]
-        logger.info("Scipy inverse transform (ZYX): M_inv=\n%s\nt_inv=%s", M_inv, t_inv)
-        
-        # Apply transform to moving array
-        moving_init_np = affine_transform(
-            moving_array,
-            M_inv,
-            offset=t_inv,
-            output_shape=fixed_array.shape,
-            order=1,  # linear interpolation
-            mode='constant',
-            cval=0.0
-        )
-        mask_init_np = affine_transform(
-            support_mask_for_qc,
-            M_inv,
-            offset=t_inv,
-            output_shape=fixed_array.shape,
-            order=0,
-            mode='constant',
-            cval=0.0,
-        )
-        
-        # Debug: check transformed data
-        logger.info(
-            "Transformed confocal: shape=%s, min=%.2f, max=%.2f, mean=%.2f, non-zero voxels=%d/%d",
-            moving_init_np.shape,
-            moving_init_np.min(),
-            moving_init_np.max(),
-            moving_init_np.mean(),
-            np.count_nonzero(moving_init_np),
-            moving_init_np.size
-        )
-        
-        # Convert fixed to numpy for plotting
-        fixed_np = fixed_array  # Already numpy
-        
-        # Create orthogonal view overlay
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle(f"Initialization QC: {animal_id} {confocal_session_id}\n(Prematch + Z-centering applied, before optimization)", fontsize=14)
-        
-        # Get middle slices - use anatomy center for overlays, confocal center for confocal-only panels
-        z_mid = fixed_np.shape[0] // 2
-        y_mid = fixed_np.shape[1] // 2
-        x_mid = fixed_np.shape[2] // 2
-        
-        # Find where confocal data actually is (for better visualization in confocal-only panels)
-        nonzero_mask = mask_init_np > 0.5
-        if np.any(nonzero_mask):
-            nz_coords = np.nonzero(nonzero_mask)
-            conf_z_mid = int((nz_coords[0].min() + nz_coords[0].max()) / 2)
-            conf_y_mid = int((nz_coords[1].min() + nz_coords[1].max()) / 2)
-            conf_x_mid = int((nz_coords[2].min() + nz_coords[2].max()) / 2)
-        else:
-            conf_z_mid, conf_y_mid, conf_x_mid = z_mid, y_mid, x_mid
-        
-        # Normalize for display
-        def normalize(arr):
-            arr = arr.copy()
-            # Skip normalization if array is all zeros or has no range
-            if arr.max() - arr.min() < 1e-6:
-                return np.zeros_like(arr)
-            p1, p99 = np.percentile(arr, [1, 99])
-            if p99 - p1 < 1e-6:
-                # If percentile range is tiny, use min/max
-                p1, p99 = arr.min(), arr.max()
-            arr = np.clip(arr, p1, p99)
-            arr = (arr - p1) / (p99 - p1 + 1e-8)
-            return arr
-        
-        mask_cmap = plt.cm.get_cmap("winter")
-
-        # XY plane (Z slice)
-        axes[0, 0].imshow(normalize(fixed_np[z_mid]), cmap='gray', alpha=0.7)
-        axes[0, 0].imshow(normalize(moving_init_np[z_mid]), cmap='hot', alpha=0.3)
-        axes[0, 0].imshow(mask_init_np[z_mid], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0)
-        axes[0, 0].contour(mask_init_np[z_mid], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
-        axes[0, 0].set_title(f'XY plane (Z={z_mid}/{fixed_np.shape[0]})')
-        axes[0, 0].axis('off')
-        
-        axes[1, 0].imshow(normalize(fixed_np[z_mid]), cmap='gray')
-        axes[1, 0].set_title('Anatomy only (XY)')
-        axes[1, 0].axis('off')
-        
-        # XZ plane (Y slice)
-        axes[0, 1].imshow(normalize(fixed_np[:, y_mid, :]), cmap='gray', alpha=0.7, aspect='auto')
-        axes[0, 1].imshow(normalize(moving_init_np[:, y_mid, :]), cmap='hot', alpha=0.3, aspect='auto')
-        axes[0, 1].imshow(mask_init_np[:, y_mid, :], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
-        axes[0, 1].contour(mask_init_np[:, y_mid, :], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
-        axes[0, 1].set_title(f'XZ plane (Y={y_mid}/{fixed_np.shape[1]})')
-        axes[0, 1].axis('off')
-        
-        axes[1, 1].imshow(normalize(moving_init_np[:, conf_y_mid, :]), cmap='hot', aspect='auto')
-        axes[1, 1].imshow(mask_init_np[:, conf_y_mid, :], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
-        axes[1, 1].contour(mask_init_np[:, conf_y_mid, :], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
-        axes[1, 1].set_title(f'Confocal only (XZ, Y={conf_y_mid})')
-        axes[1, 1].axis('off')
-        
-        # YZ plane (X slice)
-        axes[0, 2].imshow(normalize(fixed_np[:, :, x_mid]), cmap='gray', alpha=0.7, aspect='auto')
-        axes[0, 2].imshow(normalize(moving_init_np[:, :, x_mid]), cmap='hot', alpha=0.3, aspect='auto')
-        axes[0, 2].imshow(mask_init_np[:, :, x_mid], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
-        axes[0, 2].contour(mask_init_np[:, :, x_mid], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
-        axes[0, 2].set_title(f'YZ plane (X={x_mid}/{fixed_np.shape[2]})')
-        axes[0, 2].axis('off')
-        
-        axes[1, 2].imshow(normalize(moving_init_np[:, :, conf_x_mid]), cmap='hot', aspect='auto')
-        axes[1, 2].imshow(mask_init_np[:, :, conf_x_mid], cmap=mask_cmap, alpha=0.15, vmin=0.0, vmax=1.0, aspect='auto')
-        axes[1, 2].contour(mask_init_np[:, :, conf_x_mid], levels=[0.5], colors='cyan', linewidths=1.0, alpha=0.7)
-        axes[1, 2].set_title(f'Confocal only (YZ, X={conf_x_mid})')
-        axes[1, 2].axis('off')
-        
-        plt.tight_layout()
-        
-        # Save QC plot
-        qc_dir = output_root / qc_subdir
-        qc_dir.mkdir(exist_ok=True, parents=True)
-        init_qc_path = qc_dir / f"{animal_id}_{confocal_session_id}_init_qc.png"
-        plt.savefig(init_qc_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        logger.info(f"Saved initialization QC plot to {init_qc_path}")
-        
-    except Exception as e:
-        logger.warning(f"Failed to generate initialization QC plot: {e}")
-
-    # Pass physical-space translation directly; fireANTs expects physical units
-    init_translation_tensor = torch.from_numpy(t_rot.astype(np.float32)).to(init_affine)
-    init_moment_tensor = torch.from_numpy(R.astype(np.float32)).to(init_affine).unsqueeze(0)
-
+    # Run rigid registration without manual seeds
     rigid = RigidRegistration(
         list(cfg.affine.scales),
         list(cfg.affine.iterations),
@@ -873,25 +912,34 @@ def register_confocal_to_anatomy(
         tolerance=cfg.affine.tolerance,
         max_tolerance_iters=cfg.affine.max_tolerance_iters,
         loss_type=cfg.affine.loss_type,
-        init_translation=init_translation_tensor,
-        init_moment=init_moment_tensor,
+        init_translation=init_translation_tensor if init_translation_tensor is not None else None,
+        init_moment=init_moment_tensor if init_moment_tensor is not None else None,
         scaling=False,
         **cfg.affine.extra_args,
     )
-    init_rigid_mat = _convert_torch_to_phys_affine(
-        rigid.get_rigid_matrix(homogenous=False), moving_batch
-    ).detach().cpu().numpy()
-    logger.info("Rigid init matrix (before locking rotation, xyz basis):\n%s", init_rigid_mat[0])
-    rigid.rotation.requires_grad_(False)
-    rigid.transl.requires_grad_(False)
-    rigid.optimizer.param_groups = []
-    rigid.optimizer.state = defaultdict(dict)
-    logger.info("Rigid optimisation skipped; prematch seed is frozen.")
+    rigid.optimize()
     final_rigid_mat = _convert_torch_to_phys_affine(
-        rigid.get_rigid_matrix(homogenous=False), moving_batch
+        rigid.get_rigid_matrix(homogenous=False), fixed_batch, moving_batch
     ).detach().cpu().numpy()
     logger.info("Rigid final matrix (xyz basis):\n%s", final_rigid_mat[0])
     final_tensor = rigid.evaluate(fixed_batch, moving_batch)
+    try:
+        warped_np = final_tensor.squeeze().detach().cpu().numpy()
+        # intensity-weighted centroid in voxel (z,y,x)
+        if warped_np.max() > 0:
+            idx = np.indices(warped_np.shape, dtype=np.float64)
+            total = float(warped_np.sum())
+            if total > 0:
+                cz = float((idx[0] * warped_np).sum() / total)
+                cy = float((idx[1] * warped_np).sum() / total)
+                cx = float((idx[2] * warped_np).sum() / total)
+                fz, fy, fx = (fixed_array.shape[0]-1)/2.0, (fixed_array.shape[1]-1)/2.0, (fixed_array.shape[2]-1)/2.0
+                logger.info(
+                    "Warped centroid vox=(%.2f, %.2f, %.2f), fixed mid vox=(%.2f, %.2f, %.2f), delta vox=(%.2f, %.2f, %.2f)",
+                    cz, cy, cx, fz, fy, fx, cz-fz, cy-fy, cx-fx,
+                )
+    except Exception:
+        pass
     affine = rigid  # Alias for downstream code that still references `affine`
 
     greedy = None

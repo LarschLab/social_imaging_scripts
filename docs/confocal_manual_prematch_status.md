@@ -80,3 +80,17 @@ Next steps (now that centring is correct):
 - Reintroduce rotation seeding from the GUI while keeping translation as above. With `around_center=True`, FireANTs internally adjusts the learnable translation by t′ = t − c + A c; we therefore keep t = `centre_moving − centre_fixed` and set `init_moment` to the GUI rotation about Z. Validate on L395_f11 and a second animal.
 - Restore mask soft edges and greedy only after the rigid seed + affine behave as expected.
 - Update unit tests to assert that the synthetic centre‑only seed maps the moving centre exactly onto the fixed centre within 1 voxel in all three axes.
+
+## 2025‑10‑21 Update: ND grid mismatch still unresolved
+
+- Rebuilt the synthetic harness to compare the world transform against FireANTs plus PyTorch’s `affine_grid`/`grid_sample`.
+- Added full physical→torch conversion, `around_center=False`, and logged FireANTs’ torch-space affine.
+- Switched the harness to `padding_mode='border'` + `mode='nearest'` and reduced the translation (Δ=20 µm) to keep the bright voxel inside the volume.
+- Composed ND transforms for both forward (`I2N_m @ A_torch @ N2I_f`) and inverse (`I2N_m @ A_torch⁻¹ @ N2I_f`) cases.
+- **Observation:** the bright voxel still collapses to indices `(0,0,0)`—the sampler sees mostly zero because we’re still using the wrong ND matrix.
+
+### Next diagnostic steps
+
+1. Double‑check the index↔ND conversion for the chosen `align_corners` setting (PyTorch default is `False`; FireANTs currently uses `True`).
+2. Probe forward vs inverse explicitly and keep the one that lands the bright voxel at the analytic target.
+3. Once the harness reports `delta vox = (0,0,0)` (Δ=0) and the expected offset for Δ≠0, reapply the same logic inside `_build_prematch_affine` before re-enabling the optimiser.

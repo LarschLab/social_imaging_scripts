@@ -86,6 +86,14 @@ def run(
     metadata_filename: str,
     flip_horizontal: bool,
     flip_z: bool,
+    rotation_deg: float | None = None,
+    rotation_offset_deg: float = 0.0,
+    rotation_offset_signed: bool = False,
+    apply_rotation: bool = True,
+    apply_flips: bool = True,
+    gui_translation_px: Optional[Tuple[float, float]] = None,
+    gui_source: Optional[str] = None,
+    gui_display_channel: Optional[str] = None,
     reprocess: bool = False,
     raw_path_override: Optional[Path] = None,
 ) -> ConfocalPreprocessOutputs:
@@ -136,10 +144,65 @@ def run(
         float(meta["voxel_size_z_um"]),
     )
 
-    if flip_horizontal:
-        stack = np.flip(stack, axis=-1)
-    if flip_z:
-        stack = np.flip(stack, axis=0)
+    # Apply flips first (before rotation) if requested
+    flips_applied = False
+    if apply_flips:
+        if flip_horizontal:
+            stack = np.flip(stack, axis=-1)
+            flips_applied = True
+        if flip_z:
+            stack = np.flip(stack, axis=0)
+            flips_applied = True
+
+    # Apply rotation (about Z) if provided
+    rot_applied = False
+    rot_value_raw = float(rotation_deg) if rotation_deg is not None else None
+    if rot_value_raw is not None:
+        offset = float(rotation_offset_deg)
+        if rotation_offset_signed:
+            import math as _math
+            offset = _math.copysign(offset, rot_value_raw if abs(rot_value_raw) > 1e-12 else 1.0)
+        rot_value_applied = rot_value_raw + offset
+        rot_value_applied = ((rot_value_applied + 180.0) % 360.0) - 180.0
+        if abs(rot_value_applied - 180.0) < 1e-6:
+            rot_value_applied = -180.0
+    else:
+        rot_value_applied = None
+    if apply_rotation and rot_value_applied is not None and abs(rot_value_applied) > 1e-9:
+        try:
+            import SimpleITK as sitk  # local import to avoid hard dependency at import time
+
+            theta = float(rot_value_applied) * np.pi / 180.0
+            z_sz, n_channels, y_sz, x_sz = stack.shape
+            center_phys = (
+                0.5 * (x_sz - 1) * voxel[0],
+                0.5 * (y_sz - 1) * voxel[1],
+                0.5 * (z_sz - 1) * voxel[2],
+            )
+
+            def _rotate_volume(vol_zyx: np.ndarray) -> np.ndarray:
+                img = sitk.GetImageFromArray(vol_zyx.astype(np.float32, copy=False))
+                img.SetSpacing((float(voxel[0]), float(voxel[1]), float(voxel[2])))
+                tx = sitk.Euler3DTransform()
+                tx.SetCenter(center_phys)
+                tx.SetRotation(0.0, 0.0, theta)
+                out = sitk.Resample(
+                    img,
+                    img,  # keep original size/spacing/origin/direction
+                    tx,
+                    sitk.sitkLinear,
+                    0.0,
+                    img.GetPixelID(),
+                )
+                return sitk.GetArrayFromImage(out).astype(np.float32, copy=False)
+
+            rotated = np.empty_like(stack)
+            for c in range(stack.shape[1]):
+                rotated[:, c, :, :] = _rotate_volume(stack[:, c, :, :])
+            stack = rotated
+            rot_applied = True
+        except Exception:
+            rot_applied = False
 
     channel_names = _resolve_channel_names(session)
     if not channel_names:
@@ -168,6 +231,19 @@ def run(
         "raw_path": str(raw_path),
         "flip_horizontal": flip_horizontal,
         "flip_z": flip_z,
+        "apply_rotation": bool(apply_rotation),
+        "apply_flips": bool(apply_flips),
+        "gui_transform_applied": bool(rot_applied or flips_applied),
+        # Record both raw GUI rotation and applied rotation (with offset)
+        "gui_rotation_deg_raw": float(rot_value_raw) if rot_value_raw is not None else None,
+        "gui_rotation_offset_deg": float(rotation_offset_deg),
+        "gui_rotation_offset_signed": bool(rotation_offset_signed),
+        "gui_rotation_deg_applied": float(rot_value_applied) if rot_value_applied is not None else None,
+        # Maintain legacy key pointing to applied value for compatibility
+        "gui_rotation_deg": float(rot_value_applied) if rot_value_applied is not None else None,
+        "gui_translation_px": list(gui_translation_px) if gui_translation_px is not None else None,
+        "gui_source": gui_source or None,
+        "gui_display_channel": gui_display_channel or None,
         "voxel_size_um": list(voxel),
         "pixels_xyz": [int(stack.shape[0]), int(stack.shape[2]), int(stack.shape[3])],
         "channels": {name: str(path) for name, path in channel_paths.items()},

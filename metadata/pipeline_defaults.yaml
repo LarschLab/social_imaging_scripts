@@ -43,6 +43,11 @@ confocal_preprocessing:
   metadata_filename_template: "{session_id}_confocal_metadata.json"  # Confocal preprocessing metadata filename.
   flip_horizontal: true  # Flip stacks left-right to match two-photon orientation.
   flip_z: true  # Reverse slice (Z) order to match two-photon orientation.
+  require_gui_transform: true  # Require GUI preprocessing info; fail if missing.
+  apply_gui_rotation: true     # Apply GUI rotation (about Z) during preprocessing.
+  apply_gui_flips: true        # Apply GUI flips during preprocessing.
+  gui_rotation_offset_deg: 0.0  # Add this offset to GUI rotation before applying.
+  gui_rotation_offset_signed: true  # If true, apply offset with the sign of the GUI angle.
 
 # FireANTs registration (anatomy → reference brain).
 fireants_registration:
@@ -114,6 +119,13 @@ confocal_to_anatomy_registration:
   crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
   crop_padding_um: 0  # Extra padding (µm) kept around the cropped confocal volume.
   blur_fixed_z_sigma: 4.0  # Gaussian blur sigma (voxels) applied to 2P anatomy in Z to match confocal PSF (0=disabled).
+  center_align_seed: true  # Align stack centres before registration.
+  moving_support_mask:
+    enabled: true
+    threshold_percentile: 60.0
+    dilate_xy_vox: 3
+    dilate_z_vox: 1
+    soft_edge_vox: 5
   prematch:  # XY-MIP prematch heuristics to seed FireANTs.
     enabled: false
     mip_percentiles: [2.0, 99.5]
