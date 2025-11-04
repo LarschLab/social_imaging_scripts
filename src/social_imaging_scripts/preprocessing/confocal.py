@@ -186,18 +186,43 @@ def run(
                 tx = sitk.Euler3DTransform()
                 tx.SetCenter(center_phys)
                 tx.SetRotation(0.0, 0.0, theta)
+                
+                # Calculate output size to fit rotated image without cropping
+                # For rotation about Z-axis, compute bounding box in XY plane
+                cos_theta = abs(np.cos(theta))
+                sin_theta = abs(np.sin(theta))
+                new_x = int(np.ceil(x_sz * cos_theta + y_sz * sin_theta))
+                new_y = int(np.ceil(x_sz * sin_theta + y_sz * cos_theta))
+                new_size = (new_x, new_y, z_sz)
+                
+                # Adjust origin to center the rotated content
+                new_origin = (
+                    center_phys[0] - 0.5 * (new_x - 1) * voxel[0],
+                    center_phys[1] - 0.5 * (new_y - 1) * voxel[1],
+                    center_phys[2] - 0.5 * (z_sz - 1) * voxel[2],
+                )
+                
                 out = sitk.Resample(
                     img,
-                    img,  # keep original size/spacing/origin/direction
+                    new_size,  # expanded size to fit rotated content
                     tx,
                     sitk.sitkLinear,
+                    new_origin,
+                    img.GetSpacing(),
+                    img.GetDirection(),
                     0.0,
                     img.GetPixelID(),
                 )
                 return sitk.GetArrayFromImage(out).astype(np.float32, copy=False)
 
-            rotated = np.empty_like(stack)
-            for c in range(stack.shape[1]):
+            # Rotate first channel to get output shape
+            first_rotated = _rotate_volume(stack[:, 0, :, :])
+            new_shape = (first_rotated.shape[0], stack.shape[1], first_rotated.shape[1], first_rotated.shape[2])
+            rotated = np.empty(new_shape, dtype=stack.dtype)
+            rotated[:, 0, :, :] = first_rotated
+            
+            # Rotate remaining channels
+            for c in range(1, stack.shape[1]):
                 rotated[:, c, :, :] = _rotate_volume(stack[:, c, :, :])
             stack = rotated
             rot_applied = True
@@ -245,6 +270,8 @@ def run(
         "gui_source": gui_source or None,
         "gui_display_channel": gui_display_channel or None,
         "voxel_size_um": list(voxel),
+        # pixels_xyz reflects the actual output shape (may be expanded after rotation)
+        # Stack shape is (z, channels, y, x), stored as [z, y, x] for legacy compatibility
         "pixels_xyz": [int(stack.shape[0]), int(stack.shape[2]), int(stack.shape[3])],
         "channels": {name: str(path) for name, path in channel_paths.items()},
     }
@@ -255,6 +282,7 @@ def run(
         metadata_path=metadata_path,
         channel_paths=channel_paths,
         voxel_size_um=voxel,
+        # Stack shape is (z, channels, y, x), stored as (z, y, x)
         pixels_xyz=(int(stack.shape[0]), int(stack.shape[2]), int(stack.shape[3])),
         flip_horizontal=flip_horizontal,
         flip_z=flip_z,

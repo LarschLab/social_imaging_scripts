@@ -1232,7 +1232,7 @@ def run_pipeline(
     cfg = cfg or load_project_config()
 
     global _LOGGING_CONFIGURED
-    if getattr(cfg, 'apply_log_settings', False) and not _LOGGING_CONFIGURED:
+    if getattr(cfg, 'apply_log_settings', False):
         level_name = str(getattr(cfg, 'log_level', 'INFO')).upper()
         level = getattr(logging, level_name, None)
         if not isinstance(level, int):
@@ -1240,13 +1240,24 @@ def run_pipeline(
                 level = int(level_name)
             except ValueError:
                 level = logging.INFO
-        logging.basicConfig(
-            level=level,
-            format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-            force=True,
-        )
-        logging.getLogger().setLevel(level)
-        _LOGGING_CONFIGURED = True
+        
+        # Configure logging - avoid adding duplicate handlers
+        root_logger = logging.getLogger()
+        
+        # Only configure if not already done, or if no handlers exist
+        if not _LOGGING_CONFIGURED:
+            # Clear existing StreamHandlers to prevent duplicates
+            root_logger.handlers = [h for h in root_logger.handlers 
+                                   if not isinstance(h, logging.StreamHandler)]
+            
+            # Add our handler
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+            _LOGGING_CONFIGURED = True
+        
+        root_logger.setLevel(level)
         logger.setLevel(level)
 
     logger.info("========== Starting social imaging pipeline ==========")

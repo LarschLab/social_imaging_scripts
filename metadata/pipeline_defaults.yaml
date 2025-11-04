@@ -118,13 +118,14 @@ confocal_to_anatomy_registration:
   qc_subdir: qc  # Subdirectory storing QC figures.
   crop_to_extent: true  # Crop confocal XY extent to approximate anatomy coverage.
   crop_padding_um: 0  # Extra padding (µm) kept around the cropped confocal volume.
-  blur_fixed_z_sigma: 4.0  # Gaussian blur sigma (voxels) applied to 2P anatomy in Z to match confocal PSF (0=disabled).
-  center_align_seed: true  # Align stack centres before registration.
+  blur_fixed_z_sigma: 0.0  # Gaussian blur sigma (voxels) applied to 2P anatomy in Z to match confocal PSF (0=disabled).
+  center_align_seed: false  # Align stack centres before registration (disabled in favor of moments-based pre-registration).
   moving_support_mask:
     enabled: true
-    threshold_percentile: 60.0  # Percentile threshold for mask (50-70 recommended for small FOV)
-    dilate_xy_vox: 3  # XY dilation (3-5 recommended for small FOV)
-    dilate_z_vox: 1  # Z dilation (1-2 recommended)
+    threshold_percentile: 0.0  # Percentile threshold for mask. Set to 0 to keep all positive signal (>0). Values 50-70 for more selective masking.
+    erode_xy_vox: 0  # XY erosion to remove sharp octagonal edges before dilation (10-20 recommended for circular/octagonal FOVs)
+    dilate_xy_vox: 0  # XY dilation (3-5 recommended for small FOV)
+    dilate_z_vox: 0  # Z dilation (1-2 recommended)
     soft_edge_vox: 5  # Soft edge width (5-8 recommended)
     apply_to_fixed: false  # Apply mask to fixed volume. Set false for small FOV confocal stacks to avoid hiding necessary anatomy.
   prematch:  # XY-MIP prematch heuristics to seed FireANTs.
@@ -151,30 +152,29 @@ confocal_to_anatomy_registration:
       enabled: true
       lower_percentile: 0.5
       upper_percentile: 99.0
-    # Note: moments_scale is not used for confocal->anatomy registration
-    # Manual prematch always provides the initial alignment
+    moments_scale: 4  # Downsampling factor for the initial moments registration.
     affine:
       #scales: [12, 8, 4, 2, 1]
       #iterations: [500, 300, 300, 200, 50]
-      scales: [12, 8, 4]
-      iterations: [500, 500, 500]
+      scales: [12, 8, 4]  # Finer scales for translation-only refinement
+      iterations: [200, 200, 30]  # Fewer iterations since moments did the heavy lifting
       optimizer: Adam
-      optimizer_lr: 0.03
+      optimizer_lr: 0.003  # Much lower LR to prevent large changes (was 0.1)
       cc_kernel_size: 51
-      tolerance: 1e-8
+      tolerance: 1e-7
       max_tolerance_iters: 20
-      loss_type: fusedcc
-      extra_args: {}
+      loss_type: fusedcc  # Mattes Mutual Information - better for partial overlap than cross-correlation
+      extra_args: {}  # Could add regularization parameters here if needed
     greedy:
-      enabled: false
-      scales: [12, 8, 4, 2, 1]
-      iterations: [200, 200, 200, 100, 50]
+      enabled: true
+      scales: [12, 8, 4, 2]
+      iterations: [200, 200, 200, 100]
       optimizer: Adam
-      optimizer_lr: 0.2
-      cc_kernel_size: 21
+      optimizer_lr: 0.02
+      cc_kernel_size: 11
       loss_type: fusedcc
       smooth_grad_sigma: 3.0
-      smooth_warp_sigma: 2.0
+      smooth_warp_sigma: 0.5
       deformation_type: compositive
       optimizer_params: {}
       loss_params: {}

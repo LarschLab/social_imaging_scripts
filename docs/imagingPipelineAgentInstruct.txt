@@ -63,23 +63,43 @@
 - New functionality should surface explicit config flags so future tweaks require only adjusting `pipeline_defaults.yaml`.
 - When in doubt, make the code chatty: log the parameters and results at each major stage. We’d rather have slightly noisy logs than silent failure.
 
-## Current Confocal→2p Challenges & Lessons
+## Current Confocal→2p Status & Lessons Learned
 
-- We struggled with alignment drifting because heavy cropping + hard masks made MI/CC blind to translation.  
-  - Mitigations so far: extent-aware cropping with optional padding, soft-edged masks, translation seeding (crop offsets or centroids).
-- Added XY MIP prematch (rotation/translation seed via NCC) that feeds FireANTs’ affine init; defaults live in `metadata/pipeline_defaults.yaml > confocal_to_anatomy_registration.prematch`. Keep an eye on logged scores (expect ~0.6 for clean pairs like L331_f01/L395_f06). If scores fall below threshold, FireANTs reverts to moments-only.
-- Greedy warps often degraded otherwise good affine alignments (producing “liquid” artefacts). Running affine-only or dialing down greedy (`optimizer_lr`, smoothing, iterations) yields more stable results.
-- Mutual information gave promising loss values but also aligned the stack poorly when masks were too symmetric. Soft masks or small margins restore reliable correlation at the cost of lower (but meaningful) loss magnitudes.
-- **Manual prematch GUI**: Refactored into a module; now operates on RAW, includes Flip‑X/Z and channel picker, and displays the applied rotation (after offset). Saved flips and the chosen channel are persisted and reused.
-- GUI rotation is applied in preprocessing (flips first, then rotation). Translation is recorded for provenance only.
-- For small‑FOV confocal stacks the optimizer previously “saw” too much empty space. The moving‑derived support mask and centre seed are intended to stabilise these cases without cropping.
-- The new seed QC (XY/ YZ/ XZ) is resampled onto the fixed grid. In some zoomed cases the seed still appears “floating” (off in X/Y/Z), indicating a remaining mismatch between the computed translation and what’s displayed.
--- We're still tuning these knobs. Next steps focused on the seed:
-  1. Validate centre‑seed sign/axis conventions end‑to‑end (array (Z,Y,X) vs spacing (X,Y,Z)): create a synthetic volume, compute `center_conf−center_anat`, and confirm that the QC overlay moves the moving centre into the fixed centre. If signs/axes are off, correct the translation build (both QC and FireANTs init).
-  2. Unify the seed path: compute the seed in physical space once and use the same transform for (a) QC preview (SimpleITK TranslationTransform + Resample to fixed) and (b) FireANTs initialisation (convert the same 3×4 to torch basis). Remove any duplicate shift logic to avoid drift.
-  3. Mask positioning sanity check: visualise the resampled moving‑derived mask as contours on the QC overlays to confirm it is centred on the seeded moving content.
-  4. Logging: emit the physical centres (`c_m`, `c_f`), the seed vector in µm, and the seeded voxel shift used for the QC preview so we can reason about mismatches quickly.
-  5. Once the seed is verified, re‑evaluate optimiser scales/`cc_kernel_size` for tiny FOVs and consider lowering the number of pyramid levels.
+### ✅ Resolved Issues (Oct 2025)
+
+- **Registration initialization fixed**: MomentsRegistration provides a good-enough approximation for initial alignment. We successfully figured out how to feed moments output (`get_rigid_moment_init()` and `get_rigid_transl_init()`) to RigidRegistration. Translation-only initialization (identity rotation) works well.
+- **Confocal preprocessing now handles rotation**: GUI-determined rotation is applied during preprocessing (after flips), with corner padding to avoid cropping—especially critical for small FOV/zoomed confocal stacks. We abandoned the idea of feeding raw confocal + custom rotation/translation seed due to coordinate system confusion.
+- **Greedy deformable registration working**: Now produces good results on cases where rigid registration succeeded. No longer creating "liquid" artifacts when properly configured.
+- **Manual prematch GUI**: Refactored into a module; operates on RAW LSM, includes Flip‑X/Z and channel picker, displays applied rotation with offset. Saved flips and chosen channel are persisted and reused.
+- **Enhanced confocal rotation**: Expanded canvas calculation preserves edges during rotation (new_x = ceil(x*cos + y*sin), new_y = ceil(x*sin + y*cos)) with adjusted origin for proper centering.
+
+### 🔧 Current Configuration & Tuning
+
+- **Registration pipeline**: moments → rigid (6 DOF, no scaling) → greedy deformable
+- **Optional features with unclear impact**:
+  - Soft-edge masking (`soft_edge_vox`): might help, not definitively proven
+  - PSF smoothing in Z (`blur_fixed_z_sigma`): seems unhelpful, best left at 0
+  - MI vs. fusedcc loss: no significant difference observed
+  - XY MIP prematch code: now deprecated/irrelevant (rotation handled in preprocessing)
+- **Learning rates under evaluation**: Comparing with colleague's ANTs pipeline revealed current rigid lr (0.003) may be too low; ANTs equivalent ~0.1. Missing finest scale levels in pyramid.
+
+### 📋 Next Major Pipeline Stages
+
+**A) Functional ROI Registration** (not yet implemented)
+- Register functional Suite2p ROIs into animal anatomy space
+- Register functional Suite2p ROIs into reference brain space
+- We already have: functional → anatomy → reference transformations
+- Need to: apply these transforms to ROI coordinates/masks
+
+**B) Confocal ROI Registration** (not yet implemented)
+- Register Cellpose ROIs from confocal → anatomy → reference
+- Register confocal stacks → reference brain (may already work via anatomy→reference)
+- Need to: implement ROI coordinate transformation pipeline
+
+**C) Cross-Modal ROI Matching** (not yet implemented)
+- Match functional Suite2p ROIs to Cellpose confocal ROIs within same animal
+- Requires: both ROI sets in common coordinate space (anatomy or reference)
+- Goal: link calcium activity to cell identity/gene expression
 
 ## Environment Headline for Future Sessions
 

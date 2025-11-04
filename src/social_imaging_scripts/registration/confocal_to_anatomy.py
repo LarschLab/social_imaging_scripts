@@ -40,19 +40,35 @@ logger = logging.getLogger(__name__)
 def _build_support_mask_from_moving(
     volume: np.ndarray,
     percentile: float,
+    erode_xy: int,
     dilate_xy: int,
     dilate_z: int,
     soft_edge: int,
 ) -> np.ndarray:
-    """Construct a soft support mask for a moving volume from its 3D MIP."""
+    """Construct a soft support mask for a moving volume from its 3D MIP.
+    
+    If percentile <= 0, threshold at 0 to keep all positive signal.
+    Erosion is applied before dilation to remove sharp edges.
+    """
 
     mip = np.max(volume, axis=0)
     positive = mip[mip > 0]
     if positive.size == 0:
         return np.ones_like(volume, dtype=np.float32)
 
-    threshold = np.percentile(positive, np.clip(percentile, 0.0, 100.0))
-    mask_xy = mip >= threshold
+    if percentile <= 0:
+        # Keep all positive signal
+        threshold = 0.0
+    else:
+        threshold = np.percentile(positive, np.clip(percentile, 0.0, 100.0))
+    mask_xy = mip > threshold
+
+    # Erode first to remove sharp edges (e.g., from octagonal FOVs)
+    if erode_xy > 0:
+        from scipy.ndimage import binary_erosion  # type: ignore
+
+        structure_xy = np.ones((2 * erode_xy + 1, 2 * erode_xy + 1), dtype=bool)
+        mask_xy = binary_erosion(mask_xy, structure=structure_xy)
 
     if dilate_xy > 0:
         from scipy.ndimage import binary_dilation  # type: ignore
@@ -111,10 +127,12 @@ def _write_seed_qc(
     moving_seed: np.ndarray,
     moving_original: np.ndarray,
     output_path: Path,
+    moving_mask: Optional[np.ndarray] = None,
 ) -> None:
     """Write QC overlays showing XY, YZ, XZ for seed and raw.
 
     All inputs are expected on the fixed grid (Z, Y, X).
+    If moving_mask is provided, it will be shown as shaded overlay on orthogonal views.
     """
     try:
         import matplotlib.pyplot as plt
@@ -148,12 +166,26 @@ def _write_seed_qc(
         seed_xz = _norm(moving_seed[:, ymid, :])
         raw_xz = _norm(moving_original[:, ymid, :])
 
-        def _overlay(fg: np.ndarray, bg: np.ndarray) -> np.ndarray:
+        # Extract mask slices if provided
+        mask_xy = None
+        mask_yz = None
+        mask_xz = None
+        if moving_mask is not None:
+            mask_xy = moving_mask[zmid]
+            mask_yz = moving_mask[:, :, xmid]
+            mask_xz = moving_mask[:, ymid, :]
+
+        def _overlay(fg: np.ndarray, bg: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
             h, w = bg.shape
             ov = np.zeros((h, w, 3), dtype=np.float32)
             ov[..., 0] = bg * 0.8
             ov[..., 1] = fg
             ov[..., 2] = bg * 0.8
+            # Add mask as cyan shading overlay
+            if mask is not None:
+                mask_alpha = np.clip(mask * 0.3, 0.0, 0.3)  # 30% opacity where mask is active
+                ov[..., 0] = np.clip(ov[..., 0] + mask_alpha, 0.0, 1.0)
+                ov[..., 2] = np.clip(ov[..., 2] + mask_alpha, 0.0, 1.0)
             return np.clip(ov, 0.0, 1.0)
 
         fig, axes = plt.subplots(2, 3, figsize=(12, 8))
@@ -162,13 +194,13 @@ def _write_seed_qc(
         axes[0, 0].set_title("Fixed XY")
         axes[0, 1].imshow(raw_xy, cmap="viridis")
         axes[0, 1].set_title("Moving XY (raw)")
-        axes[0, 2].imshow(_overlay(seed_xy, fixed_xy))
-        axes[0, 2].set_title("Seed overlay XY")
+        axes[0, 2].imshow(_overlay(seed_xy, fixed_xy, mask_xy))
+        axes[0, 2].set_title("Seed overlay XY" + (" (cyan=mask)" if mask_xy is not None else ""))
         # Row 2: YZ and XZ overlays
-        axes[1, 0].imshow(_overlay(seed_yz, fixed_yz))
-        axes[1, 0].set_title("Seed overlay YZ")
-        axes[1, 1].imshow(_overlay(seed_xz, fixed_xz))
-        axes[1, 1].set_title("Seed overlay XZ")
+        axes[1, 0].imshow(_overlay(seed_yz, fixed_yz, mask_yz))
+        axes[1, 0].set_title("Seed overlay YZ" + (" (cyan=mask)" if mask_yz is not None else ""))
+        axes[1, 1].imshow(_overlay(seed_xz, fixed_xz, mask_xz))
+        axes[1, 1].set_title("Seed overlay XZ" + (" (cyan=mask)" if mask_xz is not None else ""))
         axes[1, 2].axis("off")
         for ax in axes.ravel():
             ax.axis("off")
@@ -702,6 +734,7 @@ def register_confocal_to_anatomy(
         moving_mask = _build_support_mask_from_moving(
             moving_array,
             mask_cfg.threshold_percentile,
+            mask_cfg.erode_xy_vox,
             mask_cfg.dilate_xy_vox,
             mask_cfg.dilate_z_vox,
             mask_cfg.soft_edge_vox,
@@ -850,11 +883,26 @@ def register_confocal_to_anatomy(
                 (fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]),
                 fixed_array.shape,
             )
+            # Resample mask to fixed grid with seed translation for QC visualization
+            mask_seed_fixed = None
+            if moving_mask is not None:
+                mask_seed_fixed = _resample_array_to_fixed(
+                    moving_mask,
+                    (spacing[0], spacing[1], spacing[2]),
+                    (fixed_spacing_um[0], fixed_spacing_um[1], fixed_spacing_um[2]),
+                    fixed_array.shape,
+                    translation_um=(
+                        translation_vec[0],
+                        translation_vec[1],
+                        translation_vec[2],
+                    ),
+                )
             _write_seed_qc(
                 fixed_array,
                 moving_seed_fixed,
                 moving_original_fixed,
                 seed_qc_path,
+                moving_mask=mask_seed_fixed,
             )
         except Exception:
             logger.warning("Failed to compute seed QC preview", exc_info=True)
@@ -901,26 +949,35 @@ def register_confocal_to_anatomy(
     moving_batch = BatchedImages(moving_fa)
     fixed_batch = BatchedImages(fixed_fa)
 
-    init_moment_tensor = None
-    init_translation_tensor = None
-    if np.linalg.norm(translation_vec) > 1e-6:
-        seed_affine = torch.zeros(1, 3, 4, device=cfg.device, dtype=torch.float32)
-        seed_affine[0, :, :3] = torch.eye(3, dtype=torch.float32, device=cfg.device)
-        seed_affine[0, :, 3] = torch.tensor(translation_vec, dtype=torch.float32, device=cfg.device)
-        init_moment_tensor, init_translation_tensor = _convert_phys_to_torch_affine(
-            seed_affine,
-            fixed_batch,
-            moving_batch,
+    # Initialize with moments-based registration if moments_scale is present
+    init_moment = None  # Will use identity (no rotation) if moments is used
+    init_translation = None
+    
+    if hasattr(cfg, 'moments_scale') and cfg.moments_scale is not None:
+        logger.info(
+            "Running moments-based initialization (scale=%d)",
+            cfg.moments_scale,
         )
+        moments = MomentsRegistration(
+            scale=cfg.moments_scale,
+            fixed_images=fixed_batch,
+            moving_images=moving_batch,
+        )
+        moments.optimize()
+        # Only use translation from moments, set rotation to identity
+        # This lets moments handle rotation, and rigid registration only refines translation
+        moments_rotation = moments.get_rigid_moment_init().detach()
+        init_translation = moments.get_rigid_transl_init().detach()
+        logger.info("Moments rotation (will use identity instead):\n%s", moments_rotation.cpu().numpy())
+        logger.info("Moments translation (will be used): %s", init_translation.cpu().numpy())
+        # init_moment stays None, which defaults to identity rotation
 
-    # Rigid registration (no prematch seeding)
+    # Affine registration (no prematch seeding)
     prematch_affine_matrix: Optional[np.ndarray] = None
 
-    # Do not seed translation; rely on registration to find it
-
-    # Initialization QC overlay removed; rely on stage QC after registration
-
-    # Run rigid registration without manual seeds
+    # Run rigid registration (only 6 DOF: 3 translation + 3 rotation, no scaling)
+    # This constrains the optimizer to translation+rotation refinement only
+    # Note: init_moment=None means identity rotation (no rotation from moments)
     rigid = RigidRegistration(
         list(cfg.affine.scales),
         list(cfg.affine.iterations),
@@ -932,16 +989,17 @@ def register_confocal_to_anatomy(
         tolerance=cfg.affine.tolerance,
         max_tolerance_iters=cfg.affine.max_tolerance_iters,
         loss_type=cfg.affine.loss_type,
-        init_translation=init_translation_tensor if init_translation_tensor is not None else None,
-        init_moment=init_moment_tensor if init_moment_tensor is not None else None,
-        scaling=False,
+        init_moment=init_moment,  # None = identity rotation
+        init_translation=init_translation,
+        scaling=False,  # Disable scaling
         **cfg.affine.extra_args,
     )
     rigid.optimize()
-    final_rigid_mat = _convert_torch_to_phys_affine(
-        rigid.get_rigid_matrix(homogenous=False), fixed_batch, moving_batch
+    final_rigid_mat_torch = rigid.get_rigid_matrix(homogenous=False).detach()
+    final_affine_mat = _convert_torch_to_phys_affine(
+        final_rigid_mat_torch, fixed_batch, moving_batch
     ).detach().cpu().numpy()
-    logger.info("Rigid final matrix (xyz basis):\n%s", final_rigid_mat[0])
+    logger.info("Rigid final matrix (xyz basis):\n%s", final_affine_mat[0])
     final_tensor = rigid.evaluate(fixed_batch, moving_batch)
     try:
         warped_np = final_tensor.squeeze().detach().cpu().numpy()
@@ -960,7 +1018,6 @@ def register_confocal_to_anatomy(
                 )
     except Exception:
         pass
-    affine = rigid  # Alias for downstream code that still references `affine`
 
     greedy = None
     if cfg.greedy.enabled:
@@ -988,7 +1045,7 @@ def register_confocal_to_anatomy(
     transforms_dir.mkdir(exist_ok=True)
 
     affine_transform_path = transforms_dir / f"{animal_id}_{confocal_session_id}_affine.mat"
-    _write_affine_transform(affine_transform_path, final_rigid_mat[0])
+    _write_affine_transform(affine_transform_path, final_affine_mat[0])
 
     greedy_transform_path = None
     greedy_inverse_path = None
@@ -1036,7 +1093,7 @@ def register_confocal_to_anatomy(
         if greedy is not None:
             warped = greedy.evaluate(fixed_batch, channel_batch)
         else:
-            warped = affine.evaluate(fixed_batch, channel_batch)
+            warped = rigid.evaluate(fixed_batch, channel_batch)
         warped_arr = warped.squeeze().detach().cpu().numpy().astype(np.float32)
         output_path = output_root / warped_channel_template.format(
             animal_id=animal_id,
@@ -1090,7 +1147,7 @@ def register_confocal_to_anatomy(
             "mode": translation_mode,
             "vector_um": [float(translation_vec[0]), float(translation_vec[1]), float(translation_vec[2])],
         },
-        "final_affine_matrix": final_rigid_mat[0].tolist(),
+        "final_affine_matrix": final_affine_mat[0].tolist(),
         "cropping": {
             "enabled": bool(crop_to_extent),
             "y_vox": (crop_info["y_vox"] if crop_info else None),

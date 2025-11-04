@@ -414,6 +414,10 @@ class MovingSupportMaskConfig(BaseModel):
         default=60.0,
         description="Percentile of the moving MIP used to threshold the support mask.",
     )
+    erode_xy_vox: int = Field(
+        default=0,
+        description="Number of voxels to erode the support mask in XY before dilation. Useful for removing sharp edges from octagonal/circular FOVs.",
+    )
     dilate_xy_vox: int = Field(
         default=3,
         description="Number of voxels to dilate the support mask in XY.",
