@@ -27,6 +27,7 @@ from ..preprocessing import confocal as confocal_preproc, functional_projections
 from ..preprocessing.two_photon import anatomy as anatomy_preproc
 from ..preprocessing.two_photon import functional as functional_preproc
 from ..preprocessing.two_photon import motion as motion_correction
+from ..functional import roi_registration
 from ..registration import align_substack
 from ..registration.confocal_to_anatomy import register_confocal_to_anatomy
 from ..registration.functional_to_anatomy_ants import register_planes_pass1
@@ -1220,6 +1221,228 @@ def process_functional_to_anatomy_registration(
     result.message = f"registered {n_planes} planes; median NCC={median_ncc:.3f}"
     return result
 
+
+def process_functional_roi_registration(
+    *,
+    animal: AnimalMetadata,
+    functional_session: FunctionalSession,
+    anatomy_session: AnatomySession,
+    registration_result: SessionResult,
+    cfg: ProjectConfig,
+    functional_cfg,
+    motion_cfg,
+    fireants_stage_cfg,
+    stage_cfg,
+) -> tuple[SessionResult, Optional[roi_registration.FunctionalRoiRegistrationResult], list[tuple[Path, bool]]]:
+    """Transform Suite2p ROIs into reference-brain coordinates."""
+
+    result = SessionResult(
+        animal_id=animal.animal_id,
+        session_id=functional_session.session_id,
+        session_type="functional_roi_registration",
+        status="skipped",
+    )
+
+    summary: Optional[roi_registration.FunctionalRoiRegistrationResult] = None
+    transform_sequence: list[tuple[Path, bool]] = []
+
+    if stage_cfg.mode == StageMode.SKIP:
+        result.message = "functional ROI registration skipped"
+        return result, summary, transform_sequence
+
+    def _coerce_path(value: object) -> Optional[Path]:
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str) and value:
+            return Path(value)
+        return None
+
+    context = {
+        "animal_id": animal.animal_id,
+        "session_id": functional_session.session_id,
+        "functional_session_id": functional_session.session_id,
+        "anatomy_session_id": anatomy_session.session_id,
+    }
+
+    def _format(template: str) -> str:
+        try:
+            return template.format(**context)
+        except KeyError as exc:
+            missing = exc.args[0]
+            raise KeyError(f"Missing placeholder '{missing}' for template '{template}'")
+
+    registration_csv_path = _coerce_path(registration_result.outputs.get("registration_csv"))
+    anatomy_stack_path = _coerce_path(registration_result.outputs.get("anatomy_stack"))
+
+    if registration_csv_path is None:
+        registration_root = resolve_output_path(
+            animal.animal_id,
+            cfg.functional_to_anatomy_registration.registration_output_subdir,
+            cfg=cfg,
+        )
+        registration_csv_path = registration_root / _format(
+            cfg.functional_to_anatomy_registration.registration_csv_template
+        )
+
+    if anatomy_stack_path is None:
+        anatomy_root = resolve_output_path(
+            animal.animal_id,
+            cfg.anatomy_preprocessing.root_subdir,
+            cfg=cfg,
+        )
+        stack_template = cfg.anatomy_preprocessing.stack_filename_template
+        anatomy_stack_path = anatomy_root / _format(stack_template)
+
+    if not registration_csv_path.exists():
+        result.status = "failed"
+        result.message = f"registration CSV not found: {registration_csv_path}"
+        return result, summary, transform_sequence
+
+    if not anatomy_stack_path.exists():
+        result.status = "failed"
+        result.message = f"anatomy stack not found: {anatomy_stack_path}"
+        return result, summary, transform_sequence
+
+    functional_root = resolve_output_path(
+        animal.animal_id,
+        functional_cfg.root_subdir,
+        cfg=cfg,
+    )
+    motion_root = functional_root / motion_cfg.motion_output_subdir
+    suite2p_root = functional_root / stage_cfg.suite2p_subdir
+
+    if not suite2p_root.exists():
+        result.status = "failed"
+        result.message = f"suite2p outputs not found: {suite2p_root}"
+        return result, summary, transform_sequence
+
+    projection_path = _coerce_path(registration_result.outputs.get("projection_max")) or _coerce_path(
+        registration_result.outputs.get("projection_avg")
+    )
+    if projection_path is None:
+        projections_dir = motion_root / motion_cfg.projections_subdir
+        max_candidate = projections_dir / _format(cfg.functional_to_anatomy_registration.max_projection_filename_template)
+        avg_candidate = projections_dir / _format(cfg.functional_to_anatomy_registration.avg_projection_filename_template)
+        if max_candidate.exists():
+            projection_path = max_candidate
+        elif avg_candidate.exists():
+            projection_path = avg_candidate
+
+    fireants_root = resolve_output_path(
+        animal.animal_id,
+        fireants_stage_cfg.output_subdir,
+        cfg=cfg,
+    )
+    fireants_metadata_path = fireants_root / stage_cfg.fireants_metadata_filename
+
+    output_root = resolve_output_path(
+        animal.animal_id,
+        stage_cfg.output_subdir,
+        cfg=cfg,
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_filename = _format(stage_cfg.output_filename_template)
+    output_csv = output_root / output_filename
+
+    if (
+        stage_cfg.mode == StageMode.REUSE
+        and not stage_cfg.overwrite_outputs
+        and output_csv.exists()
+    ):
+        result.status = "success"
+        result.outputs["roi_csv"] = output_csv
+        result.message = "functional ROI registration reused existing outputs"
+        return result, summary, transform_sequence
+
+    try:
+        registration_df = pd.read_csv(registration_csv_path)
+    except Exception as exc:
+        result.status = "failed"
+        result.message = f"failed to read registration CSV: {exc}"
+        return result, summary, transform_sequence
+
+    ants_cfg = stage_cfg.ants_point_application
+    try:
+        transform_sequence = roi_registration.build_transform_sequence(
+            fireants_metadata_path,
+            use_inverse_warp=ants_cfg.use_inverse_warp,
+            invert_forward_warp=ants_cfg.invert_forward_warp,
+            invert_inverse_warp=ants_cfg.invert_inverse_warp,
+            invert_affine=ants_cfg.invert_affine,
+        )
+    except Exception as exc:
+        result.status = "failed"
+        result.message = f"failed to resolve FireANTs transforms: {exc}"
+        return result, summary, transform_sequence
+
+    overwrite = stage_cfg.overwrite_outputs or stage_cfg.mode == StageMode.FORCE
+    reference_qc_output_path: Optional[Path] = None
+    if stage_cfg.reference_qc.enabled:
+        qc_dir = output_root / stage_cfg.reference_qc.output_subdir
+        qc_filename = _format(stage_cfg.reference_qc.filename_template)
+        reference_qc_output_path = qc_dir / qc_filename
+    anatomy_qc_output_path: Optional[Path] = None
+    if stage_cfg.anatomy_qc.enabled:
+        qc_dir = output_root / stage_cfg.anatomy_qc.output_subdir
+        qc_filename = _format(stage_cfg.anatomy_qc.filename_template)
+        anatomy_qc_output_path = qc_dir / qc_filename
+    native_qc_output_path: Optional[Path] = None
+    if stage_cfg.native_qc.enabled:
+        native_qc_dir = output_root / stage_cfg.native_qc.output_subdir
+        native_qc_filename = _format(stage_cfg.native_qc.filename_template)
+        native_qc_output_path = native_qc_dir / native_qc_filename
+
+    try:
+        summary = roi_registration.transform_rois_to_reference(
+            animal_id=animal.animal_id,
+            session_id=functional_session.session_id,
+            registration_df=registration_df,
+            suite2p_root=suite2p_root,
+            plane_folder_template=stage_cfg.plane_folder_template,
+            anatomy_stack_path=anatomy_stack_path,
+            fireants_metadata_path=fireants_metadata_path,
+            reference_brain_path=resolve_reference_brain(cfg=cfg),
+            output_csv=output_csv,
+            transform_sequence=transform_sequence,
+            plane_column=stage_cfg.plane_column,
+            extra_stat_filenames=stage_cfg.extra_stat_filenames,
+            flip_anatomy_x=stage_cfg.flip_anatomy_x,
+            flip_anatomy_z=stage_cfg.flip_anatomy_z,
+            overwrite=overwrite,
+            reference_qc_settings=stage_cfg.reference_qc,
+            reference_qc_output_path=reference_qc_output_path,
+            anatomy_qc_settings=stage_cfg.anatomy_qc,
+            anatomy_qc_output_path=anatomy_qc_output_path,
+            native_qc_settings=stage_cfg.native_qc,
+            native_qc_output_path=native_qc_output_path,
+            native_projection_path=projection_path,
+        )
+    except roi_registration.FunctionalRoiRegistrationError as exc:
+        result.status = "failed"
+        result.message = str(exc)
+        return result, summary, transform_sequence
+    except Exception as exc:
+        logger.exception("Functional ROI registration failed", exc_info=exc)
+        result.status = "failed"
+        result.message = f"functional ROI registration failed: {exc}"
+        return result, summary, transform_sequence
+
+    result.status = "success"
+    result.outputs["roi_csv"] = output_csv
+    if summary and summary.qc_path is not None:
+        result.outputs["roi_reference_qc"] = summary.qc_path
+    if summary and getattr(summary, "native_qc_path", None):
+        result.outputs["roi_native_qc"] = summary.native_qc_path
+    if summary and getattr(summary, "anatomy_qc_path", None):
+        result.outputs["roi_anatomy_qc"] = summary.anatomy_qc_path
+    result.message = (
+        f"transformed {summary.total_rois} ROIs "
+        f"({summary.processed_planes}/{summary.total_planes} planes)"
+    )
+    if summary and summary.qc_path is not None:
+        result.message += f"; qc={summary.qc_path.name}"
+    return result, summary, transform_sequence
+
 def run_pipeline(
     animal_ids: Optional[Iterable[str]] = None,
     *,
@@ -1269,6 +1492,7 @@ def run_pipeline(
     fireants_stage_cfg = cfg.fireants_registration
     confocal_stage_cfg = cfg.confocal_to_anatomy_registration
     ftoa_stage_cfg = cfg.functional_to_anatomy_registration
+    roi_stage_cfg = cfg.functional_roi_registration
     processing_cfg = cfg.processing_log
 
     animals = list(iter_animals_with_yaml(metadata_base))
@@ -1649,6 +1873,94 @@ def run_pipeline(
                         animal_log,
                         _stage_key(stage_result.session_type, stage_result.session_id),
                         stage_result,
+                        parameters,
+                    )
+                    save_processing_log(animal_log, log_path)
+
+            roi_stage_result: Optional[SessionResult] = None
+            roi_summary: Optional[roi_registration.FunctionalRoiRegistrationResult] = None
+            roi_transforms: list[tuple[Path, bool]] = []
+
+            if roi_stage_cfg.mode == StageMode.SKIP:
+                roi_stage_result = SessionResult(
+                    animal_id=animal.animal_id,
+                    session_id=functional_session_ref.session_id,
+                    session_type="functional_roi_registration",
+                    status="skipped",
+                    message="functional ROI registration skipped",
+                )
+            elif stage_result.status != "success":
+                roi_stage_result = SessionResult(
+                    animal_id=animal.animal_id,
+                    session_id=functional_session_ref.session_id,
+                    session_type="functional_roi_registration",
+                    status="skipped",
+                    message="functional-to-anatomy registration unavailable; cannot transform ROIs",
+                )
+            else:
+                logger.info(
+                    "---------- Functional ROI registration (%s :: %s) ----------",
+                    animal.animal_id,
+                    functional_session_ref.session_id,
+                )
+                roi_stage_result, roi_summary, roi_transforms = process_functional_roi_registration(
+                    animal=animal,
+                    functional_session=functional_session_ref,  # type: ignore[arg-type]
+                    anatomy_session=anatomy_session_ref,  # type: ignore[arg-type]
+                    registration_result=stage_result,
+                    cfg=cfg,
+                    functional_cfg=functional_cfg,
+                    motion_cfg=motion_cfg,
+                    fireants_stage_cfg=fireants_stage_cfg,
+                    stage_cfg=roi_stage_cfg,
+                )
+                logger.info(
+                    "---------- Completed functional ROI registration (%s :: %s): %s ----------",
+                    animal.animal_id,
+                    functional_session_ref.session_id,
+                    roi_stage_result.status,
+                )
+
+            if roi_stage_result is not None:
+                animal_result.sessions.append(roi_stage_result)
+                if animal_log is not None and log_path is not None:
+                    parameters = {
+                        "functional_roi_mode": roi_stage_cfg.mode.value,
+                        "overwrite_outputs": roi_stage_cfg.overwrite_outputs,
+                        "flip_anatomy_x": roi_stage_cfg.flip_anatomy_x,
+                        "flip_anatomy_z": roi_stage_cfg.flip_anatomy_z,
+                        "plane_column": roi_stage_cfg.plane_column,
+                        "extra_stat_filenames": roi_stage_cfg.extra_stat_filenames,
+                        "reference_qc_enabled": roi_stage_cfg.reference_qc.enabled,
+                        "anatomy_qc_enabled": roi_stage_cfg.anatomy_qc.enabled,
+                        "native_qc_enabled": roi_stage_cfg.native_qc.enabled,
+                    }
+                    if roi_transforms:
+                        parameters["transform_sequence"] = [
+                            {"path": str(path), "invert": invert}
+                            for path, invert in roi_transforms
+                        ]
+                    if roi_summary is not None:
+                        parameters.update(
+                            {
+                                "total_planes": roi_summary.total_planes,
+                                "processed_planes": roi_summary.processed_planes,
+                                "total_rois": roi_summary.total_rois,
+                                "skipped_planes": dict(roi_summary.skipped_planes),
+                            }
+                        )
+                        if getattr(roi_summary, "native_qc_path", None):
+                            parameters["native_qc_path"] = str(roi_summary.native_qc_path)
+                        if getattr(roi_summary, "anatomy_qc_path", None):
+                            parameters["anatomy_qc_path"] = str(roi_summary.anatomy_qc_path)
+                        if getattr(roi_summary, "qc_path", None):
+                            parameters["reference_qc_path"] = str(roi_summary.qc_path)
+                        if roi_summary.qc_path is not None:
+                            parameters["qc_path"] = str(roi_summary.qc_path)
+                    _update_processing_log_stage(
+                        animal_log,
+                        _stage_key(roi_stage_result.session_type, roi_stage_result.session_id),
+                        roi_stage_result,
                         parameters,
                     )
                     save_processing_log(animal_log, log_path)

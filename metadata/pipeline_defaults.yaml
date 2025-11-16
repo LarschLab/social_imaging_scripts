@@ -106,6 +106,60 @@ functional_to_anatomy_registration:
   gaussian_sigma: 1.0          # Gaussian smoothing sigma applied during preprocessing.
   early_stop_score: 0.995      # Stop search once NCC exceeds this threshold (set null to disable).
 
+functional_roi_registration:
+  mode: reuse  # Stage execution mode for Suite2p ROI transformation.
+  suite2p_subdir: 03_suite2p  # Relative to motion outputs; folder containing Suite2p artefacts.
+  plane_folder_template: "plane{plane_index}"  # Template for per-plane Suite2p directories.
+  fireants_metadata_filename: fireants_registration_metadata.json  # Metadata describing FireANTs transforms.
+  output_subdir: 03_analysis/functional/ROI_transformed  # Destination for transformed ROI tables.
+  output_filename_template: "{animal_id}_{session_id}_functional_rois_reference.csv"  # Output CSV filename.
+  overwrite_outputs: true  # Recompute even if the output CSV exists.
+  plane_column: moving_plane  # Column in registration CSV identifying the plane index (null falls back to row index).
+  flip_anatomy_x: false  # Unflip anatomy-space X before applying FireANTs transforms.
+  flip_anatomy_z: false  # Invert anatomy-space Z indices before applying FireANTs transforms.
+  extra_stat_filenames: []  # Additional Suite2p stat.npy filename candidates (relative to plane folder).
+  ants_point_application:
+    invert_affine: true  # Invert affine transform when applying to points.
+    invert_forward_warp: false  # Invert forward (greedy) warp when applying to points.
+    use_inverse_warp: false  # Use the saved inverse warp instead of the forward warp when available.
+    invert_inverse_warp: false  # Invert the inverse warp before application (only used when use_inverse_warp=true).
+  reference_qc:
+    enabled: true  # Generate QC overlays comparing ROIs against the reference stack.
+    output_subdir: qc  # Subdirectory (relative to ROI output) for QC artefacts.
+    filename_template: "{animal_id}_{session_id}_functional_roi_reference.png"  # QC figure filename.
+    max_planes: 6  # Maximum number of reference planes visualised in QC figure.
+    max_columns: 3  # Maximum subplot columns for QC grid.
+    z_tolerance: 2.0  # Include ROIs within ± this reference-plane tolerance.
+    point_size: 10.0  # Scatter marker size for ROIs.
+    alpha: 0.9  # Scatter marker opacity.
+    figsize: [10, 8]  # Matplotlib figure size for QC overlays.
+    dpi: 150  # Output DPI for QC figure.
+    percentiles: [1.0, 99.0]  # Percentiles used to normalise reference slices.
+    flip_z: false  # Flip Z indexing for visualization in reference QC.
+  anatomy_qc:
+    enabled: true  # Overlay ROIs + warped functional planes on anatomy slices (functional→anatomy only).
+    output_subdir: qc  # Subdirectory (relative to ROI output) for anatomy QC artefacts.
+    filename_template: "{animal_id}_{session_id}_functional_roi_anatomy.png"  # Anatomy QC filename.
+    max_planes: 6  # Maximum number of anatomy planes visualised.
+    max_columns: 3  # Maximum subplot columns for anatomy QC grid.
+    z_tolerance: 0.0  # Optional tolerance when picking anatomy slices (0 = exact z_index).
+    point_size: 10.0  # Scatter marker size for ROIs.
+    alpha: 0.6  # Scatter opacity for ROIs.
+    figsize: [10, 8]  # Matplotlib figure size for QC overlays.
+    dpi: 150  # Output DPI for QC figure.
+    percentiles: [1.0, 99.0]  # Percentiles used to normalise anatomy slices.
+  native_qc:
+    enabled: true  # Overlay native (untransformed) ROIs on functional plane projections.
+    use_max_projection: true  # Use max projection when available; otherwise average.
+    output_subdir: qc  # Subdirectory (relative to ROI output) for native QC artefacts.
+    filename_template: "{animal_id}_{session_id}_functional_roi_native.png"  # Native QC filename.
+    percentiles: [1.0, 99.0]  # Percentiles to normalise projection planes.
+    point_size: 8.0  # Scatter size for ROIs.
+    alpha: 0.9  # Scatter opacity for ROIs.
+    figsize: [10, 8]  # Figure size.
+    dpi: 150  # Output DPI.
+    max_columns: 3  # Grid columns for plane panels.
+
 # Confocal → anatomy registration.
 confocal_to_anatomy_registration:
   mode: reuse  # Stage execution mode (skip/reuse/force).

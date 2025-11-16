@@ -617,6 +617,175 @@ class FunctionalToAnatomyRegistrationConfig(BaseModel):
         return normalise_pathlike(value)
 
 
+class AntsPointApplicationConfig(BaseModel):
+    """Controls how ANTs/FireANTs transforms are applied to ROI coordinates."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    invert_affine: bool = Field(
+        default=True, description="Invert affine transform when applying to points."
+    )
+    invert_forward_warp: bool = Field(
+        default=False, description="Invert the forward warp before application."
+    )
+    use_inverse_warp: bool = Field(
+        default=False,
+        description="Use the saved inverse warp instead of the forward warp.",
+    )
+    invert_inverse_warp: bool = Field(
+        default=False,
+        description="Invert the inverse warp transform before application.",
+    )
+
+
+class FunctionalRoiRegistrationQcConfig(BaseModel):
+    """Settings controlling QC figure generation for functional ROI mapping."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=False,
+        description="Generate QC overlays comparing ROIs against the reference stack.",
+    )
+    output_subdir: Path = Field(
+        default=Path("qc"),
+        description="Subdirectory (relative to ROI output) for QC artefacts.",
+    )
+    filename_template: str = Field(
+        default="{animal_id}_{session_id}_functional_roi_qc.png",
+        description="Filename template for QC figures.",
+    )
+    max_planes: int = Field(
+        default=6,
+        description="Maximum number of reference planes visualised in QC figures.",
+    )
+    max_columns: int = Field(
+        default=3,
+        description="Maximum number of columns used for QC subplot grids.",
+    )
+    z_tolerance: float = Field(
+        default=2.0,
+        description="Include ROIs within ± this tolerance (in reference index units).",
+    )
+    point_size: float = Field(
+        default=10.0,
+        description="Scatter size used when plotting ROIs.",
+    )
+    alpha: float = Field(
+        default=0.9,
+        description="Alpha (opacity) used for ROI scatter markers.",
+    )
+    figsize: tuple[float, float] = Field(
+        default=(10.0, 8.0),
+        description="Matplotlib figure size for QC overlays.",
+    )
+    dpi: int = Field(
+        default=150,
+        description="Output DPI for QC figures.",
+    )
+    percentiles: tuple[float, float] = Field(
+        default=(1.0, 99.0),
+        description="Percentiles used to rescale reference slices for display.",
+    )
+    flip_z: bool = Field(
+        default=False,
+        description="Flip Z indexing when selecting slices for display (visual-only).",
+    )
+
+    @field_validator("output_subdir", mode="before")
+    @classmethod
+    def _normalise_output_subdir(cls, value):
+        return normalise_pathlike(value)
+
+    @field_validator("figsize", mode="before")
+    @classmethod
+    def _validate_figsize(cls, value):
+        if value is None:
+            return (10.0, 8.0)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            return (float(value[0]), float(value[1]))
+        raise ValueError("figsize must contain two values [width, height]")
+
+    @field_validator("percentiles", mode="before")
+    @classmethod
+    def _validate_percentiles(cls, value):
+        if value is None:
+            return (1.0, 99.0)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            return (float(value[0]), float(value[1]))
+        raise ValueError("percentiles must contain two values [low, high]")
+
+
+class FunctionalRoiRegistrationConfig(BaseModel):
+    """Configuration for transforming Suite2p ROIs into reference space."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: StageMode = Field(..., description="Stage execution mode.")
+    suite2p_subdir: Path = Field(
+        ..., description="Relative path to Suite2p outputs under the motion stage."
+    )
+    plane_folder_template: str = Field(
+        ..., description="Template for per-plane Suite2p segmentation folders."
+    )
+    fireants_metadata_filename: Path = Field(
+        ...,
+        description="Filename of the FireANTs metadata JSON (relative to fireants output).",
+    )
+    output_subdir: Path = Field(
+        ..., description="Destination directory for transformed ROI tables."
+    )
+    output_filename_template: str = Field(
+        ..., description="Filename template for transformed ROI CSV outputs."
+    )
+    overwrite_outputs: bool = Field(
+        default=True,
+        description="Recompute outputs even if the destination CSV already exists.",
+    )
+    plane_column: Optional[str] = Field(
+        default="moving_plane",
+        description="Column in the registration CSV identifying the plane index.",
+    )
+    flip_anatomy_x: bool = Field(
+        default=True,
+        description="Unflip anatomy-space X coordinates before applying FireANTs transforms.",
+    )
+    flip_anatomy_z: bool = Field(
+        default=False,
+        description="Invert anatomy-space Z indices before applying FireANTs transforms.",
+    )
+    extra_stat_filenames: list[str] = Field(
+        default_factory=list,
+        description="Additional Suite2p stat.npy filename candidates per plane.",
+    )
+    ants_point_application: AntsPointApplicationConfig = Field(
+        default_factory=AntsPointApplicationConfig,
+        description="How affine/warp transforms are applied to ROI coordinates.",
+    )
+    reference_qc: FunctionalRoiRegistrationQcConfig = Field(
+        default_factory=FunctionalRoiRegistrationQcConfig,
+        description="QC for ROIs mapped into reference space.",
+    )
+    anatomy_qc: FunctionalRoiRegistrationQcConfig = Field(
+        default_factory=FunctionalRoiRegistrationQcConfig,
+        description="QC for ROIs mapped into anatomy space (no ANTs).",
+    )
+    native_qc: FunctionalRoiRegistrationQcConfig = Field(
+        default_factory=FunctionalRoiRegistrationQcConfig,
+        description="QC overlay for native (untransformed) functional ROIs.",
+    )
+
+    @field_validator(
+        "suite2p_subdir",
+        "output_subdir",
+        "fireants_metadata_filename",
+        mode="before",
+    )
+    @classmethod
+    def _normalise_paths(cls, value):
+        return normalise_pathlike(value)
+
+
 class ProcessingLogConfig(BaseModel):
     """Configuration for generated per-animal processing artefact logs."""
 
@@ -677,6 +846,7 @@ class ProjectConfig(BaseModel):
     functional_to_anatomy_registration: FunctionalToAnatomyRegistrationConfig = Field(
         ...
     )
+    functional_roi_registration: FunctionalRoiRegistrationConfig = Field(...)
     processing_log: ProcessingLogConfig = Field(...)
 
     @field_validator("raw_base_dir", "output_base_dir", "ref_base_dir", mode="before")
