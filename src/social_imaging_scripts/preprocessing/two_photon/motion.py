@@ -81,6 +81,8 @@ def move_suite2p_outputs(
     motion_output: Path,
     segmentation_output: Path,
     dest_motion: Path,
+    metadata_filename: str,
+    pixel_size_xy_um: float | None = None,
 ) -> Dict[str, Path]:
     """Collate Suite2p outputs and clean project layout."""
 
@@ -102,11 +104,26 @@ def move_suite2p_outputs(
     if dest_motion.exists():
         dest_motion.unlink()
 
+    # Capture XY scaling from preprocessing metadata if provided
+    resolution = None
+    resolutionunit = None
+    metadata = {}
+    if pixel_size_xy_um is not None and pixel_size_xy_um > 0:
+        res = 1e4 / float(pixel_size_xy_um)  # pixels per cm
+        resolution = (res, res)
+        resolutionunit = "CENTIMETER"
+
     with tifffile.TiffWriter(dest_motion, bigtiff=True) as writer:
         for chunk_path in tiff_files:
             with tifffile.TiffFile(chunk_path) as tif:
                 for page in tif.pages:
-                    writer.write(page.asarray(), contiguous=True)
+                    writer.write(
+                        page.asarray(),
+                        contiguous=True,
+                        resolution=resolution,
+                        resolutionunit=resolutionunit,
+                        metadata=metadata or None,
+                    )
 
     for chunk_path in tiff_files:
         chunk_path.unlink()
@@ -151,6 +168,7 @@ def run_motion_correction(
     segmentation_folder_template: str = "plane{plane_index}",
     motion_filename_template: str = "{animal_id}_plane{plane_index}_mcorrected.tif",
     metadata_filename: str = "motion_metadata.json",
+    pixel_size_xy_um: float | None = None,
 ) -> Dict[str, Path]:
     """Run Suite2p on one plane and organize outputs under output_root.
 
@@ -197,6 +215,8 @@ def run_motion_correction(
         motion_output=motion_output,
         segmentation_output=segmentation_output,
         dest_motion=dest_motion,
+        metadata_filename=metadata_name,
+        pixel_size_xy_um=pixel_size_xy_um,
     )
 
     metadata = {

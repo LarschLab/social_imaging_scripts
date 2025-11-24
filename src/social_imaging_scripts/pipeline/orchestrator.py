@@ -306,6 +306,7 @@ def process_functional_session(
     metadata_path = plane_dir / metadata_name
     preproc_ran = False
     notes: list[str] = []
+    pixel_size_xy = None
 
     if run_preprocess:
         try:
@@ -346,6 +347,12 @@ def process_functional_session(
     else:
         if metadata_path.exists():
             result.outputs["preprocess_metadata"] = metadata_path
+
+    if metadata_path.exists():
+        try:
+            pixel_size_xy = _load_session_pixel_size(metadata_path)
+        except Exception:
+            pixel_size_xy = None
 
     plane_pattern = functional_cfg.plane_filename_template.format(
         animal_id=animal.animal_id,
@@ -392,6 +399,7 @@ def process_functional_session(
                     segmentation_folder_template=motion_cfg.segmentation_folder_template,
                     motion_filename_template=motion_cfg.motion_filename_template,
                     metadata_filename=motion_cfg.metadata_filename,
+                    pixel_size_xy_um=pixel_size_xy[0] if pixel_size_xy else None,
                 )
                 for key, value in motion_outputs.items():
                     result.outputs[f"plane{plane_idx}_{key}"] = Path(value)
@@ -469,6 +477,10 @@ def process_anatomy_session(
     notes: list[str] = []
 
     if run_preprocess:
+        if getattr(session.session_data, "plane_spacing", None) is None:
+            result.status = "failed"
+            result.message = "anatomy plane_spacing missing in metadata"
+            return result
         try:
             raw_path = _resolve_session_raw_path(
                 animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
@@ -507,6 +519,14 @@ def process_anatomy_session(
                 preproc_ran = True
             if metadata_path.exists():
                 result.outputs["anatomy_preprocess_metadata"] = metadata_path
+                # Populate spacing on the session from preprocessing metadata (single source of truth)
+                meta_data = json.loads(metadata_path.read_text(encoding="utf-8"))
+                px = meta_data.get("pixel_size_xy_um")
+                z_spc = meta_data.get("plane_spacing_um")
+                if px is None or z_spc is None:
+                    raise ValueError(f"Missing pixel_size_xy_um/plane_spacing_um in {metadata_path}")
+                session.session_data.pixel_size_xy_um = (float(px[0]), float(px[1]))
+                session.session_data.z_step_um = float(z_spc)
         except Exception as exc:  # pragma: no cover - external IO
             logger.exception("Anatomy preprocessing failed", exc_info=exc)
             result.status = "failed"
@@ -686,6 +706,10 @@ def process_confocal_session(
         stage_cfg.root_subdir,
         cfg=cfg,
     )
+    if getattr(session.session_data, "plane_spacing", None) is None:
+        result.status = "failed"
+        result.message = "confocal plane_spacing missing in metadata"
+        return result, None
     try:
         raw_path = _resolve_session_raw_path(
             animal=animal, relative_path=Path(session.session_data.raw_path), cfg=cfg
@@ -739,6 +763,7 @@ def process_confocal_session(
             gui_display_channel=gui.get("display_channel") if gui is not None else None,
             reprocess=mode == StageMode.FORCE,
             raw_path_override=raw_path,
+            plane_spacing_um=float(session.session_data.plane_spacing),
         )
     except Exception as exc:  # pragma: no cover - IO heavy
         logger.exception("Confocal preprocessing failed", exc_info=exc)
@@ -832,25 +857,17 @@ def process_confocal_to_anatomy_registration(
         animal_id=animal.animal_id,
         session_id=anatomy_session.session_id,
     )
-    fixed_pixel_size = (1.0, 1.0)
-    z_spacing_from_metadata = None
+    if not anatomy_metadata_path.exists():
+        raise FileNotFoundError(f"anatomy metadata missing at {anatomy_metadata_path}")
     try:
         fixed_pixel_size = _load_session_pixel_size(anatomy_metadata_path)
-        # Also try to load z spacing from preprocessed metadata
-        if anatomy_metadata_path.exists():
-            metadata = json.loads(anatomy_metadata_path.read_text(encoding="utf-8"))
-            z_spacing_from_metadata = metadata.get("plane_spacing_um")
-    except Exception:
-        pass
-    
-    # Prefer z_spacing from preprocessed metadata, then session YAML
-    z_spacing = z_spacing_from_metadata
-    if z_spacing is None:
-        z_spacing = getattr(anatomy_session.session_data, "plane_spacing", None)
-    if z_spacing is None:
-        z_spacing = getattr(anatomy_session.session_data, "z_step_um", None)
-    if z_spacing is None:
-        z_spacing = 1.0
+        metadata = json.loads(anatomy_metadata_path.read_text(encoding="utf-8"))
+        z_spacing = metadata.get("plane_spacing_um")
+        if z_spacing is None or fixed_pixel_size is None:
+            raise ValueError("pixel_size_xy_um or plane_spacing_um missing in anatomy metadata")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load anatomy spacing from {anatomy_metadata_path}: {exc}") from exc
+
     fixed_spacing_um = [
         float(fixed_pixel_size[0]),
         float(fixed_pixel_size[1]),

@@ -111,12 +111,21 @@ def save_max_avg_projections(
     avg_path = out_dir / f"{prefix}avg_projections.tif"
 
     # ImageJ expects axes "ZYX" for stacks
+    resolution = None
+    resolutionunit = None
+    if pixel_size_xy_um is not None and pixel_size_xy_um > 0:
+        res = 1e4 / float(pixel_size_xy_um)  # pixels per cm
+        resolution = (res, res)
+        resolutionunit = "CENTIMETER"
+
     tiff.imwrite(
         str(max_path),
         max_norm.astype(np.float32, copy=False),
         imagej=True,
         metadata={"axes": "ZYX"},
         compression="deflate",
+        resolution=resolution,
+        resolutionunit=resolutionunit,
     )
     tiff.imwrite(
         str(avg_path),
@@ -124,6 +133,8 @@ def save_max_avg_projections(
         imagej=True,
         metadata={"axes": "ZYX"},
         compression="deflate",
+        resolution=resolution,
+        resolutionunit=resolutionunit,
     )
 
     metadata_payload = {

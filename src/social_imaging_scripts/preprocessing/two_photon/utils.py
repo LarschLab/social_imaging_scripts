@@ -148,11 +148,35 @@ def correct_negative_values(stack: np.ndarray, *, chunk_size: int = 256) -> np.n
     return result
 
 
-def save_tiff_stack(path: Path, data: np.ndarray) -> None:
-    """Persist ``data`` as a TIFF stack (uint16)."""
+def save_tiff_stack(path: Path, data: np.ndarray, *, pixel_size_xy_um: float | tuple[float, float] | None = None, plane_spacing_um: float | None = None) -> None:
+    """Persist ``data`` as a TIFF stack (uint16) with optional scaling metadata."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(path, data.astype(np.uint16, copy=False), photometric="minisblack")
+
+    resolution = None
+    resolutionunit = None
+    metadata: dict[str, object] | None = None
+    if pixel_size_xy_um is not None:
+        if isinstance(pixel_size_xy_um, (tuple, list)):
+            px = float(pixel_size_xy_um[0])
+        else:
+            px = float(pixel_size_xy_um)
+        if px > 0:
+            # TIFF resolution is specified as pixels per unit; use cm as the unit (ImageJ-compatible)
+            res = 1e4 / px  # pixels per cm
+            resolution = (res, res)
+            resolutionunit = "CENTIMETER"
+    if plane_spacing_um is not None:
+        metadata = {"spacing": float(plane_spacing_um), "spacing_unit": "um", "unit": "um"}
+
+    tifffile.imwrite(
+        path,
+        data.astype(np.uint16, copy=False),
+        photometric="minisblack",
+        resolution=resolution,
+        resolutionunit=resolutionunit,
+        metadata=metadata,
+    )
 
 
 def drop_flyback_and_reshape(

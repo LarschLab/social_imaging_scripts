@@ -309,9 +309,22 @@ def transform_rois_to_reference(
             validated_sequence.append((candidate, bool(invert)))
         transforms = validated_sequence
 
-    anatomy_spacing, anatomy_origin = align_substack.get_spacing_origin_ZYX(
-        anatomy_stack_path
-    )
+    def _load_anatomy_spacing() -> tuple[np.ndarray, np.ndarray]:
+        meta_candidates = list(anatomy_stack_path.parent.glob("*_anatomy_metadata.json"))
+        for meta_path in meta_candidates:
+            try:
+                data = json.loads(meta_path.read_text())
+                px = data.get("pixel_size_xy_um")
+                z = data.get("plane_spacing_um")
+                if px and z is not None:
+                    spacing = np.array([float(z), float(px[0]), float(px[1])], dtype=float)
+                    origin = np.zeros(3, dtype=float)
+                    return spacing, origin
+            except Exception:
+                continue
+        return align_substack.get_spacing_origin_ZYX(anatomy_stack_path)
+
+    anatomy_spacing, anatomy_origin = _load_anatomy_spacing()
     reference_spacing, reference_origin = align_substack.get_spacing_origin_ZYX(
         reference_brain_path
     )

@@ -251,31 +251,6 @@ def _compute_pixel_size_from_tiff(path: Path) -> Optional[Tuple[float, float]]:
     return float(size_x), float(size_y)
 
 
-def _lookup_z_step_um(animal: AnimalMetadata, session: AnatomySession) -> Optional[float]:
-    """Read step_size_um_anatomy from the microscope metadata CSV if present."""
-
-    try:
-        metadata_dir = _resolve_raw_path(Path(animal.root_dir) / "01_raw/2p/metadata")
-    except FileNotFoundError:
-        return None
-
-    for csv_path in sorted(Path(metadata_dir).glob("*_metadata.csv")):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            continue
-        if "parameter" not in df.columns or "value" not in df.columns:
-            continue
-        mask = df["parameter"].str.fullmatch("step_size_um_anatomy", case=False, na=False)
-        if mask.any():
-            raw_value = df.loc[mask, "value"].dropna().iloc[0]
-            try:
-                return float(raw_value)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
 def _prepare_voxel_spacing(
     animal: Optional[AnimalMetadata], session: Optional[AnatomySession]
 ) -> Tuple[Optional[Tuple[float, float]], Optional[float]]:
@@ -285,21 +260,15 @@ def _prepare_voxel_spacing(
         return None, None
 
     pixel_size = session.session_data.pixel_size_xy_um
-    z_step = session.session_data.z_step_um
+    z_step = session.session_data.z_step_um or getattr(session.session_data, "plane_spacing", None)
 
-    raw_stack_path = _resolve_raw_path(Path(animal.root_dir) / session.session_data.raw_path)
+    if pixel_size is None or z_step is None:
+        raise ValueError(
+            f"Missing voxel spacing for anatomy session {session.session_id}: "
+            f"pixel_size_xy_um={pixel_size}, z_step_um={z_step}"
+        )
 
-    if pixel_size is None:
-        pixel_size = _compute_pixel_size_from_tiff(raw_stack_path)
-        if pixel_size:
-            session.session_data.pixel_size_xy_um = pixel_size
-
-    if z_step is None:
-        z_step = _lookup_z_step_um(animal, session)
-        if z_step is not None:
-            session.session_data.z_step_um = z_step
-
-    return pixel_size, z_step
+    return pixel_size, float(z_step)
 
 
 def register_two_photon_anatomy(
@@ -329,6 +298,7 @@ def register_two_photon_anatomy(
         FAImage,
         BatchedImages,
         MomentsRegistration,
+        RigidRegistration,
         AffineRegistration,
         GreedyRegistration,
     ) = _import_fireants()
@@ -467,7 +437,20 @@ def register_two_photon_anatomy(
 
     warped_volume = final_tensor.squeeze().detach().cpu().numpy().astype(np.float32)
     warped_stack_path = output_root / f"{animal_id}_anatomy_warped_fireants.tif"
-    tifffile.imwrite(warped_stack_path, warped_volume)
+    # Use reference spacing for the warped output
+    ref_spacing = fixed_image.GetSpacing()
+    res = None
+    resunit = None
+    if len(ref_spacing) >= 2:
+        res = (1e4 / float(ref_spacing[0]), 1e4 / float(ref_spacing[1]))
+        resunit = "CENTIMETER"
+    tifffile.imwrite(
+        warped_stack_path,
+        warped_volume,
+        resolution=res,
+        resolutionunit=resunit,
+        metadata={"spacing": float(ref_spacing[2] if len(ref_spacing) >= 3 else 1.0), "spacing_unit": "um", "unit": "um"},
+    )
 
     qc_dir = output_root / "qc"
     qc_dir.mkdir(exist_ok=True)

@@ -1075,7 +1075,14 @@ def register_confocal_to_anatomy(
         anatomy_session_id=anatomy_session_id,
         channel=reference_channel_name,
     )
-    tifffile.imwrite(gcamp_output, warped_gcamp)
+    res = (1e4 / float(fixed_spacing_um[0]), 1e4 / float(fixed_spacing_um[1]))
+    tifffile.imwrite(
+        gcamp_output,
+        warped_gcamp,
+        resolution=res,
+        resolutionunit="CENTIMETER",
+        metadata={"spacing": float(fixed_spacing_um[2]), "spacing_unit": "um", "unit": "um"},
+    )
     warped_channels[reference_channel_name] = gcamp_output
 
     def _warp_additional_channel(name: str, channel_path: Path) -> Path:
@@ -1101,7 +1108,13 @@ def register_confocal_to_anatomy(
             anatomy_session_id=anatomy_session_id,
             channel=name,
         )
-        tifffile.imwrite(output_path, warped_arr)
+        tifffile.imwrite(
+            output_path,
+            warped_arr,
+            resolution=res,
+            resolutionunit="CENTIMETER",
+            metadata={"spacing": float(fixed_spacing_um[2]), "spacing_unit": "um", "unit": "um"},
+        )
         return output_path
 
     for name, path in additional_channels.items():

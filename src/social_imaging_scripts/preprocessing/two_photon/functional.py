@@ -151,7 +151,12 @@ def run(
             plane_index=plane_idx,
         )
         plane_path = output_planes / plane_filename
-        utils.save_tiff_stack(plane_path, plane_stack)
+        utils.save_tiff_stack(
+            plane_path,
+            plane_stack,
+            pixel_size_xy_um=pixel_size_xy[0],
+            plane_spacing_um=None,  # functional planes do not carry z spacing here
+        )
         plane_paths[f"plane_{plane_idx}"] = plane_path
 
     metadata = {

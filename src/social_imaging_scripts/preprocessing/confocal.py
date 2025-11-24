@@ -96,6 +96,7 @@ def run(
     gui_display_channel: Optional[str] = None,
     reprocess: bool = False,
     raw_path_override: Optional[Path] = None,
+    plane_spacing_um: Optional[float] = None,
 ) -> ConfocalPreprocessOutputs:
     """Split a confocal LSM stack into per-channel TIFF volumes."""
 
@@ -108,7 +109,10 @@ def run(
     if metadata_path.exists() and not reprocess:
         payload = json.loads(metadata_path.read_text())
         channel_paths = {name: Path(path) for name, path in payload.get("channels", {}).items()}
-        voxel = payload.get("voxel_size_um") or [1.0, 1.0, 1.0]
+        voxel = payload.get("voxel_size_um")
+        plane_spacing = payload.get("plane_spacing_um")
+        if voxel is None or plane_spacing is None:
+            raise ValueError(f"Confocal metadata missing voxel_size_um/plane_spacing_um: {metadata_path}")
         flip = bool(payload.get("flip_horizontal", False))
         flip_axial = bool(payload.get("flip_z", False))
         pixels = payload.get("pixels_xyz")
@@ -118,7 +122,7 @@ def run(
                 example_shape = tifffile.imread(example).shape
                 pixels = [int(example_shape[0]), int(example_shape[1]), int(example_shape[2])]
             else:
-                pixels = [0, 0, 0]
+                raise ValueError(f"Confocal metadata missing pixels_xyz and no channel file to infer: {metadata_path}")
         return ConfocalPreprocessOutputs(
             session_id=session_id,
             metadata_path=metadata_path,
@@ -129,6 +133,11 @@ def run(
             flip_z=flip_axial,
             reused=True,
         )
+
+    if plane_spacing_um is None:
+        plane_spacing_um = getattr(session.session_data, "plane_spacing", None)
+    if plane_spacing_um is None:
+        raise ValueError("plane_spacing must be provided for confocal preprocessing")
 
     raw_path = raw_path_override or Path(session.session_data.raw_path)
     if not raw_path.is_absolute():
@@ -141,8 +150,14 @@ def run(
     voxel = (
         float(meta["voxel_size_x_um"]),
         float(meta["voxel_size_y_um"]),
-        float(meta["voxel_size_z_um"]),
+        float(plane_spacing_um),
     )
+    if np.allclose([voxel[0], voxel[1]], (1.0, 1.0)):
+        import logging
+        logging.getLogger(__name__).warning(
+            "Confocal pixel size reported as (1.0, 1.0) µm for %s; header likely missing correct spacing",
+            raw_path.name,
+        )
 
     # Apply flips first (before rotation) if requested
     flips_applied = False
@@ -247,7 +262,20 @@ def run(
             channel=name,
         )
         channel_path = output_dir / channel_filename
-        tifffile.imwrite(channel_path, channel_data.astype(np.float32, copy=False))
+        # ImageJ-compatible scaling metadata: spacing along Z is plane_spacing_um; XY from header
+        res = 1e4 / float(voxel[0]) if voxel[0] > 0 else None
+        tifffile.imwrite(
+            channel_path,
+            channel_data.astype(np.float32, copy=False),
+            imagej=True,
+            metadata={
+                "axes": "ZYX",
+                "spacing": float(plane_spacing_um),
+                "unit": "um",
+            },
+            resolution=(res, res) if res is not None else None,
+            resolutionunit="CENTIMETER" if res is not None else None,
+        )
         channel_paths[name] = channel_path
 
     metadata = {
@@ -270,6 +298,7 @@ def run(
         "gui_source": gui_source or None,
         "gui_display_channel": gui_display_channel or None,
         "voxel_size_um": list(voxel),
+        "plane_spacing_um": float(plane_spacing_um),
         # pixels_xyz reflects the actual output shape (may be expanded after rotation)
         # Stack shape is (z, channels, y, x), stored as [z, y, x] for legacy compatibility
         "pixels_xyz": [int(stack.shape[0]), int(stack.shape[2]), int(stack.shape[3])],

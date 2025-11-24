@@ -39,11 +39,19 @@ def run(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    if plane_spacing is None:
+        raise ValueError("plane_spacing must be provided for anatomy preprocessing")
+
     tiff_paths = sorted(raw_dir.glob("*.tif"))
     if not tiff_paths:
         raise FileNotFoundError(f"No anatomy TIFF files found in {raw_dir}")
 
     pixel_size_xy = utils.extract_pixel_size_um(tiff_paths[0])
+    if np.allclose(pixel_size_xy, (1.0, 1.0)):
+        logger.warning(
+            "Anatomy pixel size reported as (1.0, 1.0) µm for %s; header likely missing correct spacing",
+            tiff_paths[0].name,
+        )
     for extra_path in tiff_paths[1:]:
         extra_size = utils.extract_pixel_size_um(extra_path)
         if not np.allclose(extra_size, pixel_size_xy, rtol=0.0, atol=1e-6):
@@ -59,7 +67,12 @@ def run(
     stack_path = output_root / stack_filename.format(
         animal_id=animal_id, session_id=session_id
     )
-    utils.save_tiff_stack(stack_path, corrected)
+    utils.save_tiff_stack(
+        stack_path,
+        corrected,
+        pixel_size_xy_um=pixel_size_xy[0],
+        plane_spacing_um=plane_spacing,
+    )
 
     metadata = {
         "session_id": session_id,
@@ -72,7 +85,7 @@ def run(
         "blocks": settings.blocks if settings else None,
         "output_stack": str(stack_path),
         "pixel_size_xy_um": [float(pixel_size_xy[0]), float(pixel_size_xy[1])],
-        "plane_spacing_um": float(plane_spacing) if plane_spacing is not None else None,
+        "plane_spacing_um": float(plane_spacing),
     }
     metadata_path = output_root / metadata_filename.format(
         animal_id=animal_id, session_id=session_id
